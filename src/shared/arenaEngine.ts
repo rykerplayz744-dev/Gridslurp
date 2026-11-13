@@ -278,7 +278,7 @@ export class ArenaEngine {
     const lastScheduledDir =
       snake.nextDirs.length > 0 ? snake.nextDirs[snake.nextDirs.length - 1] : snake.dir;
 
-    if (requestedDir === lastScheduledDir || isOppositeDirection(requestedDir, lastScheduledDir)) {
+    if (requestedDir === lastScheduledDir) {
       return;
     }
 
@@ -489,9 +489,7 @@ export class ArenaEngine {
         }
       } else if (snake.nextDirs.length > 0) {
         const nextDir = snake.nextDirs.shift()!;
-        if (!isOppositeDirection(nextDir, snake.dir)) {
-          snake.dir = nextDir;
-        }
+        snake.dir = nextDir;
       }
 
       const nextHead = stepPoint(snake.segments[0], snake.dir);
