@@ -1068,8 +1068,9 @@ export default function App() {
                 <span className="text-amber-300">flashing big pellets</span> they drop on death.
               </p>
               <p>
-                <strong className="text-rose-400">Zero Forgiveness:</strong> Running over your own
-                pixels, hitting a rival trail, or stepping off the 32×32 grid is instant death.
+                <strong className="text-rose-400">Zero Wall Forgiveness:</strong> You can freely
+                cross over your own tail, but hitting a rival trail or stepping off the 32×32 grid
+                is instant death.
               </p>
               <p className="pt-1 text-[11px] font-mono-tabular text-slate-300">
                 Controls: WASD or Arrow Keys only
@@ -1123,7 +1124,7 @@ export default function App() {
                 <div className="p-3 rounded-lg bg-[#080B10] border border-slate-800">
                   <div className="font-semibold text-rose-400 mb-1">3. Unforgiving 32×32</div>
                   <p className="text-slate-400 leading-relaxed">
-                    Going over top of yourself or stepping 1 pixel off the 32×32 border is fatal.
+                    You can cross your own tail safely, but hitting rivals or stepping 1 pixel off the 32×32 border is fatal.
                   </p>
                 </div>
               </div>

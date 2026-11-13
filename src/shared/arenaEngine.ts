@@ -328,15 +328,10 @@ export class ArenaEngine {
     const validDirs = allDirs.filter((d) => !isOppositeDirection(d, bot.dir));
 
     // Build hazard map:
-    // - Bot's own body is known immediately so it doesn't randomly self-collide in open space.
-    // - For OTHER snakes passing by, the AI has delayed reaction time: it does NOT register
-    //   their front 3 segments (head + neck that just moved by in the last ~0.5s) as hazards,
-    //   and only partially notices older trail segments!
-    const ownBodyCells = new Set<string>();
-    for (let i = 1; i < bot.segments.length - 1; i++) {
-      ownBodyCells.add(`${bot.segments[i].x},${bot.segments[i].y}`);
-    }
-
+    // Snakes can freely cross over their own tail/body.
+    // For OTHER snakes passing by, the AI has delayed reaction time: it does NOT register
+    // their front 3 segments (head + neck that just moved by in the last ~0.5s) as hazards,
+    // and only partially notices older trail segments!
     const otherTrailCells = new Set<string>();
     for (const other of this.snakes.values()) {
       if (!other.alive || other.id === bot.id) continue;
@@ -346,19 +341,17 @@ export class ArenaEngine {
       }
     }
 
-    // Human-like reaction delay: if continuing straight stays inside the 32x32 grid
-    // and doesn't hit the bot's own body, the bot often stays committed to its current heading
-    // instead of frame-perfectly dodging a player passing by.
+    // Human-like reaction delay: if continuing straight stays inside the 32x32 grid,
+    // the bot often stays committed to its current heading instead of frame-perfectly dodging.
     const straightPt = stepPoint(head, bot.dir);
-    const straightSafeFromWallAndSelf =
+    const straightSafeFromWall =
       isInsideGrid(straightPt) &&
       straightPt.x >= 1 &&
       straightPt.x < GRID_SIZE - 1 &&
       straightPt.y >= 1 &&
-      straightPt.y < GRID_SIZE - 1 &&
-      !ownBodyCells.has(`${straightPt.x},${straightPt.y}`);
+      straightPt.y < GRID_SIZE - 1;
 
-    if (straightSafeFromWallAndSelf && Math.random() < 0.62) {
+    if (straightSafeFromWall && Math.random() < 0.62) {
       return bot.dir;
     }
 
@@ -398,11 +391,6 @@ export class ArenaEngine {
 
       // Immediate outer 32x32 wall check
       if (!isInsideGrid(nextPt)) {
-        continue;
-      }
-
-      // Avoid running over its own body
-      if (ownBodyCells.has(`${nextPt.x},${nextPt.y}`)) {
         continue;
       }
 
@@ -586,18 +574,7 @@ export class ArenaEngine {
         continue;
       }
 
-      // B. Self-collision check (going over top of yourself)
-      let hitSelf = false;
-      for (let i = 1; i < snake.segments.length; i++) {
-        if (snake.segments[i].x === head.x && snake.segments[i].y === head.y) {
-          hitSelf = true;
-          break;
-        }
-      }
-      if (hitSelf) {
-        doomed.set(snake.id, { reason: 'SELF_CRASH' });
-        continue;
-      }
+      // B. Self-overlap is allowed! Snakes can freely pass over their own tail/body.
 
       // C. Other snakes check (Fail-safe spawn timer: shielded snakes cannot be killed by or kill other snakes on overlap)
       if (snake.shieldTicks > 0) {
