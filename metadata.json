@@ -1,0 +1,6 @@
+{
+  "name": "GRIDSLURP // 32x32 Multiplayer Pixel Snake Arena",
+  "description": "High-stakes multiplayer pixel snake combat on an unforgiving 32x32 matrix. Cut off rivals, force collisions, and slurp flashing trophy pellets.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
