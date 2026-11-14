@@ -6,13 +6,14 @@ import {
   ClientToServerMessage,
   Direction,
   GRID_SIZE,
+  ServerGridSize,
   ServerToClientMessage,
   SNAKE_PALETTES,
   TICK_MS,
 } from './shared/gameTypes';
 import { soundEngine } from './utils/soundEngine';
 
-const GLOBAL_MESH_TOPIC = 'gridslurp/v2/arena/global_main_32x32';
+const getMeshTopic = (size: ServerGridSize) => `gridslurp/v2/arena/global_main_${size}x${size}`;
 const MQTT_BROKERS = [
   'wss://broker.emqx.io:8084/mqtt',
   'wss://broker-cn.emqx.io:8084/mqtt',
@@ -51,10 +52,11 @@ interface Shockwave {
 
 export default function App() {
   const [gameState, setGameState] = useState<GameState>('TITLE_MENU');
+  const [serverGridSize, setServerGridSize] = useState<ServerGridSize>(32);
   const [playerName, setPlayerName] = useState<string>('VIPER_01');
   const [selectedColorId, setSelectedColorId] = useState<string>('emerald');
   const [muted, setMuted] = useState<boolean>(soundEngine.muted);
-  const [connectionMode, setConnectionMode] = useState<'ws' | 'local-sync'>('ws');
+  const [, setConnectionMode] = useState<'ws' | 'local-sync'>('ws');
 
   // HUD state synced at tick rate (not 60fps) to keep React lightweight
   const [hudStats, setHudStats] = useState<{
@@ -259,13 +261,14 @@ export default function App() {
           };
         });
 
+      const activeSize = snap.gridSize || GRID_SIZE;
       setHudStats((prev) => ({
         score: me ? me.score : prev.score,
         length: me ? me.segments.length : prev.length,
         kills: me ? me.kills : prev.kills,
         slurped: me ? me.pelletsSlurped : prev.slurped,
-        headX: me && me.segments[0] ? Math.max(0, Math.min(31, me.segments[0].x)) : prev.headX,
-        headY: me && me.segments[0] ? Math.max(0, Math.min(31, me.segments[0].y)) : prev.headY,
+        headX: me && me.segments[0] ? Math.max(0, Math.min(activeSize - 1, me.segments[0].x)) : prev.headX,
+        headY: me && me.segments[0] ? Math.max(0, Math.min(activeSize - 1, me.segments[0].y)) : prev.headY,
         alive: me ? me.alive : false,
         shieldTicks: me ? me.shieldTicks : 0,
         deathReason: me?.deathReason || prev.deathReason,
@@ -300,12 +303,15 @@ export default function App() {
     let localInterval: ReturnType<typeof setInterval> | null = null;
     let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
     let isUnmounted = false;
+    const meshTopic = getMeshTopic(serverGridSize);
+    activePeersRef.current.clear();
+    localEngineRef.current = null;
 
     const publishMeshPacket = (packet: Record<string, unknown>) => {
       const serialized = JSON.stringify(packet);
       if (mqttRef.current && mqttRef.current.connected) {
         try {
-          mqttRef.current.publish(GLOBAL_MESH_TOPIC, serialized, { qos: 0 });
+          mqttRef.current.publish(meshTopic, serialized, { qos: 0 });
         } catch {
           // ignore publish error
         }
@@ -381,6 +387,7 @@ export default function App() {
                 clientId: myId,
                 name: myJoinInfoRef.current.name,
                 colorId: myJoinInfoRef.current.colorId,
+                gridSize: serverGridSize,
               },
             });
           }
@@ -409,12 +416,12 @@ export default function App() {
     const startGlobalMeshEngine = () => {
       if (isUnmounted || localEngineRef.current) return;
       setConnectionMode('ws');
-      const engine = new ArenaEngine(2);
+      const engine = new ArenaEngine(2, serverGridSize);
       localEngineRef.current = engine;
 
       // 1. Local multi-tab BroadcastChannel
       try {
-        const bc = new BroadcastChannel('gridslurp_32x32_arena_v2');
+        const bc = new BroadcastChannel(`gridslurp_${serverGridSize}x${serverGridSize}_arena_v2`);
         broadcastChannelRef.current = bc;
         bc.onmessage = (ev) => {
           handleMeshPacket(ev.data);
@@ -436,7 +443,7 @@ export default function App() {
         client.on('connect', () => {
           if (isUnmounted) return;
           setConnectionMode('ws');
-          client.subscribe(GLOBAL_MESH_TOPIC, { qos: 0 });
+          client.subscribe(meshTopic, { qos: 0 });
           publishMeshPacket({
             type: 'mesh_heartbeat',
             senderId: playerIdRef.current,
@@ -531,6 +538,7 @@ export default function App() {
       ws.onopen = () => {
         if (fallbackTimer) clearTimeout(fallbackTimer);
         setConnectionMode('ws');
+        ws.send(JSON.stringify({ type: 'select_server', gridSize: serverGridSize }));
       };
 
       ws.onmessage = (event) => {
@@ -589,59 +597,62 @@ export default function App() {
         }
       }
     };
-  }, [processSnapshotEvents]);
+  }, [processSnapshotEvents, serverGridSize]);
 
-  const sendCommand = useCallback((msg: ClientToServerMessage) => {
-    const pid = playerIdRef.current;
+  const sendCommand = useCallback(
+    (msg: ClientToServerMessage) => {
+      const pid = playerIdRef.current;
 
-    if (msg.type === 'join' || msg.type === 'respawn') {
-      myJoinInfoRef.current = {
-        name: msg.name,
-        colorId: msg.colorId,
-        playing: true,
-      };
-    } else if (msg.type === 'leave') {
-      myJoinInfoRef.current.playing = false;
-    }
-
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg));
-      return;
-    }
-
-    // Global Mesh / Vercel Multiplayer command dispatch
-    const engine = localEngineRef.current;
-    if (engine) {
       if (msg.type === 'join' || msg.type === 'respawn') {
-        engine.spawnPlayer(pid, msg.name, msg.colorId);
-        snapshotRef.current = engine.getSnapshot();
-      } else if (msg.type === 'turn') {
-        engine.queueTurn(pid, msg.dir);
+        myJoinInfoRef.current = {
+          name: msg.name,
+          colorId: msg.colorId,
+          playing: true,
+        };
       } else if (msg.type === 'leave') {
-        engine.removePlayer(pid);
+        myJoinInfoRef.current.playing = false;
       }
-    }
 
-    const packet = {
-      type: 'mesh_cmd',
-      senderId: pid,
-      senderOrder: peerOrderRef.current,
-      cmd: { ...msg, clientId: pid },
-    };
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify(msg));
+        return;
+      }
 
-    if (mqttRef.current && mqttRef.current.connected) {
+      // Global Mesh / Vercel Multiplayer command dispatch
+      const engine = localEngineRef.current;
+      if (engine) {
+        if (msg.type === 'join' || msg.type === 'respawn') {
+          engine.spawnPlayer(pid, msg.name, msg.colorId);
+          snapshotRef.current = engine.getSnapshot();
+        } else if (msg.type === 'turn') {
+          engine.queueTurn(pid, msg.dir);
+        } else if (msg.type === 'leave') {
+          engine.removePlayer(pid);
+        }
+      }
+
+      const packet = {
+        type: 'mesh_cmd',
+        senderId: pid,
+        senderOrder: peerOrderRef.current,
+        cmd: { ...msg, clientId: pid },
+      };
+
+      if (mqttRef.current && mqttRef.current.connected) {
+        try {
+          mqttRef.current.publish(getMeshTopic(serverGridSize), JSON.stringify(packet), { qos: 0 });
+        } catch {
+          // ignore
+        }
+      }
       try {
-        mqttRef.current.publish(GLOBAL_MESH_TOPIC, JSON.stringify(packet), { qos: 0 });
+        broadcastChannelRef.current?.postMessage(packet);
       } catch {
         // ignore
       }
-    }
-    try {
-      broadcastChannelRef.current?.postMessage(packet);
-    } catch {
-      // ignore
-    }
-  }, []);
+    },
+    [serverGridSize]
+  );
 
   const handleStartOrRespawn = useCallback(() => {
     const cleanName = playerName.trim().toUpperCase().slice(0, 14) || 'VIPER_01';
@@ -651,9 +662,10 @@ export default function App() {
       name: cleanName,
       colorId: selectedColorId,
       clientId: playerIdRef.current,
+      gridSize: serverGridSize,
     });
     setGameState('PLAYING');
-  }, [playerName, selectedColorId, sendCommand]);
+  }, [playerName, selectedColorId, serverGridSize, sendCommand]);
 
   const handleToggleMute = useCallback(() => {
     const nextMuted = soundEngine.toggleMute();
@@ -770,18 +782,21 @@ export default function App() {
         shakeRef.current = 0;
       }
 
+      const snap = snapshotRef.current;
+      const activeGridSize = snap?.gridSize || serverGridSize;
       const boardPx = displaySize;
-      const cellPx = boardPx / GRID_SIZE;
-      const gap = Math.max(1.2, cellPx * 0.09);
+      const cellPx = boardPx / activeGridSize;
+      const gap = Math.max(0.9, cellPx * 0.09);
 
       // 1. Deep Obsidian Matrix Backplane
       ctx.fillStyle = '#070A0F';
       ctx.fillRect(0, 0, boardPx, boardPx);
 
-      // 2. Render all 32x32 unlit physical LED pixel sockets
-      for (let y = 0; y < GRID_SIZE; y++) {
-        for (let x = 0; x < GRID_SIZE; x++) {
-          const isEdgeTile = x === 0 || y === 0 || x === GRID_SIZE - 1 || y === GRID_SIZE - 1;
+      // 2. Render all unlit physical LED pixel sockets
+      for (let y = 0; y < activeGridSize; y++) {
+        for (let x = 0; x < activeGridSize; x++) {
+          const isEdgeTile =
+            x === 0 || y === 0 || x === activeGridSize - 1 || y === activeGridSize - 1;
           ctx.fillStyle = isEdgeTile ? '#131826' : '#0E1522';
           ctx.fillRect(
             x * cellPx + gap * 0.5,
@@ -792,10 +807,10 @@ export default function App() {
         }
       }
 
-      // Subtle 8x8 sector hairlines for spatial navigation on the 32x32 matrix
+      // Subtle 8x8 sector hairlines for spatial navigation on the matrix
       ctx.strokeStyle = 'rgba(148, 163, 184, 0.08)';
       ctx.lineWidth = 1;
-      for (let i = 8; i < GRID_SIZE; i += 8) {
+      for (let i = 8; i < activeGridSize; i += 8) {
         const pos = i * cellPx;
         ctx.beginPath();
         ctx.moveTo(pos, 0);
@@ -808,7 +823,6 @@ export default function App() {
         ctx.stroke();
       }
 
-      const snap = snapshotRef.current;
       if (snap) {
         const myId = playerIdRef.current;
         const me = snap.snakes.find((s) => s.id === myId && s.alive);
@@ -902,7 +916,7 @@ export default function App() {
           // Draw body segments from tail to head so the head pixel sits cleanly on top
           for (let i = len - 1; i >= 0; i--) {
             const seg = snake.segments[i];
-            if (seg.x < 0 || seg.x >= GRID_SIZE || seg.y < 0 || seg.y >= GRID_SIZE) continue;
+            if (seg.x < 0 || seg.x >= activeGridSize || seg.y < 0 || seg.y >= activeGridSize) continue;
 
             const sx = seg.x * cellPx + gap * 0.5;
             const sy = seg.y * cellPx + gap * 0.5;
@@ -957,7 +971,7 @@ export default function App() {
               ctx.fillRect(e1x, e1y, eyeSize, eyeSize);
               ctx.fillRect(e2x, e2y, eyeSize, eyeSize);
             } else {
-              // Lit Body Pixel on the 32x32 Grid
+              // Lit Body Pixel on the Grid
               const ratio = i / Math.max(1, len - 1);
               ctx.fillStyle = ratio > 0.72 ? snake.color.tail : snake.color.body;
               ctx.fillRect(sx, sy, sw, sh);
@@ -977,7 +991,7 @@ export default function App() {
 
           // Floating Callsign & Fail-Safe Shield Timer readout above snake head
           const head = snake.segments[0];
-          if (head && head.x >= 0 && head.x < GRID_SIZE && head.y >= 0 && head.y < GRID_SIZE) {
+          if (head && head.x >= 0 && head.x < activeGridSize && head.y >= 0 && head.y < activeGridSize) {
             const hx = (head.x + 0.5) * cellPx;
             const hy = head.y * cellPx - 4;
             ctx.save();
@@ -997,14 +1011,14 @@ export default function App() {
           }
         }
 
-        // 6. Unforgiving 32x32 Danger Perimeter Alert when player is within 2 pixels of the edge!
+        // 6. Unforgiving Danger Perimeter Alert when player is within 2 pixels of the edge!
         const head = me?.segments[0];
         const nearEdge =
           head &&
           (head.x <= 1 ||
-            head.x >= GRID_SIZE - 2 ||
+            head.x >= activeGridSize - 2 ||
             head.y <= 1 ||
-            head.y >= GRID_SIZE - 2);
+            head.y >= activeGridSize - 2);
 
         ctx.save();
         ctx.strokeStyle = nearEdge
@@ -1079,7 +1093,7 @@ export default function App() {
 
     rafId = requestAnimationFrame(renderFrame);
     return () => cancelAnimationFrame(rafId);
-  }, []);
+  }, [serverGridSize]);
 
   const deathExplanation = (() => {
     switch (hudStats.deathReason) {
@@ -1110,7 +1124,7 @@ export default function App() {
               <rect x="16" y="16" width="5" height="5" className="text-amber-400" />
             </svg>
             <span className="font-display font-bold tracking-wider text-sm text-white whitespace-nowrap">
-              GRIDSLURP <span className="text-slate-400 font-normal">32×32</span>
+              GRIDSLURP
             </span>
           </div>
 
@@ -1210,13 +1224,13 @@ export default function App() {
                 00,00
               </span>
               <span className="absolute top-0.5 right-2 text-[10px] font-mono-tabular text-rose-400/80 pointer-events-none">
-                31,00 · UNFORGIVING BORDER
+                {serverGridSize - 1},00 · UNFORGIVING BORDER
               </span>
               <span className="absolute bottom-0.5 left-2 text-[10px] font-mono-tabular text-rose-400/80 pointer-events-none">
-                00,31
+                00,{serverGridSize - 1}
               </span>
               <span className="absolute bottom-0.5 right-2 text-[10px] font-mono-tabular text-rose-400/80 pointer-events-none">
-                31,31
+                {serverGridSize - 1},{serverGridSize - 1}
               </span>
 
               <canvas
@@ -1344,7 +1358,7 @@ export default function App() {
                   </svg>
                   <div>
                     <h1 className="font-display text-3xl sm:text-4xl font-bold tracking-tight text-white">
-                      GRIDSLURP <span className="text-emerald-400">32×32</span>
+                      GRIDSLURP
                     </h1>
                     <p className="text-xs text-slate-400 font-mono-tabular">
                       MULTIPLAYER PIXEL SNAKE COMBAT · ZERO PASSIVE PELLETS
@@ -1435,6 +1449,35 @@ export default function App() {
                     })}
                   </div>
                 </div>
+                <div>
+                  <span className="block text-xs font-medium text-slate-300 mb-2">
+                    ARENA SERVER
+                  </span>
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <button
+                      type="button"
+                      onClick={() => setServerGridSize(32)}
+                      className={`py-2.5 px-3 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                        serverGridSize === 32
+                          ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                          : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
+                      }`}
+                    >
+                      32×32 SERVER (CLASSIC)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setServerGridSize(64)}
+                      className={`py-2.5 px-3 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                        serverGridSize === 64
+                          ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                          : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
+                      }`}
+                    >
+                      64×64 SERVER (EXPANDED)
+                    </button>
+                  </div>
+                </div>
               </div>
 
               {/* Primary Start CTA & Single-Line Genre Control Hint */}
@@ -1444,7 +1487,7 @@ export default function App() {
                   onClick={handleStartOrRespawn}
                   className="w-full py-3.5 px-6 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-base tracking-wide transition-colors cursor-pointer shadow-lg shadow-emerald-500/20"
                 >
-                  Drop Into 32×32 Grid [Enter]
+                  Drop Into {serverGridSize}×{serverGridSize} Grid [Enter]
                 </button>
                 <p className="text-center text-xs text-slate-400 font-mono-tabular">
                   WASD / Arrow Keys Move · M Mute · Esc Pause

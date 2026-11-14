@@ -49,12 +49,13 @@ export function stepPoint(pt: Point, dir: Direction): Point {
   }
 }
 
-export function isInsideGrid(pt: Point): boolean {
-  return pt.x >= 0 && pt.x < GRID_SIZE && pt.y >= 0 && pt.y < GRID_SIZE;
+export function isInsideGrid(pt: Point, gridSize: number = GRID_SIZE): boolean {
+  return pt.x >= 0 && pt.x < gridSize && pt.y >= 0 && pt.y < gridSize;
 }
 
 export class ArenaEngine {
   public tick = 0;
+  public readonly gridSize: number;
   public snakes: Map<string, SnakeEntity> = new Map();
   public pellets: BigPellet[] = [];
   public telegraphs: SpawnTelegraph[] = [];
@@ -66,13 +67,14 @@ export class ArenaEngine {
   private slurpCounter = 0;
   private targetBotCount = 2;
 
-  constructor(targetBotCount = 2) {
+  constructor(targetBotCount = 2, gridSize = GRID_SIZE) {
     this.targetBotCount = targetBotCount;
+    this.gridSize = gridSize;
     this.seedInitialArena();
   }
 
   private seedInitialArena() {
-    // Keep exactly 2 initial AI snakes on the 32x32 matrix at all times
+    // Keep exactly 2 initial AI snakes on the matrix at all times
     for (let i = 0; i < this.targetBotCount; i++) {
       this.spawnBotImmediate();
     }
@@ -124,12 +126,12 @@ export class ArenaEngine {
         const angle = Math.random() * Math.PI * 2;
         x = Math.round(anchor.x + Math.cos(angle) * dist);
         y = Math.round(anchor.y + Math.sin(angle) * dist);
-        // Clamp within safe interior margin (4..27) so newborn snakes don't immediately hit the wall
-        x = Math.max(4, Math.min(GRID_SIZE - 5, x));
-        y = Math.max(4, Math.min(GRID_SIZE - 5, y));
+        // Clamp within safe interior margin so newborn snakes don't immediately hit the wall
+        x = Math.max(4, Math.min(this.gridSize - 5, x));
+        y = Math.max(4, Math.min(this.gridSize - 5, y));
       } else {
-        x = 4 + Math.floor(Math.random() * (GRID_SIZE - 8));
-        y = 4 + Math.floor(Math.random() * (GRID_SIZE - 8));
+        x = 4 + Math.floor(Math.random() * (this.gridSize - 8));
+        y = 4 + Math.floor(Math.random() * (this.gridSize - 8));
       }
 
       const dir = directions[Math.floor(Math.random() * directions.length)];
@@ -140,7 +142,7 @@ export class ArenaEngine {
       let clear = true;
       let testPt = { x, y };
       for (let i = 0; i < 4; i++) {
-        if (!isInsideGrid(testPt) || occupied.has(`${testPt.x},${testPt.y}`)) {
+        if (!isInsideGrid(testPt, this.gridSize) || occupied.has(`${testPt.x},${testPt.y}`)) {
           clear = false;
           break;
         }
@@ -154,9 +156,9 @@ export class ArenaEngine {
         forwardPt = stepPoint(forwardPt, dir);
         if (
           forwardPt.x <= 1 ||
-          forwardPt.x >= GRID_SIZE - 2 ||
+          forwardPt.x >= this.gridSize - 2 ||
           forwardPt.y <= 1 ||
-          forwardPt.y >= GRID_SIZE - 2 ||
+          forwardPt.y >= this.gridSize - 2 ||
           occupied.has(`${forwardPt.x},${forwardPt.y}`)
         ) {
           clear = false;
@@ -171,8 +173,8 @@ export class ArenaEngine {
 
     // Fallback safe center-ish coordinate
     return {
-      x: Math.max(5, Math.min(GRID_SIZE - 6, 10 + Math.floor(Math.random() * 12))),
-      y: Math.max(5, Math.min(GRID_SIZE - 6, 10 + Math.floor(Math.random() * 12))),
+      x: Math.max(5, Math.min(this.gridSize - 6, 10 + Math.floor(Math.random() * (this.gridSize - 20)))),
+      y: Math.max(5, Math.min(this.gridSize - 6, 10 + Math.floor(Math.random() * (this.gridSize - 20)))),
       dir: 'RIGHT',
     };
   }
@@ -295,7 +297,7 @@ export class ArenaEngine {
     const count = victim.segments.length;
     for (let i = 0; i < count; i++) {
       const seg = victim.segments[i];
-      if (!isInsideGrid(seg)) continue;
+      if (!isInsideGrid(seg, this.gridSize)) continue;
 
       // Avoid stacking multiple pellets on the exact same cell
       const existing = this.pellets.find((p) => p.x === seg.x && p.y === seg.y);
@@ -341,15 +343,15 @@ export class ArenaEngine {
       }
     }
 
-    // Human-like reaction delay: if continuing straight stays inside the 32x32 grid,
+    // Human-like reaction delay: if continuing straight stays inside the grid,
     // the bot often stays committed to its current heading instead of frame-perfectly dodging.
     const straightPt = stepPoint(head, bot.dir);
     const straightSafeFromWall =
-      isInsideGrid(straightPt) &&
+      isInsideGrid(straightPt, this.gridSize) &&
       straightPt.x >= 1 &&
-      straightPt.x < GRID_SIZE - 1 &&
+      straightPt.x < this.gridSize - 1 &&
       straightPt.y >= 1 &&
-      straightPt.y < GRID_SIZE - 1;
+      straightPt.y < this.gridSize - 1;
 
     if (straightSafeFromWall && Math.random() < 0.62) {
       return bot.dir;
@@ -389,8 +391,8 @@ export class ArenaEngine {
     for (const dir of validDirs) {
       const nextPt = stepPoint(head, dir);
 
-      // Immediate outer 32x32 wall check
-      if (!isInsideGrid(nextPt)) {
+      // Immediate outer wall check
+      if (!isInsideGrid(nextPt, this.gridSize)) {
         continue;
       }
 
@@ -403,12 +405,12 @@ export class ArenaEngine {
         }
       }
 
-      // Keep buffer from the unforgiving 32x32 outer wall so bots don't die to walls on their own
+      // Keep buffer from the unforgiving outer wall so bots don't die to walls on their own
       const wallDist = Math.min(
         nextPt.x,
-        GRID_SIZE - 1 - nextPt.x,
+        this.gridSize - 1 - nextPt.x,
         nextPt.y,
-        GRID_SIZE - 1 - nextPt.y
+        this.gridSize - 1 - nextPt.y
       );
       if (wallDist === 0) score -= 65;
       else if (wallDist === 1) score -= 18;
@@ -566,8 +568,8 @@ export class ArenaEngine {
     for (const snake of aliveSnakes) {
       const head = snake.segments[0];
 
-      // A. Unforgiving 32x32 Grid Boundary Check
-      if (!isInsideGrid(head)) {
+      // A. Unforgiving Grid Boundary Check
+      if (!isInsideGrid(head, this.gridSize)) {
         doomed.set(snake.id, { reason: 'WALL_CRASH' });
         continue;
       }
@@ -639,12 +641,12 @@ export class ArenaEngine {
       const dropSource: SnakeEntity = {
         ...victim,
         segments: victim.segments.map((seg, idx) =>
-          isInsideGrid(seg) ? seg : victim.prevSegments[idx] || victim.prevSegments[0]
+          isInsideGrid(seg, this.gridSize) ? seg : victim.prevSegments[idx] || victim.prevSegments[0]
         ),
       };
       this.dropBigFlashingPellets(dropSource);
 
-      const crashPt = isInsideGrid(victim.segments[0])
+      const crashPt = isInsideGrid(victim.segments[0], this.gridSize)
         ? victim.segments[0]
         : victim.prevSegments[0];
 
@@ -708,7 +710,7 @@ export class ArenaEngine {
     const humanCount = snakesList.filter((s) => !s.isBot).length;
     return {
       tick: this.tick,
-      gridSize: GRID_SIZE,
+      gridSize: this.gridSize,
       snakes: snakesList,
       pellets: this.pellets,
       telegraphs: this.telegraphs,

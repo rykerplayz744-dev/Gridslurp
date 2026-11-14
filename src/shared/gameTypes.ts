@@ -150,10 +150,13 @@ export interface ArenaSnapshot {
   onlinePlayers: number;
 }
 
+export type ServerGridSize = 32 | 64;
+
 export type ClientToServerMessage =
-  | { type: 'join'; name: string; colorId: string; clientId: string }
+  | { type: 'join'; name: string; colorId: string; clientId: string; gridSize?: ServerGridSize }
   | { type: 'turn'; dir: Direction }
-  | { type: 'respawn'; name: string; colorId: string }
+  | { type: 'respawn'; name: string; colorId: string; gridSize?: ServerGridSize }
+  | { type: 'select_server'; gridSize: ServerGridSize }
   | { type: 'leave' };
 
 export type ServerToClientMessage =

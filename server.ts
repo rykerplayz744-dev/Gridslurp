@@ -7,6 +7,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { ArenaEngine } from './src/shared/arenaEngine';
 import {
   ClientToServerMessage,
+  ServerGridSize,
   ServerToClientMessage,
   TICK_MS,
 } from './src/shared/gameTypes';
@@ -21,11 +22,17 @@ async function startServer() {
   const httpServer = createServer(app);
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
-  const arena = new ArenaEngine(2);
-  const clientPlayers = new Map<WebSocket, string>();
+  // Maintain both the 32x32 Server and the 64x64 Server simultaneously
+  const arenas = new Map<ServerGridSize, ArenaEngine>([
+    [32, new ArenaEngine(2, 32)],
+    [64, new ArenaEngine(2, 64)],
+  ]);
 
-  // REST API endpoint for health & Vercel/HTTP fallback state inspection
-  app.get('/api/arena', (_req, res) => {
+  const clientPlayers = new Map<WebSocket, { id: string; gridSize: ServerGridSize }>();
+
+  app.get('/api/arena', (req, res) => {
+    const requestedSize = Number(req.query.size) === 64 ? 64 : 32;
+    const arena = arenas.get(requestedSize)!;
     res.json({
       status: 'ok',
       mode: 'authoritative-ws',
@@ -33,13 +40,16 @@ async function startServer() {
     });
   });
 
-  app.post('/api/arena', (_req, res) => {
+  app.post('/api/arena', (req, res) => {
+    const requestedSize = Number(req.body?.gridSize) === 64 ? 64 : 32;
+    const arena = arenas.get(requestedSize)!;
     res.json({ ok: true, snapshot: arena.getSnapshot() });
   });
 
   wss.on('connection', (ws: WebSocket) => {
     let assignedPlayerId = `plr_${Math.random().toString(36).slice(2, 9)}`;
-    clientPlayers.set(ws, assignedPlayerId);
+    let activeGridSize: ServerGridSize = 32;
+    clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize });
 
     const sendMsg = (msg: ServerToClientMessage) => {
       if (ws.readyState === WebSocket.OPEN) {
@@ -51,17 +61,35 @@ async function startServer() {
     sendMsg({
       type: 'welcome',
       playerId: assignedPlayerId,
-      state: arena.getSnapshot(),
+      state: arenas.get(activeGridSize)!.getSnapshot(),
     });
 
     ws.on('message', (raw) => {
       try {
         const msg = JSON.parse(raw.toString()) as ClientToServerMessage;
-        if (msg.type === 'join') {
+        if (msg.type === 'select_server') {
+          const newSize: ServerGridSize = msg.gridSize === 64 ? 64 : 32;
+          if (newSize !== activeGridSize) {
+            arenas.get(activeGridSize)?.removePlayer(assignedPlayerId);
+            activeGridSize = newSize;
+            clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize });
+          }
+          sendMsg({
+            type: 'state',
+            state: arenas.get(activeGridSize)!.getSnapshot(),
+          });
+        } else if (msg.type === 'join') {
           if (msg.clientId && msg.clientId.trim().length > 0) {
             assignedPlayerId = msg.clientId;
-            clientPlayers.set(ws, assignedPlayerId);
           }
+          if (msg.gridSize === 64 || msg.gridSize === 32) {
+            if (msg.gridSize !== activeGridSize) {
+              arenas.get(activeGridSize)?.removePlayer(assignedPlayerId);
+              activeGridSize = msg.gridSize;
+            }
+          }
+          clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize });
+          const arena = arenas.get(activeGridSize)!;
           arena.spawnPlayer(assignedPlayerId, msg.name, msg.colorId);
           sendMsg({
             type: 'welcome',
@@ -69,15 +97,23 @@ async function startServer() {
             state: arena.getSnapshot(),
           });
         } else if (msg.type === 'turn') {
-          arena.queueTurn(assignedPlayerId, msg.dir);
+          arenas.get(activeGridSize)!.queueTurn(assignedPlayerId, msg.dir);
         } else if (msg.type === 'respawn') {
+          if (msg.gridSize === 64 || msg.gridSize === 32) {
+            if (msg.gridSize !== activeGridSize) {
+              arenas.get(activeGridSize)?.removePlayer(assignedPlayerId);
+              activeGridSize = msg.gridSize;
+              clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize });
+            }
+          }
+          const arena = arenas.get(activeGridSize)!;
           arena.spawnPlayer(assignedPlayerId, msg.name, msg.colorId);
           sendMsg({
             type: 'state',
             state: arena.getSnapshot(),
           });
         } else if (msg.type === 'leave') {
-          arena.removePlayer(assignedPlayerId);
+          arenas.get(activeGridSize)!.removePlayer(assignedPlayerId);
         }
       } catch {
         // Ignore malformed packets
@@ -85,25 +121,32 @@ async function startServer() {
     });
 
     ws.on('close', () => {
-      const pid = clientPlayers.get(ws);
-      if (pid) {
-        arena.removePlayer(pid);
+      const info = clientPlayers.get(ws);
+      if (info) {
+        arenas.get(info.gridSize)?.removePlayer(info.id);
         clientPlayers.delete(ws);
       }
     });
   });
 
-  // Authoritative 32x32 game loop broadcasting state every TICK_MS
+  // Authoritative game loop stepping both the 32x32 Server and the 64x64 Server every TICK_MS
   setInterval(() => {
-    const snapshot = arena.step();
-    const payload = JSON.stringify({
+    const snap32 = arenas.get(32)!.step();
+    const snap64 = arenas.get(64)!.step();
+
+    const payload32 = JSON.stringify({
       type: 'state',
-      state: snapshot,
+      state: snap32,
     } satisfies ServerToClientMessage);
 
-    for (const client of wss.clients) {
+    const payload64 = JSON.stringify({
+      type: 'state',
+      state: snap64,
+    } satisfies ServerToClientMessage);
+
+    for (const [client, info] of clientPlayers.entries()) {
       if (client.readyState === WebSocket.OPEN) {
-        client.send(payload);
+        client.send(info.gridSize === 64 ? payload64 : payload32);
       }
     }
   }, TICK_MS);
@@ -124,7 +167,7 @@ async function startServer() {
 
   const PORT = Number(process.env.PORT) || 3000;
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`GRIDSLURP 32x32 Arena Server listening on http://0.0.0.0:${PORT}`);
+    console.log(`GRIDSLURP Arena Server listening on http://0.0.0.0:${PORT}`);
   });
 }
 
