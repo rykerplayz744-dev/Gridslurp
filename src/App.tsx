@@ -59,6 +59,15 @@ interface Shockwave {
 
 export default function App() {
   const [gameState, setGameState] = useState<GameState>('TITLE_MENU');
+  const [isSpectating, setIsSpectating] = useState<boolean>(false);
+  const [spectatedSnakeInfo, setSpectatedSnakeInfo] = useState<{
+    id: string;
+    name: string;
+    color: string;
+    isBot: boolean;
+    score: number;
+    length: number;
+  } | null>(null);
   const [serverGridSize, setServerGridSize] = useState<ServerGridSize>(32);
   const [zoomIn16, setZoomIn16] = useState<boolean>(false);
   const [mobileControlsEnabled, setMobileControlsEnabled] = useState<boolean>(() => {
@@ -177,6 +186,8 @@ export default function App() {
   const shakeRef = useRef<number>(0);
   const hitstopUntilRef = useRef<number>(0);
   const gameStateRef = useRef<GameState>(gameState);
+  const isSpectatingRef = useRef<boolean>(isSpectating);
+  const spectatedSnakeIdRef = useRef<string | null>(null);
   const zoomIn16Ref = useRef<boolean>(zoomIn16);
   const camRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 
@@ -185,8 +196,40 @@ export default function App() {
   }, [gameState]);
 
   useEffect(() => {
+    isSpectatingRef.current = isSpectating;
+  }, [isSpectating]);
+
+  useEffect(() => {
     zoomIn16Ref.current = zoomIn16;
   }, [zoomIn16]);
+
+  const pickRandomSpectatedSnake = useCallback(
+    (snap?: ArenaSnapshot | null, excludeId?: string | null) => {
+      const targetSnap = snap ?? snapshotRef.current;
+      const aliveSnakes = targetSnap?.snakes.filter((s) => s.alive) ?? [];
+      if (aliveSnakes.length === 0) {
+        spectatedSnakeIdRef.current = null;
+        setSpectatedSnakeInfo(null);
+        return null;
+      }
+      const candidates =
+        aliveSnakes.length > 1 && excludeId
+          ? aliveSnakes.filter((s) => s.id !== excludeId)
+          : aliveSnakes;
+      const chosen = candidates[Math.floor(Math.random() * candidates.length)];
+      spectatedSnakeIdRef.current = chosen.id;
+      setSpectatedSnakeInfo({
+        id: chosen.id,
+        name: chosen.name,
+        color: chosen.color.head,
+        isBot: chosen.isBot,
+        score: chosen.score,
+        length: chosen.segments.length,
+      });
+      return chosen;
+    },
+    []
+  );
 
   const spawnBurst = useCallback((gridX: number, gridY: number, color: string, count = 18) => {
     for (let i = 0; i < count; i++) {
@@ -254,6 +297,27 @@ export default function App() {
             alpha: 0.95,
           });
 
+          // If watching a snake in spectator mode and it is killed:
+          // zoom into the killer snake if killed by another snake, otherwise focus on a random other snake
+          if (kill.victimId === spectatedSnakeIdRef.current) {
+            const killerSnake = kill.killerId
+              ? snap.snakes.find((s) => s.id === kill.killerId && s.alive)
+              : undefined;
+            if (killerSnake) {
+              spectatedSnakeIdRef.current = killerSnake.id;
+              setSpectatedSnakeInfo({
+                id: killerSnake.id,
+                name: killerSnake.name,
+                color: killerSnake.color.head,
+                isBot: killerSnake.isBot,
+                score: killerSnake.score,
+                length: killerSnake.segments.length,
+              });
+            } else {
+              pickRandomSpectatedSnake(snap, kill.victimId);
+            }
+          }
+
           if (kill.victimId === myId && gameStateRef.current === 'PLAYING') {
             soundEngine.playPlayerDeath();
             shakeRef.current = 14;
@@ -271,10 +335,45 @@ export default function App() {
               alpha: 1,
               vy: -0.06,
             });
-          } else if (gameStateRef.current === 'PLAYING') {
+          } else if (gameStateRef.current === 'PLAYING' || isSpectatingRef.current) {
             soundEngine.playRivalKill(false);
             shakeRef.current = 4;
           }
+        }
+      }
+
+      // Keep spectator focus valid: if the watched snake left the game or died, focus on killer or a random other snake
+      if (gameStateRef.current !== 'PLAYING') {
+        let watched = spectatedSnakeIdRef.current
+          ? snap.snakes.find((s) => s.id === spectatedSnakeIdRef.current && s.alive)
+          : undefined;
+        if (!watched) {
+          const recentKill = spectatedSnakeIdRef.current
+            ? [...snap.recentKills]
+                .reverse()
+                .find((k) => k.victimId === spectatedSnakeIdRef.current && k.killerId)
+            : undefined;
+          const killerSnake = recentKill?.killerId
+            ? snap.snakes.find((s) => s.id === recentKill.killerId && s.alive)
+            : undefined;
+          if (killerSnake) {
+            spectatedSnakeIdRef.current = killerSnake.id;
+            watched = killerSnake;
+          } else {
+            watched = pickRandomSpectatedSnake(snap, spectatedSnakeIdRef.current) ?? undefined;
+          }
+        }
+        if (watched) {
+          setSpectatedSnakeInfo({
+            id: watched.id,
+            name: watched.name,
+            color: watched.color.head,
+            isBot: watched.isBot,
+            score: watched.score,
+            length: watched.segments.length,
+          });
+        } else {
+          setSpectatedSnakeInfo(null);
         }
       }
 
@@ -346,7 +445,7 @@ export default function App() {
       );
       setAdminInServer(hasAdminSnake || hasAdminPeer);
     },
-    [spawnBurst]
+    [pickRandomSpectatedSnake, spawnBurst]
   );
 
   // Setup Live Multiplayer: Direct /ws Server + Global Cross-Device WSS Mesh (for Vercel) + BroadcastChannel
@@ -978,6 +1077,7 @@ export default function App() {
       clientId: playerIdRef.current,
       gridSize: serverGridSize,
     });
+    setIsSpectating(false);
     setGameState('PLAYING');
 
     // Nothing starts playing automatically except for the admin music when a player named ADMIN is in the server!
@@ -998,8 +1098,31 @@ export default function App() {
   }, []);
 
   const handleToggleZoom = useCallback(() => {
-    setZoomIn16((prev) => !prev);
-  }, []);
+    setZoomIn16((prev) => {
+      const next = !prev;
+      if (next && gameStateRef.current !== 'PLAYING') {
+        pickRandomSpectatedSnake(snapshotRef.current, spectatedSnakeIdRef.current);
+      }
+      return next;
+    });
+  }, [pickRandomSpectatedSnake]);
+
+  const handleToggleSpectatorMode = useCallback(() => {
+    setGameState('TITLE_MENU');
+    setIsSpectating((prev) => {
+      const next = !prev;
+      if (next && zoomIn16Ref.current) {
+        const snap = snapshotRef.current;
+        const currentValid =
+          spectatedSnakeIdRef.current &&
+          snap?.snakes.some((s) => s.id === spectatedSnakeIdRef.current && s.alive);
+        if (!currentValid) {
+          pickRandomSpectatedSnake(snap);
+        }
+      }
+      return next;
+    });
+  }, [pickRandomSpectatedSnake]);
 
   const handleToggleMobileControls = useCallback(() => {
     setMobileControlsEnabled((prev) => {
@@ -1049,6 +1172,11 @@ export default function App() {
       }
 
       if (gameState === 'TITLE_MENU' || gameState === 'GAME_OVER') {
+        if (e.key === 'Escape' && gameState === 'TITLE_MENU' && isSpectatingRef.current) {
+          e.preventDefault();
+          setIsSpectating(false);
+          return;
+        }
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
           handleStartOrRespawn();
@@ -1156,9 +1284,41 @@ export default function App() {
       // Compute continuous sub-tick camera offset in grid coordinates when zoomed to 16x16 squares
       if (isZoomed) {
         const myId = playerIdRef.current;
-        const meSnake = snap?.snakes.find((s) => s.id === myId && s.alive);
-        const fallbackSnake = snap?.snakes.find((s) => s.alive);
-        const trackedSnake = meSnake || fallbackSnake;
+        const meSnake =
+          gameStateRef.current === 'PLAYING' || gameStateRef.current === 'PAUSED'
+            ? snap?.snakes.find((s) => s.id === myId && s.alive)
+            : undefined;
+        let trackedSnake = meSnake;
+
+        if (!trackedSnake && snap) {
+          trackedSnake = snap.snakes.find(
+            (s) => s.id === spectatedSnakeIdRef.current && s.alive
+          );
+          if (!trackedSnake) {
+            // If the watched snake was killed by another snake, immediately focus on that killer snake
+            const recentKill = spectatedSnakeIdRef.current
+              ? [...snap.recentKills]
+                  .reverse()
+                  .find((k) => k.victimId === spectatedSnakeIdRef.current && k.killerId)
+              : undefined;
+            const killerSnake = recentKill?.killerId
+              ? snap.snakes.find((s) => s.id === recentKill.killerId && s.alive)
+              : undefined;
+            if (killerSnake) {
+              spectatedSnakeIdRef.current = killerSnake.id;
+              trackedSnake = killerSnake;
+            } else {
+              // If the snake left the game or died to the wall, focus on a random other alive snake
+              const aliveSnakes = snap.snakes.filter((s) => s.alive);
+              if (aliveSnakes.length > 0) {
+                const chosen =
+                  aliveSnakes[Math.floor(Math.random() * aliveSnakes.length)];
+                spectatedSnakeIdRef.current = chosen.id;
+                trackedSnake = chosen;
+              }
+            }
+          }
+        }
 
         // Sub-tick interpolation factor (0.0 -> 1.0 over TICK_MS) eliminates 155ms grid-step jolts
         const tickAlpha = Math.min(
@@ -1708,6 +1868,20 @@ export default function App() {
               Admin Menu
             </button>
           )}
+          {gameState === 'TITLE_MENU' && (
+            <button
+              type="button"
+              onClick={handleToggleSpectatorMode}
+              className={`px-2.5 py-1 text-xs font-medium rounded border transition-colors whitespace-nowrap cursor-pointer ${
+                isSpectating
+                  ? 'bg-cyan-500/20 border-cyan-400/60 text-cyan-300'
+                  : 'bg-slate-800/80 hover:bg-slate-700/80 text-slate-300 border-slate-700'
+              }`}
+              title="Hide or show the main menu to spectate the live arena"
+            >
+              {isSpectating ? 'Show Main Menu' : 'Spectate (Hide Menu)'}
+            </button>
+          )}
           <button
             type="button"
             onClick={handleToggleMobileControls}
@@ -1958,8 +2132,63 @@ export default function App() {
           </div>
         )}
 
+        {/* SPECTATOR MODE FLOATING HUD BAR (WHEN MAIN MENU IS HIDDEN) */}
+        {gameState === 'TITLE_MENU' && isSpectating && (
+          <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-wrap items-center justify-center gap-3 px-4 py-2.5 rounded-xl bg-[#0D131F]/95 border border-cyan-500/40 shadow-[0_8px_32px_rgba(0,0,0,0.75)] backdrop-blur-md">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
+              <span className="font-display font-bold text-xs tracking-wider text-cyan-300">
+                SPECTATOR MODE
+              </span>
+            </div>
+
+            <span className="text-slate-700" aria-hidden="true">
+              |
+            </span>
+
+            {zoomIn16 && spectatedSnakeInfo ? (
+              <div className="flex items-center gap-2 text-xs font-mono-tabular">
+                <span className="text-slate-400">WATCHING:</span>
+                <span
+                  className="w-2.5 h-2.5 rounded-xs shrink-0"
+                  style={{ backgroundColor: spectatedSnakeInfo.color }}
+                />
+                <span className="font-bold text-white">{spectatedSnakeInfo.name}</span>
+                <span className="text-[10px] text-slate-400">
+                  ({spectatedSnakeInfo.length}px · {spectatedSnakeInfo.score} pts)
+                </span>
+              </div>
+            ) : (
+              <span className="text-xs font-mono-tabular text-slate-300">
+                Full Grid View · Press Zoom [Z] to follow a random snake
+              </span>
+            )}
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleToggleZoom}
+                className={`px-3 py-1 rounded-lg border text-xs font-mono-tabular font-semibold transition-colors cursor-pointer ${
+                  zoomIn16
+                    ? 'bg-emerald-500/20 border-emerald-400/70 text-emerald-300 hover:bg-emerald-500/30'
+                    : 'bg-slate-800 hover:bg-slate-700 border-slate-600 text-slate-200'
+                }`}
+              >
+                {zoomIn16 ? 'Zoom: 16×16 [Z]' : 'Zoom Random Snake [Z]'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsSpectating(false)}
+                className="px-3 py-1 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-display font-bold text-xs tracking-wide transition-colors cursor-pointer"
+              >
+                Show Main Menu [Esc]
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* TITLE SCREEN OVERLAY */}
-        {gameState === 'TITLE_MENU' && (
+        {gameState === 'TITLE_MENU' && !isSpectating && (
           <div className="absolute inset-0 z-30 bg-[#080B10]/80 flex items-center justify-center p-4">
             <div className="w-full max-w-xl rounded-xl bg-[#0D131F] border border-slate-700/80 shadow-2xl p-6 sm:p-8 space-y-6">
               {/* Bespoke Inline SVG Title Lockup */}
@@ -2187,15 +2416,24 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Primary Start CTA & Single-Line Genre Control Hint */}
-              <div className="space-y-3 pt-2">
-                <button
-                  type="button"
-                  onClick={handleStartOrRespawn}
-                  className="w-full py-3.5 px-6 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-base tracking-wide transition-colors cursor-pointer shadow-lg shadow-emerald-500/20"
-                >
-                  Drop Into {serverGridSize}×{serverGridSize} Grid [Enter]
-                </button>
+              {/* Primary Start CTA & Spectator Mode Button */}
+              <div className="space-y-2.5 pt-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  <button
+                    type="button"
+                    onClick={handleStartOrRespawn}
+                    className="sm:col-span-2 py-3.5 px-6 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-base tracking-wide transition-colors cursor-pointer shadow-lg shadow-emerald-500/20"
+                  >
+                    Drop Into {serverGridSize}×{serverGridSize} Grid [Enter]
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleToggleSpectatorMode}
+                    className="py-3.5 px-4 rounded-lg bg-slate-800/90 hover:bg-slate-700/90 border border-cyan-500/40 text-cyan-300 font-display font-semibold text-xs sm:text-sm tracking-wide transition-colors cursor-pointer"
+                  >
+                    Spectate (Hide Menu)
+                  </button>
+                </div>
                 <p className="text-center text-xs text-slate-400 font-mono-tabular">
                   WASD / Arrow Keys Move · Z Toggle 16×16 Zoom · M Mute · Esc Pause
                 </p>
@@ -2278,10 +2516,20 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setGameState('TITLE_MENU')}
+                  onClick={handleToggleSpectatorMode}
+                  className="py-3 px-4 rounded-lg bg-slate-800 hover:bg-slate-700 border border-cyan-500/40 text-cyan-300 font-medium text-sm transition-colors cursor-pointer"
+                >
+                  Spectate
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsSpectating(false);
+                    setGameState('TITLE_MENU');
+                  }}
                   className="py-3 px-4 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium text-sm transition-colors cursor-pointer"
                 >
-                  Change Color
+                  Main Menu
                 </button>
               </div>
             </div>
