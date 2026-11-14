@@ -112,6 +112,16 @@ async function startServer() {
             type: 'state',
             state: arena.getSnapshot(),
           });
+        } else if (msg.type === 'admin_track') {
+          const payload = JSON.stringify({
+            type: 'admin_track',
+            trackId: msg.trackId,
+          } satisfies ServerToClientMessage);
+          for (const [client, info] of clientPlayers.entries()) {
+            if (client.readyState === WebSocket.OPEN && info.gridSize === activeGridSize) {
+              client.send(payload);
+            }
+          }
         } else if (msg.type === 'leave') {
           arenas.get(activeGridSize)!.removePlayer(assignedPlayerId);
         }

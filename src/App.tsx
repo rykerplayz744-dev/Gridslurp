@@ -11,6 +11,13 @@ import {
   SNAKE_PALETTES,
   TICK_MS,
 } from './shared/gameTypes';
+import {
+  ADMIN_AUDIO_TRACKS,
+  DISCOVERED_AUDIO_TRACKS,
+  loadPlaylistStore,
+  PlaylistStoreState,
+  savePlaylistStore,
+} from './utils/playlistManager';
 import { soundEngine } from './utils/soundEngine';
 
 const getMeshTopic = (size: ServerGridSize) => `gridslurp/v2/arena/global_main_${size}x${size}`;
@@ -54,10 +61,36 @@ export default function App() {
   const [gameState, setGameState] = useState<GameState>('TITLE_MENU');
   const [serverGridSize, setServerGridSize] = useState<ServerGridSize>(32);
   const [zoomIn16, setZoomIn16] = useState<boolean>(false);
+  const [mobileControlsEnabled, setMobileControlsEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('gridslurp_mobile_controls') === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [playerName, setPlayerName] = useState<string>('VIPER_01');
   const [selectedColorId, setSelectedColorId] = useState<string>('emerald');
   const [muted, setMuted] = useState<boolean>(soundEngine.muted);
   const [, setConnectionMode] = useState<'ws' | 'local-sync'>('ws');
+  const [showAdminModal, setShowAdminModal] = useState<boolean>(false);
+  const [playlistStore, setPlaylistStore] = useState<PlaylistStoreState>(() => loadPlaylistStore());
+  const [selectedPlaylistId, setSelectedPlaylistId] = useState<string>(
+    () => loadPlaylistStore().activePlaylistId
+  );
+  const [newPlaylistName, setNewPlaylistName] = useState<string>('');
+  const [currentTrackId, setCurrentTrackId] = useState<string | null>(null);
+  const [isMusicPlaying, setIsMusicPlaying] = useState<boolean>(false);
+  const [adminInServer, setAdminInServer] = useState<boolean>(false);
+  const [isAdminMusicActive, setIsAdminMusicActive] = useState<boolean>(false);
+  const [adminLeaveSecondsLeft, setAdminLeaveSecondsLeft] = useState<number | null>(null);
+
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const isAdminMusicActiveRef = useRef<boolean>(false);
+  const manualDefaultMusicPlayingRef = useRef<boolean>(false);
+  const adminLeaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const adminLeaveCountdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const playNextAdminTrackRef = useRef<(forceTrackId?: string) => void>(() => {});
+  const isAdminName = playerName.trim().toUpperCase() === 'ADMIN';
 
   // HUD state synced at tick rate (not 60fps) to keep React lightweight
   const [hudStats, setHudStats] = useState<{
@@ -300,6 +333,18 @@ export default function App() {
         })),
         killFeed: feed,
       }));
+
+      // Check if any player named ADMIN is currently active in the server
+      const hasAdminSnake = snap.snakes.some(
+        (s) => !s.isBot && s.alive && s.name.trim().toUpperCase() === 'ADMIN'
+      );
+      const hasAdminPeer = Array.from(activePeersRef.current.values()).some(
+        (p) =>
+          performance.now() - p.lastSeen < 6500 &&
+          p.playing &&
+          p.name.trim().toUpperCase() === 'ADMIN'
+      );
+      setAdminInServer(hasAdminSnake || hasAdminPeer);
     },
     [spawnBurst]
   );
@@ -413,6 +458,10 @@ export default function App() {
           engine.spawnPlayer(targetId, cmd.name, cmd.colorId);
         } else if (cmd.type === 'turn') {
           engine.queueTurn(targetId, cmd.dir);
+        } else if (cmd.type === 'admin_track') {
+          isAdminMusicActiveRef.current = true;
+          setIsAdminMusicActive(true);
+          playNextAdminTrackRef.current(cmd.trackId);
         } else if (cmd.type === 'leave') {
           engine.removePlayer(targetId);
           myJoinInfoRef.current = { ...myJoinInfoRef.current };
@@ -561,6 +610,10 @@ export default function App() {
             snapshotRef.current = msg.state;
             lastSnapshotTimeRef.current = performance.now();
             processSnapshotEvents(msg.state);
+          } else if (msg.type === 'admin_track') {
+            isAdminMusicActiveRef.current = true;
+            setIsAdminMusicActive(true);
+            playNextAdminTrackRef.current(msg.trackId);
           }
         } catch {
           // ignore parse error
@@ -662,6 +715,259 @@ export default function App() {
     [serverGridSize]
   );
 
+  // Persist playlist store changes
+  const updatePlaylistStore = useCallback(
+    (updater: (prev: PlaylistStoreState) => PlaylistStoreState) => {
+      setPlaylistStore((prev) => {
+        const next = updater(prev);
+        savePlaylistStore(next);
+        return next;
+      });
+    },
+    []
+  );
+
+  const adminQueueRef = useRef<{ queue: string[]; index: number }>({
+    queue: [],
+    index: 0,
+  });
+  const defaultQueueRef = useRef<{
+    playlistKey: string;
+    shuffle: boolean;
+    queue: string[];
+    index: number;
+  }>({
+    playlistKey: '',
+    shuffle: true,
+    queue: [],
+    index: 0,
+  });
+
+  const createShuffledOrder = useCallback(
+    (ids: string[], lastPlayedId?: string | null): string[] => {
+      const shuffled = [...ids];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        const tmp = shuffled[i];
+        shuffled[i] = shuffled[j];
+        shuffled[j] = tmp;
+      }
+      // If reshuffling at the end of a playlist with 2+ tracks, avoid repeating the last track of the previous loop right away
+      if (shuffled.length > 1 && lastPlayedId && shuffled[0] === lastPlayedId) {
+        const swapIdx = 1 + Math.floor(Math.random() * (shuffled.length - 1));
+        const tmp = shuffled[0];
+        shuffled[0] = shuffled[swapIdx];
+        shuffled[swapIdx] = tmp;
+      }
+      return shuffled;
+    },
+    []
+  );
+
+  // Play a shuffled track from the dedicated src/audio/admin/ folder (reshuffles & loops at end)
+  const playNextAdminTrack = useCallback(
+    (forceTrackId?: string) => {
+      const audio = audioRef.current;
+      if (!audio) return;
+
+      if (ADMIN_AUDIO_TRACKS.length === 0) {
+        return;
+      }
+
+      const poolIds = ADMIN_AUDIO_TRACKS.map((t) => t.id);
+      let chosenId = forceTrackId;
+
+      if (chosenId && ADMIN_AUDIO_TRACKS.some((t) => t.id === chosenId)) {
+        adminQueueRef.current.queue = createShuffledOrder(poolIds);
+        const foundIdx = adminQueueRef.current.queue.indexOf(chosenId);
+        adminQueueRef.current.index = foundIdx >= 0 ? foundIdx + 1 : 0;
+      } else {
+        // When we reach the end of the admin playlist (or haven't built it yet), reshuffle and loop from the start!
+        if (
+          adminQueueRef.current.queue.length !== poolIds.length ||
+          adminQueueRef.current.index >= adminQueueRef.current.queue.length
+        ) {
+          adminQueueRef.current.queue = createShuffledOrder(poolIds, currentTrackId);
+          adminQueueRef.current.index = 0;
+        }
+        chosenId = adminQueueRef.current.queue[adminQueueRef.current.index];
+        adminQueueRef.current.index += 1;
+      }
+
+      const track = ADMIN_AUDIO_TRACKS.find((t) => t.id === chosenId);
+      if (!track) return;
+
+      setCurrentTrackId(track.id);
+      const targetHref = new URL(track.url, window.location.origin).href;
+      if (audio.src !== targetHref) {
+        audio.src = track.url;
+      } else {
+        audio.currentTime = 0;
+      }
+      audio.volume = muted || !playlistStore.musicEnabled ? 0 : playlistStore.volume;
+      audio
+        .play()
+        .then(() => setIsMusicPlaying(true))
+        .catch(() => setIsMusicPlaying(false));
+    },
+    [createShuffledOrder, currentTrackId, muted, playlistStore.musicEnabled, playlistStore.volume]
+  );
+
+  useEffect(() => {
+    playNextAdminTrackRef.current = playNextAdminTrack;
+  }, [playNextAdminTrack]);
+
+  // Pick next track from the active default playlist: plays through all tracks, then reshuffles and loops at the end
+  const playNextPlaylistTrack = useCallback(
+    (forceTrackId?: string) => {
+      const audio = audioRef.current;
+      if (!audio) return;
+
+      const activePl =
+        playlistStore.playlists.find((p) => p.id === playlistStore.activePlaylistId) ||
+        playlistStore.playlists[0];
+      const poolIds =
+        activePl && activePl.trackIds.length > 0
+          ? activePl.trackIds
+          : DISCOVERED_AUDIO_TRACKS.map((t) => t.id);
+
+      if (poolIds.length === 0) {
+        audio.pause();
+        setIsMusicPlaying(false);
+        return;
+      }
+
+      const playlistKey = `${activePl?.id || 'default'}:${poolIds.join(',')}`;
+      let chosenId = forceTrackId;
+
+      if (chosenId && DISCOVERED_AUDIO_TRACKS.some((t) => t.id === chosenId)) {
+        const nextQueue = playlistStore.shuffle
+          ? createShuffledOrder(poolIds)
+          : [...poolIds];
+        const foundIdx = nextQueue.indexOf(chosenId);
+        defaultQueueRef.current = {
+          playlistKey,
+          shuffle: playlistStore.shuffle,
+          queue: nextQueue,
+          index: foundIdx >= 0 ? foundIdx + 1 : 0,
+        };
+      } else {
+        const qState = defaultQueueRef.current;
+        const needsRebuildOrReshuffle =
+          qState.playlistKey !== playlistKey ||
+          qState.shuffle !== playlistStore.shuffle ||
+          qState.queue.length === 0 ||
+          qState.index >= qState.queue.length;
+
+        // Once it gets to the end of the playlist, reshuffle and loop from that new order!
+        if (needsRebuildOrReshuffle) {
+          qState.playlistKey = playlistKey;
+          qState.shuffle = playlistStore.shuffle;
+          qState.queue = playlistStore.shuffle
+            ? createShuffledOrder(poolIds, currentTrackId)
+            : [...poolIds];
+          qState.index = 0;
+        }
+
+        chosenId = qState.queue[qState.index];
+        qState.index += 1;
+      }
+
+      const track = DISCOVERED_AUDIO_TRACKS.find((t) => t.id === chosenId);
+      if (!track) return;
+
+      setCurrentTrackId(track.id);
+      const targetHref = new URL(track.url, window.location.origin).href;
+      if (audio.src !== targetHref) {
+        audio.src = track.url;
+      } else {
+        audio.currentTime = 0;
+      }
+      audio.volume = muted || !playlistStore.musicEnabled ? 0 : playlistStore.volume;
+      audio
+        .play()
+        .then(() => setIsMusicPlaying(true))
+        .catch(() => setIsMusicPlaying(false));
+    },
+    [createShuffledOrder, playlistStore, currentTrackId, muted]
+  );
+
+  // Automatically start playing from src/audio/admin/ whenever a player named ADMIN is in the server,
+  // and stop 10 seconds after the ADMIN leaves the server (returning to default music).
+  useEffect(() => {
+    if (adminInServer) {
+      // Cancel any pending 10-second leave timer if ADMIN is back in the server
+      if (adminLeaveTimerRef.current) {
+        clearTimeout(adminLeaveTimerRef.current);
+        adminLeaveTimerRef.current = null;
+      }
+      if (adminLeaveCountdownRef.current) {
+        clearInterval(adminLeaveCountdownRef.current);
+        adminLeaveCountdownRef.current = null;
+      }
+      setAdminLeaveSecondsLeft(null);
+
+      if (!isAdminMusicActiveRef.current) {
+        isAdminMusicActiveRef.current = true;
+        setIsAdminMusicActive(true);
+        playNextAdminTrack();
+      } else if (audioRef.current && audioRef.current.paused && playlistStore.musicEnabled) {
+        playNextAdminTrack();
+      }
+    } else if (isAdminMusicActiveRef.current && !adminLeaveTimerRef.current) {
+      // ADMIN just left the server: keep playing admin music for 10 seconds, then stop and return to default music
+      const leaveDeadline = performance.now() + 10000;
+      setAdminLeaveSecondsLeft(10);
+
+      adminLeaveCountdownRef.current = setInterval(() => {
+        const rem = Math.max(0, Math.ceil((leaveDeadline - performance.now()) / 1000));
+        setAdminLeaveSecondsLeft(rem);
+      }, 250);
+
+      adminLeaveTimerRef.current = setTimeout(() => {
+        adminLeaveTimerRef.current = null;
+        if (adminLeaveCountdownRef.current) {
+          clearInterval(adminLeaveCountdownRef.current);
+          adminLeaveCountdownRef.current = null;
+        }
+        setAdminLeaveSecondsLeft(null);
+        isAdminMusicActiveRef.current = false;
+        setIsAdminMusicActive(false);
+
+        const audio = audioRef.current;
+        if (audio) {
+          audio.pause();
+        }
+        // Return to default music if it was manually enabled/started, otherwise stay stopped
+        if (manualDefaultMusicPlayingRef.current && playlistStore.musicEnabled) {
+          playNextPlaylistTrack();
+        } else {
+          setIsMusicPlaying(false);
+          setCurrentTrackId(null);
+        }
+      }, 10000);
+    }
+  }, [adminInServer, playNextAdminTrack, playNextPlaylistTrack, playlistStore.musicEnabled]);
+
+  // Cleanup admin leave timers on unmount
+  useEffect(() => {
+    return () => {
+      if (adminLeaveTimerRef.current) clearTimeout(adminLeaveTimerRef.current);
+      if (adminLeaveCountdownRef.current) clearInterval(adminLeaveCountdownRef.current);
+    };
+  }, []);
+
+  // Sync volume & mute state to the HTML5 Audio element
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.volume = muted || !playlistStore.musicEnabled ? 0 : playlistStore.volume;
+    if (!playlistStore.musicEnabled && !audio.paused) {
+      audio.pause();
+      setIsMusicPlaying(false);
+    }
+  }, [muted, playlistStore.volume, playlistStore.musicEnabled]);
+
   const handleStartOrRespawn = useCallback(() => {
     const cleanName = playerName.trim().toUpperCase().slice(0, 14) || 'VIPER_01';
     lastAutoJoinSentAtRef.current = performance.now();
@@ -673,6 +979,17 @@ export default function App() {
       gridSize: serverGridSize,
     });
     setGameState('PLAYING');
+
+    // Nothing starts playing automatically except for the admin music when a player named ADMIN is in the server!
+    if (cleanName === 'ADMIN') {
+      setAdminInServer(true);
+    } else if (isAdminMusicActiveRef.current && audioRef.current && audioRef.current.paused) {
+      // If another player named ADMIN is already in the server, resume admin music on user gesture
+      audioRef.current
+        .play()
+        .then(() => setIsMusicPlaying(true))
+        .catch(() => {});
+    }
   }, [playerName, selectedColorId, serverGridSize, sendCommand]);
 
   const handleToggleMute = useCallback(() => {
@@ -683,6 +1000,27 @@ export default function App() {
   const handleToggleZoom = useCallback(() => {
     setZoomIn16((prev) => !prev);
   }, []);
+
+  const handleToggleMobileControls = useCallback(() => {
+    setMobileControlsEnabled((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('gridslurp_mobile_controls', String(next));
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  }, []);
+
+  const handleMobileTurn = useCallback(
+    (dir: Direction) => {
+      if (gameState !== 'PLAYING') return;
+      soundEngine.playTurnBlip();
+      sendCommand({ type: 'turn', dir });
+    },
+    [gameState, sendCommand]
+  );
 
   // Strict WASD & Arrow Keys directional input listener
   useEffect(() => {
@@ -1361,6 +1699,27 @@ export default function App() {
 
         {/* Right Controls */}
         <div className="flex items-center gap-2 shrink-0">
+          {isAdminName && (
+            <button
+              type="button"
+              onClick={() => setShowAdminModal(true)}
+              className="px-2.5 py-1 text-xs font-semibold bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-400/60 rounded transition-colors whitespace-nowrap cursor-pointer"
+            >
+              Admin Menu
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={handleToggleMobileControls}
+            className={`px-2.5 py-1 text-xs font-medium rounded border transition-colors whitespace-nowrap cursor-pointer ${
+              mobileControlsEnabled
+                ? 'bg-emerald-500/20 border-emerald-400/60 text-emerald-300'
+                : 'bg-slate-800/80 hover:bg-slate-700/80 text-slate-300 border-slate-700'
+            }`}
+            title="Enable or disable on-screen mobile directional controls"
+          >
+            {mobileControlsEnabled ? 'Mobile: On' : 'Mobile: Off'}
+          </button>
           <button
             type="button"
             onClick={handleToggleZoom}
@@ -1513,11 +1872,91 @@ export default function App() {
                 border is instant death.
               </p>
               <p className="pt-1 text-[11px] font-mono-tabular text-slate-300">
-                Controls: WASD or Arrow Keys only
+                Controls: WASD, Arrow Keys, or Mobile Controls
               </p>
             </div>
           </aside>
         </div>
+
+        {/* ON-SCREEN MOBILE CONTROLS D-PAD OVERLAY */}
+        {mobileControlsEnabled && gameState === 'PLAYING' && (
+          <div
+            className="fixed bottom-5 right-5 z-20 select-none touch-none"
+            aria-label="Mobile Directional Controls"
+          >
+            <div className="p-2.5 rounded-2xl bg-[#0B111D]/85 border border-slate-700/80 backdrop-blur-md shadow-[0_8px_32px_rgba(0,0,0,0.65)]">
+              <div className="grid grid-cols-3 gap-2 w-40 h-40 sm:w-44 sm:h-44">
+                <div />
+                <button
+                  type="button"
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleMobileTurn('UP');
+                  }}
+                  aria-label="Turn Up"
+                  className="flex items-center justify-center rounded-xl bg-slate-800/90 active:bg-emerald-500/40 hover:bg-slate-700/90 border border-slate-600/80 active:border-emerald-400 text-white shadow-inner transition-colors cursor-pointer touch-none select-none"
+                >
+                  <svg className="w-7 h-7" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 5l7 9H5l7-9z" />
+                  </svg>
+                </button>
+                <div />
+
+                <button
+                  type="button"
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleMobileTurn('LEFT');
+                  }}
+                  aria-label="Turn Left"
+                  className="flex items-center justify-center rounded-xl bg-slate-800/90 active:bg-emerald-500/40 hover:bg-slate-700/90 border border-slate-600/80 active:border-emerald-400 text-white shadow-inner transition-colors cursor-pointer touch-none select-none"
+                >
+                  <svg className="w-7 h-7" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M5 12l9-7v14l-9-7z" />
+                  </svg>
+                </button>
+
+                <div className="flex items-center justify-center rounded-xl bg-[#070A0F]/80 border border-slate-800/90">
+                  <div className="w-2.5 h-2.5 rounded-xs bg-emerald-400/70" />
+                </div>
+
+                <button
+                  type="button"
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleMobileTurn('RIGHT');
+                  }}
+                  aria-label="Turn Right"
+                  className="flex items-center justify-center rounded-xl bg-slate-800/90 active:bg-emerald-500/40 hover:bg-slate-700/90 border border-slate-600/80 active:border-emerald-400 text-white shadow-inner transition-colors cursor-pointer touch-none select-none"
+                >
+                  <svg className="w-7 h-7" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M19 12l-9 7V5l9 7z" />
+                  </svg>
+                </button>
+
+                <div />
+                <button
+                  type="button"
+                  onPointerDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleMobileTurn('DOWN');
+                  }}
+                  aria-label="Turn Down"
+                  className="flex items-center justify-center rounded-xl bg-slate-800/90 active:bg-emerald-500/40 hover:bg-slate-700/90 border border-slate-600/80 active:border-emerald-400 text-white shadow-inner transition-colors cursor-pointer touch-none select-none"
+                >
+                  <svg className="w-7 h-7" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 19l-7-9h14l-7 9z" />
+                  </svg>
+                </button>
+                <div />
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* TITLE SCREEN OVERLAY */}
         {gameState === 'TITLE_MENU' && (
@@ -1572,21 +2011,43 @@ export default function App() {
               {/* Player Name & Pixel Color Customizer */}
               <div className="space-y-4 pt-1">
                 <div>
-                  <label
-                    htmlFor="callsign-input"
-                    className="block text-xs font-medium text-slate-300 mb-1.5"
-                  >
-                    NAME
-                  </label>
-                  <input
-                    id="callsign-input"
-                    type="text"
-                    maxLength={14}
-                    value={playerName}
-                    onChange={(e) => setPlayerName(e.target.value)}
-                    placeholder="VIPER_01"
-                    className="w-full px-3.5 py-2.5 rounded-lg bg-[#080B10] border border-slate-700 text-white font-mono-tabular text-sm focus:outline-none focus:border-emerald-400"
-                  />
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label
+                      htmlFor="callsign-input"
+                      className="block text-xs font-medium text-slate-300"
+                    >
+                      NAME
+                    </label>
+                    {isAdminName && (
+                      <button
+                        type="button"
+                        onClick={() => setShowAdminModal(true)}
+                        className="px-3 py-1 rounded-md bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs tracking-wide transition-colors cursor-pointer shadow-sm"
+                      >
+                        ADMIN MENU
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      id="callsign-input"
+                      type="text"
+                      maxLength={14}
+                      value={playerName}
+                      onChange={(e) => setPlayerName(e.target.value.toUpperCase())}
+                      placeholder="VIPER_01"
+                      className="w-full px-3.5 py-2.5 rounded-lg bg-[#080B10] border border-slate-700 text-white font-mono-tabular text-sm uppercase focus:outline-none focus:border-emerald-400"
+                    />
+                    {isAdminName && (
+                      <button
+                        type="button"
+                        onClick={() => setShowAdminModal(true)}
+                        className="shrink-0 px-4 py-2.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/70 text-amber-300 font-display font-bold text-xs tracking-wider transition-colors cursor-pointer"
+                      >
+                        OPEN ADMIN MENU
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 <div>
@@ -1629,63 +2090,97 @@ export default function App() {
                     })}
                   </div>
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div>
                     <span className="block text-xs font-medium text-slate-300 mb-2">
                       ARENA SERVER
                     </span>
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-2 gap-1.5">
                       <button
                         type="button"
                         onClick={() => setServerGridSize(32)}
-                        className={`py-2 px-2.5 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                        className={`py-2 px-2 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
                           serverGridSize === 32
                             ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
                             : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
                         }`}
                       >
-                        32×32 SERVER
+                        32×32
                       </button>
                       <button
                         type="button"
                         onClick={() => setServerGridSize(64)}
-                        className={`py-2 px-2.5 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                        className={`py-2 px-2 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
                           serverGridSize === 64
                             ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
                             : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
                         }`}
                       >
-                        64×64 SERVER
+                        64×64
                       </button>
                     </div>
                   </div>
 
                   <div>
                     <span className="block text-xs font-medium text-slate-300 mb-2">
-                      CAMERA VIEW (ALL MODES)
+                      CAMERA VIEW
                     </span>
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-2 gap-1.5">
                       <button
                         type="button"
                         onClick={() => setZoomIn16(false)}
-                        className={`py-2 px-2.5 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                        className={`py-2 px-2 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
                           !zoomIn16
                             ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
                             : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
                         }`}
                       >
-                        FULL GRID
+                        FULL
                       </button>
                       <button
                         type="button"
                         onClick={() => setZoomIn16(true)}
-                        className={`py-2 px-2.5 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                        className={`py-2 px-2 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
                           zoomIn16
                             ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
                             : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
                         }`}
                       >
-                        16×16 ZOOM
+                        16×16
+                      </button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <span className="block text-xs font-medium text-slate-300 mb-2">
+                      MOBILE CONTROLS
+                    </span>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (mobileControlsEnabled) handleToggleMobileControls();
+                        }}
+                        className={`py-2 px-2 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                          !mobileControlsEnabled
+                            ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                            : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
+                        }`}
+                      >
+                        OFF
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (!mobileControlsEnabled) handleToggleMobileControls();
+                        }}
+                        className={`py-2 px-2 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                          mobileControlsEnabled
+                            ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                            : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
+                        }`}
+                      >
+                        ON
                       </button>
                     </div>
                   </div>
@@ -1792,7 +2287,516 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {/* ADMIN AUDIO PLAYLIST MENU MODAL */}
+        {showAdminModal && (
+          <div className="absolute inset-0 z-40 bg-[#080B10]/85 flex items-center justify-center p-4">
+            <div className="w-full max-w-2xl max-h-[90vh] flex flex-col rounded-xl bg-[#0D131F] border border-amber-500/50 shadow-2xl overflow-hidden">
+              {/* Modal Header */}
+              <div className="px-6 py-4 bg-[#090D16] border-b border-slate-800 flex items-center justify-between">
+                <div>
+                  <div className="text-[11px] font-mono-tabular text-amber-400 font-semibold">
+                    ADMIN AUDIO CONSOLE · FOLDER: src/audio/
+                  </div>
+                  <h2 className="font-display text-xl font-bold text-white">
+                    SHUFFLED GAME AUDIO PLAYLISTS
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowAdminModal(false)}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold cursor-pointer"
+                >
+                  Close
+                </button>
+              </div>
+
+              {/* Modal Body */}
+              <div className="p-6 overflow-y-auto space-y-5 text-xs">
+                {/* Folder Info Banners (Default Folder vs Extra Admin Folder) */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="p-3.5 rounded-lg bg-[#080B10] border border-slate-800 space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-slate-200">
+                        Default Music (<code className="text-emerald-300">src/audio/</code>)
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-mono-tabular text-[11px] font-semibold">
+                        {DISCOVERED_AUDIO_TRACKS.length} TRACKS
+                      </span>
+                    </div>
+                    <p className="text-slate-400 leading-relaxed text-[11px]">
+                      Does not auto-play on launch. Organize into playlists below or start manually.
+                    </p>
+                  </div>
+
+                  <div className="p-3.5 rounded-lg bg-[#080B10] border border-amber-500/40 space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-amber-300">
+                        Admin Auto-Play (<code className="text-amber-200">src/audio/admin/</code>)
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 font-mono-tabular text-[11px] font-semibold">
+                        {ADMIN_AUDIO_TRACKS.length} ADMIN TRACKS
+                      </span>
+                    </div>
+                    <p className="text-slate-400 leading-relaxed text-[11px]">
+                      Hidden from default playlists. Auto-plays whenever a player named{' '}
+                      <strong className="text-white">ADMIN</strong> is in the server, and stops 10s
+                      after they leave.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Playback & Shuffle Controls Bar */}
+                <div className="p-4 rounded-lg bg-[#080B10] border border-slate-800 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="space-y-0.5">
+                      <div className="text-[11px] font-mono-tabular text-slate-400">
+                        {isAdminMusicActive
+                          ? `ADMIN PRESENCE MUSIC ACTIVE${
+                              adminLeaveSecondsLeft !== null
+                                ? ` (STOPPING IN ${adminLeaveSecondsLeft}s)`
+                                : ' (ADMIN IN SERVER)'
+                            }`
+                          : `DEFAULT PLAYLIST (${playlistStore.shuffle ? 'SHUFFLED' : 'IN ORDER'})`}
+                      </div>
+                      <div className="text-sm font-mono-tabular font-semibold text-amber-300">
+                        {currentTrackId
+                          ? DISCOVERED_AUDIO_TRACKS.find((t) => t.id === currentTrackId)?.title ||
+                            ADMIN_AUDIO_TRACKS.find((t) => t.id === currentTrackId)?.title ||
+                            currentTrackId
+                          : 'Stopped (Only Admin Music Starts Automatically)'}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const audio = audioRef.current;
+                          if (!audio) return;
+                          if (isMusicPlaying && !audio.paused) {
+                            audio.pause();
+                            manualDefaultMusicPlayingRef.current = false;
+                            setIsMusicPlaying(false);
+                          } else {
+                            manualDefaultMusicPlayingRef.current = true;
+                            if (isAdminMusicActiveRef.current) {
+                              playNextAdminTrack();
+                            } else {
+                              playNextPlaylistTrack();
+                            }
+                          }
+                        }}
+                        className="px-3 py-1.5 rounded bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold cursor-pointer"
+                      >
+                        {isMusicPlaying ? 'Pause Music' : 'Play Default Playlist'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          manualDefaultMusicPlayingRef.current = true;
+                          if (isAdminMusicActiveRef.current) {
+                            playNextAdminTrack();
+                          } else {
+                            playNextPlaylistTrack();
+                          }
+                        }}
+                        className="px-3 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-medium cursor-pointer"
+                      >
+                        Next Shuffled Track ⏭
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="pt-2 border-t border-slate-800/80 grid grid-cols-1 sm:grid-cols-3 gap-3 items-center">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updatePlaylistStore((prev) => ({ ...prev, shuffle: !prev.shuffle }))
+                      }
+                      className={`py-2 px-3 rounded border font-mono-tabular font-semibold cursor-pointer transition-colors ${
+                        playlistStore.shuffle
+                          ? 'bg-amber-500/15 border-amber-400 text-amber-300'
+                          : 'bg-[#0D131F] border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      SHUFFLE: {playlistStore.shuffle ? 'ON (DEFAULT)' : 'OFF'}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        updatePlaylistStore((prev) => ({
+                          ...prev,
+                          musicEnabled: !prev.musicEnabled,
+                        }))
+                      }
+                      className={`py-2 px-3 rounded border font-mono-tabular font-semibold cursor-pointer transition-colors ${
+                        playlistStore.musicEnabled
+                          ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                          : 'bg-[#0D131F] border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      GAME MUSIC: {playlistStore.musicEnabled ? 'ENABLED' : 'MUTED'}
+                    </button>
+
+                    <div className="flex items-center gap-2 px-2">
+                      <span className="text-slate-400 font-mono-tabular">
+                        VOL {Math.round(playlistStore.volume * 100)}%
+                      </span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={1}
+                        step={0.05}
+                        value={playlistStore.volume}
+                        onChange={(e) =>
+                          updatePlaylistStore((prev) => ({
+                            ...prev,
+                            volume: Number(e.target.value),
+                          }))
+                        }
+                        className="w-full accent-emerald-400 cursor-pointer"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Admin Music Folder Track Selector (src/audio/admin/) */}
+                <div className="p-4 rounded-lg bg-[#080B10] border border-amber-500/40 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="font-display font-semibold text-amber-300 tracking-wide">
+                        CHOOSE ADMIN SONG (<code className="text-amber-200">src/audio/admin/</code>)
+                      </div>
+                      <p className="text-[11px] text-slate-400">
+                        Select any song in the admin folder to play it right now. When it finishes,
+                        the admin folder continues shuffling and looping.
+                      </p>
+                    </div>
+                    {ADMIN_AUDIO_TRACKS.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          isAdminMusicActiveRef.current = true;
+                          setIsAdminMusicActive(true);
+                          playNextAdminTrack();
+                        }}
+                        className="px-2.5 py-1.5 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/60 text-amber-200 font-mono-tabular font-semibold text-[11px] cursor-pointer"
+                      >
+                        Shuffle Next Admin Song ⏭
+                      </button>
+                    )}
+                  </div>
+
+                  {ADMIN_AUDIO_TRACKS.length === 0 ? (
+                    <div className="p-3 rounded bg-[#0D131F] border border-slate-800 text-slate-400 text-[11px]">
+                      No audio files found in <code>src/audio/admin/</code>. Drop any{' '}
+                      <code>.mp3</code> into <code>src/audio/admin/</code> to select it here.
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-44 overflow-y-auto pr-1">
+                      {ADMIN_AUDIO_TRACKS.map((track) => {
+                        const isCurrentlyPlayingThis =
+                          currentTrackId === track.id && isMusicPlaying;
+                        return (
+                          <div
+                            key={track.id}
+                            className={`p-2.5 rounded-lg border flex items-center justify-between gap-2.5 transition-colors ${
+                              isCurrentlyPlayingThis
+                                ? 'bg-amber-500/15 border-amber-400 text-white'
+                                : 'bg-[#0D131F] border-slate-800 text-slate-200 hover:border-slate-700'
+                            }`}
+                          >
+                            <div className="truncate">
+                              <div className="font-mono-tabular font-semibold truncate">
+                                {track.title}
+                              </div>
+                              <div className="text-[10px] text-slate-400 font-mono-tabular truncate">
+                                src/audio/{track.id}
+                              </div>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                isAdminMusicActiveRef.current = true;
+                                setIsAdminMusicActive(true);
+                                playNextAdminTrack(track.id);
+                                sendCommand({ type: 'admin_track', trackId: track.id });
+                              }}
+                              className={`px-3 py-1.5 rounded text-[11px] font-mono-tabular font-semibold shrink-0 cursor-pointer transition-colors ${
+                                isCurrentlyPlayingThis
+                                  ? 'bg-amber-400 text-slate-950'
+                                  : 'bg-slate-800 hover:bg-amber-500 hover:text-slate-950 text-amber-300 border border-amber-500/40'
+                              }`}
+                            >
+                              {isCurrentlyPlayingThis ? 'PLAYING NOW' : 'PLAY SONG'}
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* Playlists Organizer Grid */}
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
+                  {/* Left Column: Playlists List & Create New Playlist */}
+                  <div className="md:col-span-5 space-y-3">
+                    <div className="font-display font-semibold text-slate-200 tracking-wide">
+                      1. SELECT OR CREATE PLAYLIST
+                    </div>
+
+                    <div className="space-y-1.5">
+                      {playlistStore.playlists.map((pl) => {
+                        const isSelected = selectedPlaylistId === pl.id;
+                        const isActiveInGame = playlistStore.activePlaylistId === pl.id;
+                        return (
+                          <div
+                            key={pl.id}
+                            onClick={() => setSelectedPlaylistId(pl.id)}
+                            className={`p-2.5 rounded-lg border transition-colors cursor-pointer flex items-center justify-between gap-2 ${
+                              isSelected
+                                ? 'bg-slate-800/90 border-amber-400/70 text-white'
+                                : 'bg-[#080B10] border-slate-800 text-slate-300 hover:border-slate-700'
+                            }`}
+                          >
+                            <div className="truncate">
+                              <div className="font-semibold truncate">{pl.name}</div>
+                              <div className="text-[11px] text-slate-400 font-mono-tabular">
+                                {pl.trackIds.length} tracks
+                                {isActiveInGame ? ' · ACTIVE IN GAME' : ''}
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  updatePlaylistStore((prev) => ({
+                                    ...prev,
+                                    activePlaylistId: pl.id,
+                                  }));
+                                }}
+                                className={`px-2 py-1 rounded text-[10px] font-mono-tabular font-semibold cursor-pointer ${
+                                  isActiveInGame
+                                    ? 'bg-emerald-500 text-slate-950'
+                                    : 'bg-slate-700 hover:bg-slate-600 text-slate-200'
+                                }`}
+                              >
+                                {isActiveInGame ? 'ACTIVE' : 'SET ACTIVE'}
+                              </button>
+                              {!pl.isBuiltIn && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    updatePlaylistStore((prev) => {
+                                      const filtered = prev.playlists.filter((p) => p.id !== pl.id);
+                                      const nextActive =
+                                        prev.activePlaylistId === pl.id
+                                          ? 'all_tracks'
+                                          : prev.activePlaylistId;
+                                      return {
+                                        ...prev,
+                                        playlists: filtered,
+                                        activePlaylistId: nextActive,
+                                      };
+                                    });
+                                    if (selectedPlaylistId === pl.id) {
+                                      setSelectedPlaylistId('all_tracks');
+                                    }
+                                  }}
+                                  className="px-2 py-1 rounded bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 text-[10px] font-semibold cursor-pointer"
+                                  title="Delete playlist"
+                                >
+                                  DEL
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Create New Playlist Input */}
+                    <div className="pt-2 flex items-center gap-2">
+                      <input
+                        type="text"
+                        maxLength={24}
+                        value={newPlaylistName}
+                        onChange={(e) => setNewPlaylistName(e.target.value.toUpperCase())}
+                        placeholder="NEW PLAYLIST NAME..."
+                        className="flex-1 px-3 py-2 rounded-lg bg-[#080B10] border border-slate-700 text-white font-mono-tabular text-xs uppercase focus:outline-none focus:border-amber-400"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const clean = newPlaylistName.trim().toUpperCase();
+                          if (!clean) return;
+                          const newId = `custom_${Date.now()}`;
+                          updatePlaylistStore((prev) => ({
+                            ...prev,
+                            playlists: [
+                              ...prev.playlists,
+                              {
+                                id: newId,
+                                name: clean,
+                                trackIds: DISCOVERED_AUDIO_TRACKS.map((t) => t.id),
+                              },
+                            ],
+                            activePlaylistId: newId,
+                          }));
+                          setSelectedPlaylistId(newId);
+                          setNewPlaylistName('');
+                        }}
+                        className="px-3 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold text-xs whitespace-nowrap cursor-pointer"
+                      >
+                        + Create
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Right Column: Organize Tracks Inside Selected Playlist */}
+                  <div className="md:col-span-7 space-y-3">
+                    {(() => {
+                      const editingPl =
+                        playlistStore.playlists.find((p) => p.id === selectedPlaylistId) ||
+                        playlistStore.playlists[0];
+                      if (!editingPl) return null;
+
+                      return (
+                        <>
+                          <div className="flex items-center justify-between">
+                            <div className="font-display font-semibold text-slate-200 tracking-wide">
+                              2. ORGANIZE TRACKS IN "{editingPl.name}"
+                            </div>
+                            {!editingPl.isBuiltIn && (
+                              <div className="flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    updatePlaylistStore((prev) => ({
+                                      ...prev,
+                                      playlists: prev.playlists.map((p) =>
+                                        p.id === editingPl.id
+                                          ? {
+                                              ...p,
+                                              trackIds: DISCOVERED_AUDIO_TRACKS.map((t) => t.id),
+                                            }
+                                          : p
+                                      ),
+                                    }))
+                                  }
+                                  className="text-[11px] text-emerald-400 hover:underline cursor-pointer"
+                                >
+                                  Select All
+                                </button>
+                                <span className="text-slate-700">·</span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    updatePlaylistStore((prev) => ({
+                                      ...prev,
+                                      playlists: prev.playlists.map((p) =>
+                                        p.id === editingPl.id ? { ...p, trackIds: [] } : p
+                                      ),
+                                    }))
+                                  }
+                                  className="text-[11px] text-slate-400 hover:underline cursor-pointer"
+                                >
+                                  Clear
+                                </button>
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+                            {DISCOVERED_AUDIO_TRACKS.map((track) => {
+                              const included = editingPl.trackIds.includes(track.id);
+                              const isCurrent = currentTrackId === track.id && isMusicPlaying;
+                              return (
+                                <div
+                                  key={track.id}
+                                  className={`p-2.5 rounded-lg border flex items-center justify-between gap-3 ${
+                                    included
+                                      ? 'bg-[#080B10] border-slate-700 text-slate-100'
+                                      : 'bg-[#080B10]/50 border-slate-800/60 text-slate-500'
+                                  }`}
+                                >
+                                  <div className="flex items-center gap-2.5 truncate">
+                                    <input
+                                      type="checkbox"
+                                      disabled={Boolean(editingPl.isBuiltIn)}
+                                      checked={included}
+                                      onChange={() => {
+                                        if (editingPl.isBuiltIn) return;
+                                        updatePlaylistStore((prev) => ({
+                                          ...prev,
+                                          playlists: prev.playlists.map((p) => {
+                                            if (p.id !== editingPl.id) return p;
+                                            const exists = p.trackIds.includes(track.id);
+                                            return {
+                                              ...p,
+                                              trackIds: exists
+                                                ? p.trackIds.filter((id) => id !== track.id)
+                                                : [...p.trackIds, track.id],
+                                            };
+                                          }),
+                                        }));
+                                      }}
+                                      className="w-4 h-4 accent-emerald-500 cursor-pointer"
+                                    />
+                                    <div className="truncate">
+                                      <div className="font-mono-tabular font-medium truncate">
+                                        {track.title}
+                                      </div>
+                                      <div className="text-[10px] text-slate-400 font-mono-tabular truncate">
+                                        src/audio/{track.id}
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  <button
+                                    type="button"
+                                    onClick={() => playNextPlaylistTrack(track.id)}
+                                    className={`px-2.5 py-1 rounded text-[11px] font-mono-tabular font-semibold shrink-0 cursor-pointer ${
+                                      isCurrent
+                                        ? 'bg-amber-400 text-slate-950'
+                                        : 'bg-slate-800 hover:bg-slate-700 text-slate-200'
+                                    }`}
+                                  >
+                                    {isCurrent ? 'PLAYING' : 'PREVIEW'}
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
+
+      {/* Hidden HTML5 Audio Element for Shuffled In-Game Folder Playlists */}
+      <audio
+        ref={audioRef}
+        onEnded={() => {
+          if (isAdminMusicActiveRef.current) {
+            playNextAdminTrack();
+          } else {
+            playNextPlaylistTrack();
+          }
+        }}
+        className="hidden"
+      />
 
       {/* Bottom Slim Control Bar */}
       <footer className="w-full h-8 px-5 bg-[#0B0F17]/95 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400 font-mono-tabular z-20 shrink-0">

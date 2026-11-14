@@ -1,6 +1,6 @@
 export const GRID_SIZE = 32;
-export const TICK_MS = 155; // ~6.45 ticks/sec for slightly slower, tactical pixel grid control
-export const SPAWN_PROTECTION_TICKS = 22; // ~3.4 seconds fail-safe spawn protection timer
+export const TICK_MS = 165; // ~6.06 ticks/sec for 10ms more reaction time per grid step
+export const SPAWN_PROTECTION_TICKS = 22; // ~3.6 seconds fail-safe spawn protection timer
 
 export type Direction = 'UP' | 'DOWN' | 'LEFT' | 'RIGHT';
 
@@ -157,8 +157,10 @@ export type ClientToServerMessage =
   | { type: 'turn'; dir: Direction }
   | { type: 'respawn'; name: string; colorId: string; gridSize?: ServerGridSize }
   | { type: 'select_server'; gridSize: ServerGridSize }
+  | { type: 'admin_track'; trackId: string }
   | { type: 'leave' };
 
 export type ServerToClientMessage =
   | { type: 'welcome'; playerId: string; state: ArenaSnapshot }
-  | { type: 'state'; state: ArenaSnapshot };
+  | { type: 'state'; state: ArenaSnapshot }
+  | { type: 'admin_track'; trackId: string };
