@@ -53,6 +53,7 @@ interface Shockwave {
 export default function App() {
   const [gameState, setGameState] = useState<GameState>('TITLE_MENU');
   const [serverGridSize, setServerGridSize] = useState<ServerGridSize>(32);
+  const [zoomIn16, setZoomIn16] = useState<boolean>(false);
   const [playerName, setPlayerName] = useState<string>('VIPER_01');
   const [selectedColorId, setSelectedColorId] = useState<string>('emerald');
   const [muted, setMuted] = useState<boolean>(soundEngine.muted);
@@ -143,10 +144,16 @@ export default function App() {
   const shakeRef = useRef<number>(0);
   const hitstopUntilRef = useRef<number>(0);
   const gameStateRef = useRef<GameState>(gameState);
+  const zoomIn16Ref = useRef<boolean>(zoomIn16);
+  const camRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 
   useEffect(() => {
     gameStateRef.current = gameState;
   }, [gameState]);
+
+  useEffect(() => {
+    zoomIn16Ref.current = zoomIn16;
+  }, [zoomIn16]);
 
   const spawnBurst = useCallback((gridX: number, gridY: number, color: string, count = 18) => {
     for (let i = 0; i < count; i++) {
@@ -246,7 +253,7 @@ export default function App() {
         .slice(-4)
         .reverse()
         .map((k) => {
-          let desc = `${k.victimName} hit the 32x32 wall (${k.pelletsDropped} big pellets!)`;
+          let desc = `${k.victimName} hit the outer wall (${k.pelletsDropped} big pellets!)`;
           if (k.reason === 'SELF_CRASH') {
             desc = `${k.victimName} ran over itself (${k.pelletsDropped} big pellets!)`;
           } else if (k.reason === 'KILLED_BY_SNAKE' && k.killerName) {
@@ -416,7 +423,8 @@ export default function App() {
     const startGlobalMeshEngine = () => {
       if (isUnmounted || localEngineRef.current) return;
       setConnectionMode('ws');
-      const engine = new ArenaEngine(2, serverGridSize);
+      const targetBots = serverGridSize === 64 ? 4 : 2;
+      const engine = new ArenaEngine(targetBots, serverGridSize);
       localEngineRef.current = engine;
 
       // 1. Local multi-tab BroadcastChannel
@@ -672,6 +680,10 @@ export default function App() {
     setMuted(nextMuted);
   }, []);
 
+  const handleToggleZoom = useCallback(() => {
+    setZoomIn16((prev) => !prev);
+  }, []);
+
   // Strict WASD & Arrow Keys directional input listener
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -689,6 +701,12 @@ export default function App() {
       if (e.key === 'm' || e.key === 'M') {
         e.preventDefault();
         handleToggleMute();
+        return;
+      }
+
+      if (e.key === 'z' || e.key === 'Z') {
+        e.preventDefault();
+        handleToggleZoom();
         return;
       }
 
@@ -740,14 +758,20 @@ export default function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [gameState, handleStartOrRespawn, handleToggleMute, sendCommand]);
+  }, [gameState, handleStartOrRespawn, handleToggleMute, handleToggleZoom, sendCommand]);
 
-  // 60FPS Hardware-Accelerated 32x32 Pixel Matrix Canvas Loop
+  // 60FPS Hardware-Accelerated Pixel Matrix Canvas Loop
   useEffect(() => {
     let rafId = 0;
+    let lastFrameTime = performance.now();
+    let camInitialized = false;
+    // Reusable 64x64 spatial bitmap so stacked/overlapping segments on the same cell are drawn only once
+    const visitedCells = new Uint8Array(64 * 64);
 
     const renderFrame = (now: number) => {
       rafId = requestAnimationFrame(renderFrame);
+      const dtSec = Math.min(0.1, Math.max(0.001, (now - lastFrameTime) / 1000));
+      lastFrameTime = now;
 
       const canvas = canvasRef.current;
       if (!canvas) return;
@@ -784,56 +808,141 @@ export default function App() {
 
       const snap = snapshotRef.current;
       const activeGridSize = snap?.gridSize || serverGridSize;
+      const isZoomed = zoomIn16Ref.current;
+      // When zoomed in, a line from left to right spans exactly 16 squares on the grid
+      const visibleSquares = isZoomed ? 16 : activeGridSize;
       const boardPx = displaySize;
-      const cellPx = boardPx / activeGridSize;
+      const cellPx = boardPx / visibleSquares;
       const gap = Math.max(0.9, cellPx * 0.09);
+
+      // Compute continuous sub-tick camera offset in grid coordinates when zoomed to 16x16 squares
+      if (isZoomed) {
+        const myId = playerIdRef.current;
+        const meSnake = snap?.snakes.find((s) => s.id === myId && s.alive);
+        const fallbackSnake = snap?.snakes.find((s) => s.alive);
+        const trackedSnake = meSnake || fallbackSnake;
+
+        // Sub-tick interpolation factor (0.0 -> 1.0 over TICK_MS) eliminates 155ms grid-step jolts
+        const tickAlpha = Math.min(
+          1,
+          Math.max(0, (now - lastSnapshotTimeRef.current) / TICK_MS)
+        );
+
+        let focusX = activeGridSize * 0.5;
+        let focusY = activeGridSize * 0.5;
+
+        if (trackedSnake && trackedSnake.segments[0]) {
+          const currHead = trackedSnake.segments[0];
+          const prevHead =
+            trackedSnake.prevSegments && trackedSnake.prevSegments[0]
+              ? trackedSnake.prevSegments[0]
+              : currHead;
+
+          // If snake just teleported/respawned (>2 cells jump), snap to currHead; otherwise glide smoothly
+          const jumpDist =
+            Math.abs(currHead.x - prevHead.x) + Math.abs(currHead.y - prevHead.y);
+          const interpX =
+            jumpDist <= 2
+              ? prevHead.x + (currHead.x - prevHead.x) * tickAlpha
+              : currHead.x;
+          const interpY =
+            jumpDist <= 2
+              ? prevHead.y + (currHead.y - prevHead.y) * tickAlpha
+              : currHead.y;
+
+          focusX = interpX + 0.5;
+          focusY = interpY + 0.5;
+        }
+
+        const targetCamX = Math.max(0, Math.min(activeGridSize - 16, focusX - 8));
+        const targetCamY = Math.max(0, Math.min(activeGridSize - 16, focusY - 8));
+
+        if (!camInitialized) {
+          camRef.current.x = targetCamX;
+          camRef.current.y = targetCamY;
+          camInitialized = true;
+        } else {
+          // Frame-rate-independent exponential smoothing over the continuous target
+          const smoothFactor = 1 - Math.exp(-dtSec * 14);
+          camRef.current.x += (targetCamX - camRef.current.x) * smoothFactor;
+          camRef.current.y += (targetCamY - camRef.current.y) * smoothFactor;
+        }
+      } else {
+        camRef.current.x = 0;
+        camRef.current.y = 0;
+        camInitialized = false;
+      }
 
       // 1. Deep Obsidian Matrix Backplane
       ctx.fillStyle = '#070A0F';
       ctx.fillRect(0, 0, boardPx, boardPx);
 
-      // 2. Render all unlit physical LED pixel sockets
-      for (let y = 0; y < activeGridSize; y++) {
-        for (let x = 0; x < activeGridSize; x++) {
-          const isEdgeTile =
-            x === 0 || y === 0 || x === activeGridSize - 1 || y === activeGridSize - 1;
-          ctx.fillStyle = isEdgeTile ? '#131826' : '#0E1522';
-          ctx.fillRect(
-            x * cellPx + gap * 0.5,
-            y * cellPx + gap * 0.5,
-            cellPx - gap,
-            cellPx - gap
-          );
+      ctx.save();
+      ctx.translate(-camRef.current.x * cellPx, -camRef.current.y * cellPx);
+
+      // 2. Render visible unlit physical LED pixel sockets (batched by fillStyle to minimize state switches)
+      const startX = isZoomed ? Math.max(0, Math.floor(camRef.current.x) - 1) : 0;
+      const endX = isZoomed
+        ? Math.min(activeGridSize, Math.ceil(camRef.current.x + 16) + 1)
+        : activeGridSize;
+      const startY = isZoomed ? Math.max(0, Math.floor(camRef.current.y) - 1) : 0;
+      const endY = isZoomed
+        ? Math.min(activeGridSize, Math.ceil(camRef.current.y + 16) + 1)
+        : activeGridSize;
+
+      const socketSize = cellPx - gap;
+      const halfGap = gap * 0.5;
+      const lastIdx = activeGridSize - 1;
+
+      ctx.fillStyle = '#0E1522';
+      for (let y = startY; y < endY; y++) {
+        const isEdgeY = y === 0 || y === lastIdx;
+        const py = y * cellPx + halfGap;
+        for (let x = startX; x < endX; x++) {
+          if (isEdgeY || x === 0 || x === lastIdx) continue;
+          ctx.fillRect(x * cellPx + halfGap, py, socketSize, socketSize);
         }
       }
 
-      // Subtle 8x8 sector hairlines for spatial navigation on the matrix
+      ctx.fillStyle = '#131826';
+      for (let y = startY; y < endY; y++) {
+        const isEdgeY = y === 0 || y === lastIdx;
+        const py = y * cellPx + halfGap;
+        for (let x = startX; x < endX; x++) {
+          if (isEdgeY || x === 0 || x === lastIdx) {
+            ctx.fillRect(x * cellPx + halfGap, py, socketSize, socketSize);
+          }
+        }
+      }
+
+      // Subtle 8x8 sector hairlines for spatial navigation on the matrix (single batched path)
+      const worldPx = activeGridSize * cellPx;
       ctx.strokeStyle = 'rgba(148, 163, 184, 0.08)';
       ctx.lineWidth = 1;
+      ctx.beginPath();
       for (let i = 8; i < activeGridSize; i += 8) {
         const pos = i * cellPx;
-        ctx.beginPath();
         ctx.moveTo(pos, 0);
-        ctx.lineTo(pos, boardPx);
-        ctx.stroke();
-
-        ctx.beginPath();
+        ctx.lineTo(pos, worldPx);
         ctx.moveTo(0, pos);
-        ctx.lineTo(boardPx, pos);
-        ctx.stroke();
+        ctx.lineTo(worldPx, pos);
       }
+      ctx.stroke();
 
       if (snap) {
         const myId = playerIdRef.current;
         const me = snap.snakes.find((s) => s.id === myId && s.alive);
 
-        // 3. Render Nearby Rival Spawn Telegraphs (Flashing Radar Crosshairs on the 32x32 grid)
+        // 3. Render Nearby Rival Spawn Telegraphs (Flashing Radar Crosshairs on the grid)
         const pulseFast = Math.sin(now * 0.022) > 0;
-        for (const tele of snap.telegraphs) {
+        for (let tIdx = 0; tIdx < snap.telegraphs.length; tIdx++) {
+          const tele = snap.telegraphs[tIdx];
+          if (tele.x < startX - 1 || tele.x > endX || tele.y < startY - 1 || tele.y > endY) {
+            continue;
+          }
           const cx = (tele.x + 0.5) * cellPx;
           const cy = (tele.y + 0.5) * cellPx;
 
-          ctx.save();
           ctx.strokeStyle = pulseFast ? '#F59E0B' : tele.color.head;
           ctx.lineWidth = 2;
           ctx.strokeRect(
@@ -843,7 +952,6 @@ export default function App() {
             cellPx + 4
           );
 
-          // Expanding target diamond
           const rad = cellPx * (0.9 + 0.35 * Math.sin(now * 0.015));
           ctx.beginPath();
           ctx.arc(cx, cy, rad, 0, Math.PI * 2);
@@ -853,30 +961,42 @@ export default function App() {
           ctx.font = `700 ${Math.max(9, Math.floor(cellPx * 0.42))}px "IBM Plex Mono", monospace`;
           ctx.textAlign = 'center';
           ctx.fillText(`SPAWN ${tele.ticksLeft}`, cx, tele.y * cellPx - 5);
-          ctx.restore();
         }
 
-        // 4. Render BIG FLASHING PELLETS dropped by killed snakes!
-        for (const pellet of snap.pellets) {
-          // High-visibility multi-frequency strobe so big pellets unmistakably flash
+        // 4. Render BIG FLASHING PELLETS (hardware-fast halo without expensive per-pellet shadowBlur)
+        const scalePulseBase = Math.sin(now * 0.018);
+        for (let pIdx = 0; pIdx < snap.pellets.length; pIdx++) {
+          const pellet = snap.pellets[pIdx];
+          if (
+            pellet.x < startX ||
+            pellet.x >= endX ||
+            pellet.y < startY ||
+            pellet.y >= endY
+          ) {
+            continue;
+          }
+
           const flashPhase = Math.floor(now / 85 + pellet.x * 3 + pellet.y * 5) % 3;
           const primaryColor =
             flashPhase === 0 ? '#FEF08A' : flashPhase === 1 ? '#F59E0B' : pellet.color;
 
           const px = pellet.x * cellPx;
           const py = pellet.y * cellPx;
-          const cx = px + cellPx * 0.5;
-          const cy = py + cellPx * 0.5;
 
-          // Outer flashing halo on adjacent pixel border
-          const scalePulse = 0.14 * Math.sin(now * 0.018 + pellet.x);
-          ctx.save();
-          ctx.shadowColor = '#F59E0B';
-          ctx.shadowBlur = 14;
+          // Fast outer glow halo (replaces expensive Gaussian shadowBlur)
+          const expand = cellPx * (0.1 + 0.08 * scalePulseBase);
+          ctx.globalAlpha = 0.28;
+          ctx.fillStyle = '#F59E0B';
+          ctx.fillRect(
+            px - expand * 1.4,
+            py - expand * 1.4,
+            cellPx + expand * 2.8,
+            cellPx + expand * 2.8
+          );
 
           // Glowing outer pixel frame
+          ctx.globalAlpha = 1;
           ctx.fillStyle = primaryColor;
-          const expand = cellPx * (0.1 + scalePulse);
           ctx.fillRect(
             px - expand * 0.5,
             py - expand * 0.5,
@@ -884,7 +1004,7 @@ export default function App() {
             cellPx + expand
           );
 
-          // White-hot inner diamond core
+          // White-hot inner core
           ctx.fillStyle = '#FFFFFF';
           ctx.fillRect(
             px + cellPx * 0.24,
@@ -892,122 +1012,169 @@ export default function App() {
             cellPx * 0.52,
             cellPx * 0.52
           );
-
-          // Subtle pulsing ring around big trophy pellets
-          if (pellet.value >= 200 || flashPhase === 0) {
-            ctx.strokeStyle = 'rgba(254, 240, 138, 0.75)';
-            ctx.lineWidth = 1.5;
-            ctx.beginPath();
-            ctx.arc(cx, cy, cellPx * 0.72, 0, Math.PI * 2);
-            ctx.stroke();
-          }
-
-          ctx.restore();
         }
 
-        // 5. Render All Snakes as Lit Colored Pixels on the 32x32 Grid
-        for (const snake of snap.snakes) {
+        // 5. Render All Snakes as Lit Colored Pixels on the Grid
+        // Optimized:
+        // - Player's snake drawn last so it sits on top
+        // - Iterates head-to-tail (0..len-1) with visitedCells bitmap so stacked/crossed segments on the same square are drawn ONLY ONCE!
+        // - Culls off-screen segments when zoomed in
+        // - Zero ctx.save/restore or shadowBlur inside the per-segment loop
+        const orderedSnakes = [...snap.snakes].sort((a, b) =>
+          a.id === myId ? 1 : b.id === myId ? -1 : 0
+        );
+
+        const meBorderW = Math.max(1.1, cellPx * 0.065);
+        const otherBorderW = Math.max(1, cellPx * 0.05);
+        const headBorderW = Math.max(1.5, cellPx * 0.09);
+
+        for (let sIdx = 0; sIdx < orderedSnakes.length; sIdx++) {
+          const snake = orderedSnakes[sIdx];
           if (!snake.alive) continue;
           const isMe = snake.id === myId;
-          const len = snake.segments.length;
+          const segs = snake.segments;
+          const len = segs.length;
+          const denom = Math.max(1, len - 1);
           const isShielded = (snake.shieldTicks || 0) > 0;
           const shieldBlink = isShielded ? 0.62 + 0.38 * Math.sin(now * 0.028) : 1;
 
-          // Draw body segments from tail to head so the head pixel sits cleanly on top
-          for (let i = len - 1; i >= 0; i--) {
-            const seg = snake.segments[i];
-            if (seg.x < 0 || seg.x >= activeGridSize || seg.y < 0 || seg.y >= activeGridSize) continue;
+          // Clear spatial deduplication bitmap for this snake
+          visitedCells.fill(0);
 
-            const sx = seg.x * cellPx + gap * 0.5;
-            const sy = seg.y * cellPx + gap * 0.5;
-            const sw = cellPx - gap;
-            const sh = cellPx - gap;
+          for (let i = 0; i < len; i++) {
+            const seg = segs[i];
+            const gx = seg.x;
+            const gy = seg.y;
+            if (gx < startX || gx >= endX || gy < startY || gy >= endY) continue;
 
-            ctx.save();
+            // Deduplicate stacked/self-overlapping segments on the exact same grid cell
+            const cellBitIdx = (gy << 6) | gx;
+            if (visitedCells[cellBitIdx] === 1) continue;
+            visitedCells[cellBitIdx] = 1;
+
+            const sx = gx * cellPx + halfGap;
+            const sy = gy * cellPx + halfGap;
+
             ctx.globalAlpha = shieldBlink;
 
             if (isShielded) {
               ctx.strokeStyle = '#38BDF8';
               ctx.lineWidth = 1.5;
-              ctx.strokeRect(sx - 1, sy - 1, sw + 2, sh + 2);
+              ctx.strokeRect(sx - 1, sy - 1, socketSize + 2, socketSize + 2);
             }
 
             if (i === 0) {
-              // Head Pixel: High-luminance phosphor + directional eyes
-              ctx.shadowColor = isShielded ? '#38BDF8' : snake.color.head;
-              ctx.shadowBlur = isMe ? 14 : 9;
-              ctx.fillStyle = snake.color.head;
-              ctx.fillRect(sx, sy, sw, sh);
+              // Fast outer glow halo on the head pixel instead of expensive shadowBlur
+              ctx.globalAlpha = (isMe ? 0.32 : 0.22) * shieldBlink;
+              ctx.fillStyle = isShielded ? '#38BDF8' : isMe ? '#FFFFFF' : snake.color.head;
+              ctx.fillRect(sx - 2.5, sy - 2.5, socketSize + 5, socketSize + 5);
 
-              // Crisp inner highlight for player snake head
-              if (isMe || isShielded) {
-                ctx.strokeStyle = isShielded ? '#E0F2FE' : '#FFFFFF';
+              ctx.globalAlpha = shieldBlink;
+              ctx.fillStyle = snake.color.head;
+              ctx.fillRect(sx, sy, socketSize, socketSize);
+
+              if (isMe) {
+                ctx.strokeStyle = '#FFFFFF';
+                ctx.lineWidth = headBorderW;
+                ctx.strokeRect(sx + 0.75, sy + 0.75, socketSize - 1.5, socketSize - 1.5);
+              } else if (isShielded) {
+                ctx.strokeStyle = '#E0F2FE';
                 ctx.lineWidth = 1.5;
-                ctx.strokeRect(sx + 1, sy + 1, sw - 2, sh - 2);
+                ctx.strokeRect(sx + 1, sy + 1, socketSize - 2, socketSize - 2);
               }
 
               // Directional pixel eyes on the head cell
               ctx.fillStyle = '#080B10';
-              const eyeSize = Math.max(2, sw * 0.2);
-              let e1x = sx + sw * 0.22;
-              let e1y = sy + sh * 0.22;
-              let e2x = sx + sw * 0.62;
-              let e2y = sy + sh * 0.22;
+              const eyeSize = Math.max(2, socketSize * 0.22);
+              let e1x = sx + socketSize * 0.22;
+              let e1y = sy + socketSize * 0.22;
+              let e2x = sx + socketSize * 0.62;
+              let e2y = sy + socketSize * 0.22;
 
               if (snake.dir === 'DOWN') {
-                e1y = sy + sh * 0.62;
-                e2y = sy + sh * 0.62;
+                e1y = sy + socketSize * 0.62;
+                e2y = sy + socketSize * 0.62;
               } else if (snake.dir === 'LEFT') {
-                e1x = sx + sw * 0.2;
-                e1y = sy + sh * 0.22;
-                e2x = sx + sw * 0.2;
-                e2y = sy + sh * 0.62;
+                e1x = sx + socketSize * 0.2;
+                e1y = sy + socketSize * 0.22;
+                e2x = sx + socketSize * 0.2;
+                e2y = sy + socketSize * 0.62;
               } else if (snake.dir === 'RIGHT') {
-                e1x = sx + sw * 0.64;
-                e1y = sy + sh * 0.22;
-                e2x = sx + sw * 0.64;
-                e2y = sy + sh * 0.62;
+                e1x = sx + socketSize * 0.64;
+                e1y = sy + socketSize * 0.22;
+                e2x = sx + socketSize * 0.64;
+                e2y = sy + socketSize * 0.62;
               }
               ctx.fillRect(e1x, e1y, eyeSize, eyeSize);
               ctx.fillRect(e2x, e2y, eyeSize, eyeSize);
+
+              if (isMe) {
+                ctx.fillStyle = '#FFFFFF';
+                const glint = Math.max(1, eyeSize * 0.42);
+                ctx.fillRect(e1x + eyeSize * 0.15, e1y + eyeSize * 0.15, glint, glint);
+                ctx.fillRect(e2x + eyeSize * 0.15, e2y + eyeSize * 0.15, glint, glint);
+              }
             } else {
               // Lit Body Pixel on the Grid
-              const ratio = i / Math.max(1, len - 1);
+              const ratio = i / denom;
               ctx.fillStyle = ratio > 0.72 ? snake.color.tail : snake.color.body;
-              ctx.fillRect(sx, sy, sw, sh);
+              ctx.fillRect(sx, sy, socketSize, socketSize);
 
-              // Subtle lit LED diode center inside each body pixel
-              ctx.fillStyle = snake.color.head;
-              ctx.globalAlpha = Math.max(0.18, 0.55 * (1 - ratio)) * shieldBlink;
-              ctx.fillRect(
-                sx + sw * 0.25,
-                sy + sh * 0.25,
-                sw * 0.5,
-                sh * 0.5
-              );
+              if (isMe) {
+                // YOUR SNAKE SQUARES: Crisp white perimeter rim + white-hot center diamond core
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.88)';
+                ctx.lineWidth = meBorderW;
+                ctx.strokeRect(sx + 0.75, sy + 0.75, socketSize - 1.5, socketSize - 1.5);
+
+                const cx = sx + socketSize * 0.5;
+                const cy = sy + socketSize * 0.5;
+                const dRadius = socketSize * Math.max(0.18, 0.3 * (1 - ratio * 0.35));
+                ctx.fillStyle = '#FFFFFF';
+                ctx.globalAlpha = Math.max(0.65, 0.92 * (1 - ratio * 0.35)) * shieldBlink;
+                ctx.beginPath();
+                ctx.moveTo(cx, cy - dRadius);
+                ctx.lineTo(cx + dRadius, cy);
+                ctx.lineTo(cx, cy + dRadius);
+                ctx.lineTo(cx - dRadius, cy);
+                ctx.closePath();
+                ctx.fill();
+              } else {
+                // OTHER SNAKES' SQUARES: Recessed dark bezel + flat colored inner square
+                ctx.strokeStyle = 'rgba(8, 11, 16, 0.7)';
+                ctx.lineWidth = otherBorderW;
+                ctx.strokeRect(sx + 0.5, sy + 0.5, socketSize - 1, socketSize - 1);
+
+                ctx.fillStyle = snake.color.head;
+                ctx.globalAlpha = Math.max(0.15, 0.42 * (1 - ratio)) * shieldBlink;
+                ctx.fillRect(
+                  sx + socketSize * 0.3,
+                  sy + socketSize * 0.3,
+                  socketSize * 0.4,
+                  socketSize * 0.4
+                );
+              }
             }
-            ctx.restore();
           }
+          ctx.globalAlpha = 1;
 
           // Floating Callsign & Fail-Safe Shield Timer readout above snake head
-          const head = snake.segments[0];
-          if (head && head.x >= 0 && head.x < activeGridSize && head.y >= 0 && head.y < activeGridSize) {
+          const head = segs[0];
+          if (head && head.x >= startX && head.x < endX && head.y >= startY && head.y < endY) {
             const hx = (head.x + 0.5) * cellPx;
             const hy = head.y * cellPx - 4;
-            ctx.save();
             ctx.font = `${isMe ? '700' : '600'} ${Math.max(9, Math.floor(cellPx * 0.42))}px "IBM Plex Mono", monospace`;
             ctx.textAlign = 'center';
-            ctx.fillStyle = isShielded ? '#7DD3FC' : isMe ? '#FFFFFF' : 'rgba(241, 245, 249, 0.82)';
-            ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
-            ctx.shadowBlur = 4;
             const shieldSec = ((snake.shieldTicks * TICK_MS) / 1000).toFixed(1);
             const label = isShielded
               ? `${isMe ? '★ ' : ''}${snake.name} [SAFE ${shieldSec}s]`
               : isMe
                 ? `★ ${snake.name}`
                 : snake.name;
-            ctx.fillText(label, hx, Math.max(11, hy));
-            ctx.restore();
+            const textY = Math.max(11, hy);
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+            ctx.fillText(label, hx + 1, textY + 1);
+            ctx.fillStyle = isShielded ? '#7DD3FC' : isMe ? '#FFFFFF' : 'rgba(241, 245, 249, 0.85)';
+            ctx.fillText(label, hx, textY);
           }
         }
 
@@ -1025,7 +1192,7 @@ export default function App() {
           ? `rgba(244, 63, 94, ${0.7 + 0.3 * Math.sin(now * 0.025)})`
           : 'rgba(244, 63, 94, 0.42)';
         ctx.lineWidth = nearEdge ? 4 : 2;
-        ctx.strokeRect(1, 1, boardPx - 2, boardPx - 2);
+        ctx.strokeRect(1, 1, worldPx - 2, worldPx - 2);
         ctx.restore();
       }
 
@@ -1089,6 +1256,7 @@ export default function App() {
       popupsRef.current = nextPopups;
 
       ctx.restore();
+      ctx.restore();
     };
 
     rafId = requestAnimationFrame(renderFrame);
@@ -1098,7 +1266,7 @@ export default function App() {
   const deathExplanation = (() => {
     switch (hudStats.deathReason) {
       case 'WALL_CRASH':
-        return 'You ran off the unforgiving 32x32 pixel grid perimeter.';
+        return 'You ran off the unforgiving outer grid border.';
       case 'SELF_CRASH':
         return 'You went over top of your own lit pixel trail.';
       case 'KILLED_BY_SNAKE':
@@ -1106,7 +1274,7 @@ export default function App() {
       case 'HEAD_COLLISION':
         return `Eliminated in a head-to-head collision with ${hudStats.killedByName || 'a rival snake'}.`;
       default:
-        return 'Your snake shattered into big flashing pellets on the 32x32 matrix.';
+        return 'Your snake shattered into big flashing pellets on the pixel grid.';
     }
   })();
 
@@ -1195,6 +1363,18 @@ export default function App() {
         <div className="flex items-center gap-2 shrink-0">
           <button
             type="button"
+            onClick={handleToggleZoom}
+            className={`px-2.5 py-1 text-xs font-medium rounded border transition-colors whitespace-nowrap cursor-pointer ${
+              zoomIn16
+                ? 'bg-emerald-500/20 border-emerald-400/60 text-emerald-300'
+                : 'bg-slate-800/80 hover:bg-slate-700/80 text-slate-300 border-slate-700'
+            }`}
+            title="Toggle 16-square Zoom In view (Shortcut: Z)"
+          >
+            {zoomIn16 ? 'Zoom: 16×16 [Z]' : 'Zoom: Full [Z]'}
+          </button>
+          <button
+            type="button"
             onClick={handleToggleMute}
             className="px-2.5 py-1 text-xs font-medium bg-slate-800/80 hover:bg-slate-700/80 text-slate-300 border border-slate-700 rounded transition-colors whitespace-nowrap cursor-pointer"
           >
@@ -1247,7 +1427,7 @@ export default function App() {
               <div className="p-4 rounded-lg bg-[#0D131F]/90 border border-slate-800/80">
                 <div className="flex items-center justify-between mb-3">
                   <h2 className="text-xs font-semibold tracking-wider text-slate-300 font-display">
-                    32×32 MATRIX LEADERS
+                    ARENA LEADERS
                   </h2>
                   <span className="text-[11px] font-mono-tabular text-slate-400">
                     {hudStats.leaderboard.length} ACTIVE
@@ -1329,8 +1509,8 @@ export default function App() {
               </p>
               <p>
                 <strong className="text-rose-400">Zero Wall Forgiveness:</strong> You can freely
-                cross over your own tail, but hitting a rival trail or stepping off the 32×32 grid
-                is instant death.
+                cross over your own tail, but hitting a rival trail or stepping off the outer grid
+                border is instant death.
               </p>
               <p className="pt-1 text-[11px] font-mono-tabular text-slate-300">
                 Controls: WASD or Arrow Keys only
@@ -1372,7 +1552,7 @@ export default function App() {
                 <div className="p-3 rounded-lg bg-[#080B10] border border-slate-800">
                   <div className="font-semibold text-emerald-400 mb-1">1. Cut Off Rivals</div>
                   <p className="text-slate-400 leading-relaxed">
-                    Rivals spawn nearby on the 32×32 grid. Bait them into running into your lit pixel trail.
+                    Rivals spawn nearby on the pixel grid. Bait them into running into your lit pixel trail.
                   </p>
                 </div>
                 <div className="p-3 rounded-lg bg-[#080B10] border border-slate-800">
@@ -1382,21 +1562,21 @@ export default function App() {
                   </p>
                 </div>
                 <div className="p-3 rounded-lg bg-[#080B10] border border-slate-800">
-                  <div className="font-semibold text-rose-400 mb-1">3. Unforgiving 32×32</div>
+                  <div className="font-semibold text-rose-400 mb-1">3. Unforgiving Border</div>
                   <p className="text-slate-400 leading-relaxed">
-                    You can cross your own tail safely, but hitting rivals or stepping 1 pixel off the 32×32 border is fatal.
+                    You can cross your own tail safely, but hitting rivals or stepping 1 pixel off the outer border is fatal.
                   </p>
                 </div>
               </div>
 
-              {/* Player Callsign & Pixel Color Customizer */}
+              {/* Player Name & Pixel Color Customizer */}
               <div className="space-y-4 pt-1">
                 <div>
                   <label
                     htmlFor="callsign-input"
                     className="block text-xs font-medium text-slate-300 mb-1.5"
                   >
-                    PILOT CALLSIGN
+                    NAME
                   </label>
                   <input
                     id="callsign-input"
@@ -1449,33 +1629,65 @@ export default function App() {
                     })}
                   </div>
                 </div>
-                <div>
-                  <span className="block text-xs font-medium text-slate-300 mb-2">
-                    ARENA SERVER
-                  </span>
-                  <div className="grid grid-cols-2 gap-2.5">
-                    <button
-                      type="button"
-                      onClick={() => setServerGridSize(32)}
-                      className={`py-2.5 px-3 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
-                        serverGridSize === 32
-                          ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
-                          : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
-                      }`}
-                    >
-                      32×32 SERVER (CLASSIC)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setServerGridSize(64)}
-                      className={`py-2.5 px-3 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
-                        serverGridSize === 64
-                          ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
-                          : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
-                      }`}
-                    >
-                      64×64 SERVER (EXPANDED)
-                    </button>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <span className="block text-xs font-medium text-slate-300 mb-2">
+                      ARENA SERVER
+                    </span>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setServerGridSize(32)}
+                        className={`py-2 px-2.5 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                          serverGridSize === 32
+                            ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                            : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
+                        }`}
+                      >
+                        32×32 SERVER
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setServerGridSize(64)}
+                        className={`py-2 px-2.5 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                          serverGridSize === 64
+                            ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                            : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
+                        }`}
+                      >
+                        64×64 SERVER
+                      </button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <span className="block text-xs font-medium text-slate-300 mb-2">
+                      CAMERA VIEW (ALL MODES)
+                    </span>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setZoomIn16(false)}
+                        className={`py-2 px-2.5 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                          !zoomIn16
+                            ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                            : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
+                        }`}
+                      >
+                        FULL GRID
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setZoomIn16(true)}
+                        className={`py-2 px-2.5 rounded-lg border text-xs font-mono-tabular font-semibold transition-all cursor-pointer ${
+                          zoomIn16
+                            ? 'bg-emerald-500/15 border-emerald-400 text-emerald-300'
+                            : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
+                        }`}
+                      >
+                        16×16 ZOOM
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1490,7 +1702,7 @@ export default function App() {
                   Drop Into {serverGridSize}×{serverGridSize} Grid [Enter]
                 </button>
                 <p className="text-center text-xs text-slate-400 font-mono-tabular">
-                  WASD / Arrow Keys Move · M Mute · Esc Pause
+                  WASD / Arrow Keys Move · Z Toggle 16×16 Zoom · M Mute · Esc Pause
                 </p>
               </div>
             </div>
@@ -1504,8 +1716,8 @@ export default function App() {
               <h2 className="font-display text-2xl font-bold text-white">ARENA PAUSED</h2>
               <p className="text-xs text-slate-400">
                 Use only <strong className="text-slate-200">WASD</strong> or{' '}
-                <strong className="text-slate-200">Arrow Keys</strong> to steer your pixel snake on
-                the 32×32 grid.
+                <strong className="text-slate-200">Arrow Keys</strong> to steer your pixel snake
+                across the arena grid.
               </p>
               <div className="flex items-center justify-center gap-3">
                 <button
@@ -1536,7 +1748,7 @@ export default function App() {
             <div className="w-full max-w-md rounded-xl bg-[#0D131F] border border-rose-500/50 shadow-2xl p-6 sm:p-7 space-y-5">
               <div className="space-y-1 text-center">
                 <div className="text-xs font-mono-tabular text-rose-400 font-semibold">
-                  SIGNAL TERMINATED ON 32×32 MATRIX
+                  SIGNAL TERMINATED IN ARENA
                 </div>
                 <h2 className="font-display text-3xl font-bold text-white">PIXEL TRAIL SHATTERED</h2>
                 <p className="text-xs text-slate-300 pt-1">{deathExplanation}</p>

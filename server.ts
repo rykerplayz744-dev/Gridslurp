@@ -22,10 +22,10 @@ async function startServer() {
   const httpServer = createServer(app);
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
-  // Maintain both the 32x32 Server and the 64x64 Server simultaneously
+  // Maintain both the 32x32 Server (2 AI snakes) and the 64x64 Server (4 AI snakes) simultaneously
   const arenas = new Map<ServerGridSize, ArenaEngine>([
     [32, new ArenaEngine(2, 32)],
-    [64, new ArenaEngine(2, 64)],
+    [64, new ArenaEngine(4, 64)],
   ]);
 
   const clientPlayers = new Map<WebSocket, { id: string; gridSize: ServerGridSize }>();
