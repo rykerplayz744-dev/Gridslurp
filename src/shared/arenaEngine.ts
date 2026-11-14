@@ -686,6 +686,23 @@ export class ArenaEngine {
     return this.getSnapshot();
   }
 
+  public hydrateFromSnapshot(snap: ArenaSnapshot) {
+    this.tick = snap.tick;
+    this.snakes.clear();
+    for (const s of snap.snakes) {
+      this.snakes.set(s.id, {
+        ...s,
+        segments: s.segments.map((pt) => ({ ...pt })),
+        prevSegments: (s.prevSegments || s.segments).map((pt) => ({ ...pt })),
+        nextDirs: [...(s.nextDirs || [])],
+      });
+    }
+    this.pellets = snap.pellets.map((p) => ({ ...p }));
+    this.telegraphs = snap.telegraphs.map((t) => ({ ...t }));
+    this.recentKills = snap.recentKills.map((k) => ({ ...k }));
+    this.recentSlurps = snap.recentSlurps.map((s) => ({ ...s }));
+  }
+
   public getSnapshot(): ArenaSnapshot {
     const snakesList = Array.from(this.snakes.values());
     const humanCount = snakesList.filter((s) => !s.isBot).length;

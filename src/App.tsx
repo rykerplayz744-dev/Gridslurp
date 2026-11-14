@@ -1,3 +1,4 @@
+import mqtt, { MqttClient } from 'mqtt';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ArenaEngine } from './shared/arenaEngine';
 import {
@@ -10,6 +11,12 @@ import {
   TICK_MS,
 } from './shared/gameTypes';
 import { soundEngine } from './utils/soundEngine';
+
+const GLOBAL_MESH_TOPIC = 'gridslurp/v2/arena/global_main_32x32';
+const MQTT_BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker-cn.emqx.io:8084/mqtt',
+];
 
 type GameState = 'TITLE_MENU' | 'PLAYING' | 'PAUSED' | 'GAME_OVER';
 
@@ -71,6 +78,7 @@ export default function App() {
       kills: number;
       color: string;
       isMe: boolean;
+      isBot: boolean;
     }>;
     killFeed: Array<{
       id: string;
@@ -94,10 +102,32 @@ export default function App() {
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const mqttRef = useRef<MqttClient | null>(null);
   const localEngineRef = useRef<ArenaEngine | null>(null);
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
 
   const playerIdRef = useRef<string>(`plr_${Math.random().toString(36).slice(2, 9)}`);
+  const peerOrderRef = useRef<number>(Date.now() + Math.random());
+  const activePeersRef = useRef<
+    Map<
+      string,
+      {
+        order: number;
+        lastSeen: number;
+        playing: boolean;
+        name: string;
+        colorId: string;
+      }
+    >
+  >(new Map());
+  const lastRemoteCoordStateAtRef = useRef<number>(0);
+  const lastAutoJoinSentAtRef = useRef<number>(0);
+  const myJoinInfoRef = useRef<{ name: string; colorId: string; playing: boolean }>({
+    name: 'VIPER_01',
+    colorId: 'emerald',
+    playing: false,
+  });
+
   const snapshotRef = useRef<ArenaSnapshot | null>(null);
   const lastSnapshotTimeRef = useRef<number>(performance.now());
   const processedKillsRef = useRef<Set<string>>(new Set());
@@ -241,7 +271,13 @@ export default function App() {
         deathReason: me?.deathReason || prev.deathReason,
         killedByName: me?.killedByName || prev.killedByName,
         bigPelletsOnGrid: snap.pellets.length,
-        onlineCount: snap.onlinePlayers,
+        onlineCount: Math.max(
+          snap.onlinePlayers,
+          1 +
+            Array.from(activePeersRef.current.values()).filter(
+              (p) => performance.now() - p.lastSeen < 6500
+            ).length
+        ),
         leaderboard: sorted.slice(0, 6).map((s) => ({
           id: s.id,
           name: s.name,
@@ -250,6 +286,7 @@ export default function App() {
           kills: s.kills,
           color: s.color.head,
           isMe: s.id === myId,
+          isBot: s.isBot,
         })),
         killFeed: feed,
       }));
@@ -257,33 +294,169 @@ export default function App() {
     [spawnBurst]
   );
 
-  // Setup WebSocket connection with automatic Vercel static/serverless + multi-tab BroadcastChannel fallback
+  // Setup Live Multiplayer: Direct /ws Server + Global Cross-Device WSS Mesh (for Vercel) + BroadcastChannel
   useEffect(() => {
     let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
     let localInterval: ReturnType<typeof setInterval> | null = null;
+    let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
     let isUnmounted = false;
 
-    const startLocalFallbackEngine = () => {
+    const publishMeshPacket = (packet: Record<string, unknown>) => {
+      const serialized = JSON.stringify(packet);
+      if (mqttRef.current && mqttRef.current.connected) {
+        try {
+          mqttRef.current.publish(GLOBAL_MESH_TOPIC, serialized, { qos: 0 });
+        } catch {
+          // ignore publish error
+        }
+      }
+      try {
+        broadcastChannelRef.current?.postMessage(packet);
+      } catch {
+        // ignore broadcast channel error
+      }
+    };
+
+    const isSelfCoordinator = (now: number): boolean => {
+      const myId = playerIdRef.current;
+      const myOrder = peerOrderRef.current;
+      for (const [pid, info] of activePeersRef.current.entries()) {
+        if (pid === myId) continue;
+        if (now - info.lastSeen > 3000) continue;
+        if (info.order < myOrder || (info.order === myOrder && pid < myId)) {
+          // Another active peer has higher priority; only yield if they are actively broadcasting state
+          if (now - lastRemoteCoordStateAtRef.current < 2200) {
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+
+    const handleMeshPacket = (data: Record<string, unknown>) => {
+      if (!data || typeof data.type !== 'string') return;
+      const senderId = String(data.senderId || '');
+      if (!senderId || senderId === playerIdRef.current) return;
+
+      const now = performance.now();
+      const senderOrder = Number(data.senderOrder) || now;
+
+      const existingPeer = activePeersRef.current.get(senderId);
+      activePeersRef.current.set(senderId, {
+        order: senderOrder,
+        lastSeen: now,
+        playing: typeof data.playing === 'boolean' ? data.playing : existingPeer?.playing ?? false,
+        name: typeof data.name === 'string' ? data.name : existingPeer?.name ?? 'PLAYER',
+        colorId: typeof data.colorId === 'string' ? data.colorId : existingPeer?.colorId ?? 'cyan',
+      });
+
+      if (data.type === 'mesh_state' && data.state && localEngineRef.current) {
+        const myId = playerIdRef.current;
+        const myOrder = peerOrderRef.current;
+        const senderIsPrior =
+          senderOrder < myOrder || (senderOrder === myOrder && senderId < myId);
+
+        if (senderIsPrior) {
+          lastRemoteCoordStateAtRef.current = now;
+          const remoteSnap = data.state as ArenaSnapshot;
+          localEngineRef.current.hydrateFromSnapshot(remoteSnap);
+          snapshotRef.current = remoteSnap;
+          lastSnapshotTimeRef.current = now;
+          processSnapshotEvents(remoteSnap);
+
+          // If we are currently playing and not yet spawned on the remote coordinator's board, request spawn
+          if (
+            myJoinInfoRef.current.playing &&
+            gameStateRef.current === 'PLAYING' &&
+            !remoteSnap.snakes.some((s) => s.id === myId && s.alive) &&
+            now - lastAutoJoinSentAtRef.current > 650
+          ) {
+            lastAutoJoinSentAtRef.current = now;
+            publishMeshPacket({
+              type: 'mesh_cmd',
+              senderId: myId,
+              senderOrder: myOrder,
+              cmd: {
+                type: 'join',
+                clientId: myId,
+                name: myJoinInfoRef.current.name,
+                colorId: myJoinInfoRef.current.colorId,
+              },
+            });
+          }
+        }
+      } else if (data.type === 'mesh_cmd' && data.cmd && localEngineRef.current) {
+        const cmd = data.cmd as ClientToServerMessage & { clientId?: string };
+        const targetId = cmd.clientId || senderId;
+        const engine = localEngineRef.current;
+
+        if (cmd.type === 'join') {
+          const existing = engine.snakes.get(targetId);
+          if (!existing || !existing.alive) {
+            engine.spawnPlayer(targetId, cmd.name, cmd.colorId);
+          }
+        } else if (cmd.type === 'respawn') {
+          engine.spawnPlayer(targetId, cmd.name, cmd.colorId);
+        } else if (cmd.type === 'turn') {
+          engine.queueTurn(targetId, cmd.dir);
+        } else if (cmd.type === 'leave') {
+          engine.removePlayer(targetId);
+          myJoinInfoRef.current = { ...myJoinInfoRef.current };
+        }
+      }
+    };
+
+    const startGlobalMeshEngine = () => {
       if (isUnmounted || localEngineRef.current) return;
-      setConnectionMode('local-sync');
+      setConnectionMode('ws');
       const engine = new ArenaEngine(2);
       localEngineRef.current = engine;
 
+      // 1. Local multi-tab BroadcastChannel
       try {
-        const bc = new BroadcastChannel('gridslurp_32x32_arena');
+        const bc = new BroadcastChannel('gridslurp_32x32_arena_v2');
         broadcastChannelRef.current = bc;
         bc.onmessage = (ev) => {
-          const data = ev.data;
-          if (data?.type === 'remote_turn' && localEngineRef.current) {
-            localEngineRef.current.queueTurn(data.playerId, data.dir);
-          } else if (data?.type === 'remote_join' && localEngineRef.current) {
-            if (!localEngineRef.current.snakes.has(data.playerId)) {
-              localEngineRef.current.spawnPlayer(data.playerId, data.name, data.colorId);
-            }
-          }
+          handleMeshPacket(ev.data);
         };
       } catch {
         // BroadcastChannel optional
+      }
+
+      // 2. Global Cross-Device WSS Relay (MQTT over WebSockets - works on Vercel & worldwide browsers)
+      try {
+        const client = mqtt.connect(MQTT_BROKERS[0], {
+          clientId: `gridslurp_${playerIdRef.current}_${Math.random().toString(16).slice(2, 6)}`,
+          clean: true,
+          connectTimeout: 4000,
+          reconnectPeriod: 2000,
+        });
+        mqttRef.current = client;
+
+        client.on('connect', () => {
+          if (isUnmounted) return;
+          setConnectionMode('ws');
+          client.subscribe(GLOBAL_MESH_TOPIC, { qos: 0 });
+          publishMeshPacket({
+            type: 'mesh_heartbeat',
+            senderId: playerIdRef.current,
+            senderOrder: peerOrderRef.current,
+            playing: myJoinInfoRef.current.playing,
+            name: myJoinInfoRef.current.name,
+            colorId: myJoinInfoRef.current.colorId,
+          });
+        });
+
+        client.on('message', (_topic, payload) => {
+          try {
+            const parsed = JSON.parse(payload.toString());
+            handleMeshPacket(parsed);
+          } catch {
+            // ignore malformed packet
+          }
+        });
+      } catch {
+        // Fallback if WSS blocked
       }
 
       const initialSnap = engine.getSnapshot();
@@ -291,12 +464,50 @@ export default function App() {
       lastSnapshotTimeRef.current = performance.now();
       processSnapshotEvents(initialSnap);
 
+      // Periodic peer heartbeat & stale player cleanup
+      heartbeatInterval = setInterval(() => {
+        const now = performance.now();
+        publishMeshPacket({
+          type: 'mesh_heartbeat',
+          senderId: playerIdRef.current,
+          senderOrder: peerOrderRef.current,
+          playing: myJoinInfoRef.current.playing,
+          name: myJoinInfoRef.current.name,
+          colorId: myJoinInfoRef.current.colorId,
+        });
+
+        // Clean up disconnected remote human players after 6.5s of silence
+        for (const [pid, info] of activePeersRef.current.entries()) {
+          if (now - info.lastSeen > 6500) {
+            activePeersRef.current.delete(pid);
+            localEngineRef.current?.removePlayer(pid);
+          }
+        }
+      }, 950);
+
+      // Authoritative Room Coordinator step loop
       localInterval = setInterval(() => {
-        if (gameStateRef.current === 'PAUSED') return;
+        const now = performance.now();
+        if (!isSelfCoordinator(now)) {
+          return;
+        }
         const snap = engine.step();
+        const activeHumans =
+          1 +
+          Array.from(activePeersRef.current.values()).filter((p) => now - p.lastSeen < 6500)
+            .length;
+        snap.onlinePlayers = Math.max(snap.onlinePlayers, activeHumans);
+
         snapshotRef.current = snap;
-        lastSnapshotTimeRef.current = performance.now();
+        lastSnapshotTimeRef.current = now;
         processSnapshotEvents(snap);
+
+        publishMeshPacket({
+          type: 'mesh_state',
+          senderId: playerIdRef.current,
+          senderOrder: peerOrderRef.current,
+          state: snap,
+        });
       }, TICK_MS);
     };
 
@@ -313,7 +524,7 @@ export default function App() {
           } catch {
             // ignore
           }
-          startLocalFallbackEngine();
+          startGlobalMeshEngine();
         }
       }, 950);
 
@@ -341,23 +552,31 @@ export default function App() {
       };
 
       ws.onerror = () => {
-        startLocalFallbackEngine();
+        startGlobalMeshEngine();
       };
 
       ws.onclose = () => {
-        startLocalFallbackEngine();
+        startGlobalMeshEngine();
       };
     } catch {
-      startLocalFallbackEngine();
+      startGlobalMeshEngine();
     }
 
     return () => {
       isUnmounted = true;
       if (fallbackTimer) clearTimeout(fallbackTimer);
       if (localInterval) clearInterval(localInterval);
+      if (heartbeatInterval) clearInterval(heartbeatInterval);
       if (wsRef.current) {
         try {
           wsRef.current.close();
+        } catch {
+          // ignore
+        }
+      }
+      if (mqttRef.current) {
+        try {
+          mqttRef.current.end(true);
         } catch {
           // ignore
         }
@@ -373,40 +592,60 @@ export default function App() {
   }, [processSnapshotEvents]);
 
   const sendCommand = useCallback((msg: ClientToServerMessage) => {
+    const pid = playerIdRef.current;
+
+    if (msg.type === 'join' || msg.type === 'respawn') {
+      myJoinInfoRef.current = {
+        name: msg.name,
+        colorId: msg.colorId,
+        playing: true,
+      };
+    } else if (msg.type === 'leave') {
+      myJoinInfoRef.current.playing = false;
+    }
+
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(msg));
       return;
     }
 
-    // Local / Vercel edge engine handler
+    // Global Mesh / Vercel Multiplayer command dispatch
     const engine = localEngineRef.current;
-    if (!engine) return;
+    if (engine) {
+      if (msg.type === 'join' || msg.type === 'respawn') {
+        engine.spawnPlayer(pid, msg.name, msg.colorId);
+        snapshotRef.current = engine.getSnapshot();
+      } else if (msg.type === 'turn') {
+        engine.queueTurn(pid, msg.dir);
+      } else if (msg.type === 'leave') {
+        engine.removePlayer(pid);
+      }
+    }
 
-    const pid = playerIdRef.current;
-    if (msg.type === 'join' || msg.type === 'respawn') {
-      engine.spawnPlayer(pid, msg.name, msg.colorId);
-      const snap = engine.getSnapshot();
-      snapshotRef.current = snap;
-      broadcastChannelRef.current?.postMessage({
-        type: 'remote_join',
-        playerId: pid,
-        name: msg.name,
-        colorId: msg.colorId,
-      });
-    } else if (msg.type === 'turn') {
-      engine.queueTurn(pid, msg.dir);
-      broadcastChannelRef.current?.postMessage({
-        type: 'remote_turn',
-        playerId: pid,
-        dir: msg.dir,
-      });
-    } else if (msg.type === 'leave') {
-      engine.removePlayer(pid);
+    const packet = {
+      type: 'mesh_cmd',
+      senderId: pid,
+      senderOrder: peerOrderRef.current,
+      cmd: { ...msg, clientId: pid },
+    };
+
+    if (mqttRef.current && mqttRef.current.connected) {
+      try {
+        mqttRef.current.publish(GLOBAL_MESH_TOPIC, JSON.stringify(packet), { qos: 0 });
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      broadcastChannelRef.current?.postMessage(packet);
+    } catch {
+      // ignore
     }
   }, []);
 
   const handleStartOrRespawn = useCallback(() => {
     const cleanName = playerName.trim().toUpperCase().slice(0, 14) || 'VIPER_01';
+    lastAutoJoinSentAtRef.current = performance.now();
     sendCommand({
       type: 'join',
       name: cleanName,
@@ -893,9 +1132,9 @@ export default function App() {
             </span>
             <span aria-hidden="true">·</span>
             <span>
-              MODE{' '}
+              ONLINE{' '}
               <strong className="text-emerald-400">
-                {connectionMode === 'ws' ? 'LIVE MULTIPLAYER' : 'VERCEL EDGE ARENA'}
+                {hudStats.onlineCount} {hudStats.onlineCount === 1 ? 'PLAYER' : 'PLAYERS'}
               </strong>
             </span>
             {hudStats.shieldTicks > 0 && (
@@ -1017,6 +1256,13 @@ export default function App() {
                           style={{ backgroundColor: entry.color }}
                         />
                         <span className="truncate font-medium">{entry.name}</span>
+                        <span
+                          className={`text-[9px] font-semibold shrink-0 ${
+                            entry.isBot ? 'text-slate-500' : 'text-emerald-400'
+                          }`}
+                        >
+                          {entry.isBot ? 'AI' : 'PLR'}
+                        </span>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
                         <span className="text-slate-400">{entry.length}px</span>
