@@ -167,6 +167,34 @@ async function startServer() {
               client.send(payload);
             }
           }
+        } else if (msg.type === 'kick_admin') {
+          const targetId = typeof msg.targetPlayerId === 'string' ? msg.targetPlayerId : '*';
+          const issuedBy =
+            typeof msg.issuedByClientId === 'string' ? msg.issuedByClientId : assignedPlayerId;
+          const arena = arenas.get(activeGridSize)!;
+          if (targetId === '*') {
+            for (const s of arena.snakes.values()) {
+              if (!s.isBot && s.id !== issuedBy) {
+                arena.setAutopilot(s.id, false);
+              }
+            }
+          } else if (targetId && targetId !== issuedBy) {
+            arena.setAutopilot(targetId, false);
+          }
+          const payload = JSON.stringify({
+            type: 'kick_admin',
+            targetPlayerId: targetId,
+            issuedByClientId: issuedBy,
+          } satisfies ServerToClientMessage);
+          for (const [client, info] of clientPlayers.entries()) {
+            if (
+              client.readyState === WebSocket.OPEN &&
+              client.bufferedAmount < 65536 &&
+              info.gridSize === activeGridSize
+            ) {
+              client.send(payload);
+            }
+          }
         } else if (msg.type === 'leave') {
           if (!isPlayerIdOwnedElsewhere(assignedPlayerId, activeGridSize, ws)) {
             arenas.get(activeGridSize)!.removePlayer(assignedPlayerId);

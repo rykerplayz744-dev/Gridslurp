@@ -236,9 +236,11 @@ export type ClientToServerMessage =
   | { type: 'select_server'; gridSize: ServerGridSize }
   | { type: 'autopilot'; enabled: boolean }
   | { type: 'admin_track'; trackId: string }
+  | { type: 'kick_admin'; targetPlayerId: string; issuedByClientId: string }
   | { type: 'leave' };
 
 export type ServerToClientMessage =
   | { type: 'welcome'; playerId: string; state: ArenaSnapshot | PackedArenaSnapshot }
   | { type: 'state'; state: ArenaSnapshot | PackedArenaSnapshot }
-  | { type: 'admin_track'; trackId: string };
+  | { type: 'admin_track'; trackId: string }
+  | { type: 'kick_admin'; targetPlayerId: string; issuedByClientId: string };

@@ -232,7 +232,7 @@ export class ArenaEngine {
   }
 
   public spawnPlayer(id: string, name: string, colorId: string): SnakeEntity {
-    const cleanName = (name || 'PLAYER_1').trim().slice(0, 14).toUpperCase() || 'PLAYER_1';
+    const cleanName = (name || 'PLAYER_1').trim().slice(0, 24).toUpperCase() || 'PLAYER_1';
     const color = this.getColorById(colorId);
     const spawn = this.findNearbySafeSpawn();
     const snake = this.createSnakeEntity(id, cleanName, color, spawn, false);
@@ -287,6 +287,11 @@ export class ArenaEngine {
   public queueTurn(id: string, requestedDir: Direction) {
     const snake = this.snakes.get(id);
     if (!snake || !snake.alive) return;
+
+    if (snake.autoPilot) {
+      snake.autoPilot = false;
+      snake.nextDirs = [];
+    }
 
     const lastScheduledDir =
       snake.nextDirs.length > 0 ? snake.nextDirs[snake.nextDirs.length - 1] : snake.dir;

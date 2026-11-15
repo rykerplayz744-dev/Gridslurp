@@ -92,6 +92,14 @@ export default function App() {
       return true;
     }
   });
+  const [keepAutoPilotOnClose, setKeepAutoPilotOnClose] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('gridslurp_admin_autopilot_keep_on_close') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [autoPilotActive, setAutoPilotActive] = useState<boolean>(false);
   const [playlistStore, setPlaylistStore] = useState<PlaylistStoreState>(() => loadPlaylistStore());
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string>(
     () => loadPlaylistStore().activePlaylistId
@@ -101,10 +109,20 @@ export default function App() {
   const [isMusicPlaying, setIsMusicPlaying] = useState<boolean>(false);
   const [isAdminMusicActive, setIsAdminMusicActive] = useState<boolean>(false);
 
+  const [adminKickedThisSession, setAdminKickedThisSession] = useState<boolean>(false);
+  const [kickFeedbackMsg, setKickFeedbackMsg] = useState<string | null>(null);
+
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const isAdminMusicActiveRef = useRef<boolean>(false);
   const playNextAdminTrackRef = useRef<(forceTrackId?: string) => void>(() => {});
-  const isAdminName = playerName.trim().toUpperCase() === 'ADMIN';
+  const handleIncomingAdminKickRef = useRef<(targetPlayerId: string, issuedByClientId: string) => void>(
+    () => {}
+  );
+  const autoPilotActiveRef = useRef<boolean>(false);
+  const keepAutoPilotOnCloseRef = useRef<boolean>(keepAutoPilotOnClose);
+  const normalizedPlayerName = playerName.trim().toUpperCase();
+  const isSuperAdminRy = !adminKickedThisSession && normalizedPlayerName.startsWith('ADMINRY');
+  const isAdminName = !adminKickedThisSession && normalizedPlayerName.startsWith('ADMIN');
 
   // HUD state synced at tick rate (not 60fps) to keep React lightweight
   const [hudStats, setHudStats] = useState<{
@@ -120,6 +138,13 @@ export default function App() {
     killedByName?: string;
     bigPelletsOnGrid: number;
     onlineCount: number;
+    humanPlayers: Array<{
+      id: string;
+      name: string;
+      color: string;
+      alive: boolean;
+      autoPilot: boolean;
+    }>;
     leaderboard: Array<{
       id: string;
       name: string;
@@ -146,6 +171,7 @@ export default function App() {
     shieldTicks: 0,
     bigPelletsOnGrid: 0,
     onlineCount: 1,
+    humanPlayers: [],
     leaderboard: [],
     killFeed: [],
   });
@@ -424,6 +450,38 @@ export default function App() {
         });
 
       const activeSize = snap.gridSize || GRID_SIZE;
+      const nowMs = performance.now();
+      const humanMap = new Map<
+        string,
+        { id: string; name: string; color: string; alive: boolean; autoPilot: boolean }
+      >();
+      for (const s of snap.snakes) {
+        if (s.isBot || s.id === myId) continue;
+        humanMap.set(s.id, {
+          id: s.id,
+          name: s.name,
+          color: s.color.head,
+          alive: s.alive,
+          autoPilot: Boolean(s.autoPilot),
+        });
+      }
+      for (const [pid, info] of activePeersRef.current.entries()) {
+        if (pid === myId || nowMs - info.lastSeen > 6500 || humanMap.has(pid)) continue;
+        humanMap.set(pid, {
+          id: pid,
+          name: info.name,
+          color: '#94A3B8',
+          alive: false,
+          autoPilot: false,
+        });
+      }
+      const humanPlayers = Array.from(humanMap.values()).sort((a, b) => {
+        const aAdmin = a.name.trim().toUpperCase().startsWith('ADMIN') ? 0 : 1;
+        const bAdmin = b.name.trim().toUpperCase().startsWith('ADMIN') ? 0 : 1;
+        if (aAdmin !== bAdmin) return aAdmin - bAdmin;
+        return a.name.localeCompare(b.name);
+      });
+
       setHudStats((prev) => ({
         score: me ? me.score : prev.score,
         length: me ? me.segments.length : prev.length,
@@ -440,9 +498,10 @@ export default function App() {
           snap.onlinePlayers,
           1 +
             Array.from(activePeersRef.current.values()).filter(
-              (p) => performance.now() - p.lastSeen < 6500
+              (p) => nowMs - p.lastSeen < 6500
             ).length
         ),
+        humanPlayers,
         leaderboard: sorted.slice(0, 6).map((s) => ({
           id: s.id,
           name: s.name,
@@ -653,6 +712,21 @@ export default function App() {
           isAdminMusicActiveRef.current = true;
           setIsAdminMusicActive(true);
           playNextAdminTrackRef.current(cmd.trackId);
+          return;
+        }
+        if (cmd.type === 'kick_admin') {
+          if (mc.isCoordinator) {
+            if (cmd.targetPlayerId === '*') {
+              for (const s of localEngineRef.current.snakes.values()) {
+                if (!s.isBot && s.id !== cmd.issuedByClientId) {
+                  localEngineRef.current.setAutopilot(s.id, false);
+                }
+              }
+            } else if (cmd.targetPlayerId && cmd.targetPlayerId !== cmd.issuedByClientId) {
+              localEngineRef.current.setAutopilot(cmd.targetPlayerId, false);
+            }
+          }
+          handleIncomingAdminKickRef.current(cmd.targetPlayerId, cmd.issuedByClientId);
           return;
         }
 
@@ -921,6 +995,8 @@ export default function App() {
             isAdminMusicActiveRef.current = true;
             setIsAdminMusicActive(true);
             playNextAdminTrackRef.current(msg.trackId);
+          } else if (msg.type === 'kick_admin') {
+            handleIncomingAdminKickRef.current(msg.targetPlayerId, msg.issuedByClientId);
           }
         } catch {
           // ignore parse error
@@ -1000,6 +1076,16 @@ export default function App() {
           engine.queueTurn(pid, msg.dir);
         } else if (msg.type === 'autopilot') {
           engine.setAutopilot(pid, Boolean(msg.enabled));
+        } else if (msg.type === 'kick_admin') {
+          if (msg.targetPlayerId === '*') {
+            for (const s of engine.snakes.values()) {
+              if (!s.isBot && s.id !== msg.issuedByClientId) {
+                engine.setAutopilot(s.id, false);
+              }
+            }
+          } else if (msg.targetPlayerId && msg.targetPlayerId !== msg.issuedByClientId) {
+            engine.setAutopilot(msg.targetPlayerId, false);
+          }
         } else if (msg.type === 'leave') {
           engine.removePlayer(pid);
         }
@@ -1220,10 +1306,98 @@ export default function App() {
 
   const lastSentAutoPilotRef = useRef<boolean>(false);
 
+  useEffect(() => {
+    autoPilotActiveRef.current = autoPilotActive;
+  }, [autoPilotActive]);
+
+  useEffect(() => {
+    keepAutoPilotOnCloseRef.current = keepAutoPilotOnClose;
+  }, [keepAutoPilotOnClose]);
+
+  const stopAutoPilot = useCallback(() => {
+    autoPilotActiveRef.current = false;
+    setAutoPilotActive(false);
+    if (lastSentAutoPilotRef.current) {
+      lastSentAutoPilotRef.current = false;
+      sendCommand({ type: 'autopilot', enabled: false });
+    }
+  }, [sendCommand]);
+
+  // Keep local mesh heartbeat name synced while in menu so peers can see ADMIN names
+  useEffect(() => {
+    if (!myJoinInfoRef.current.playing) {
+      myJoinInfoRef.current.name = playerName.trim().toUpperCase().slice(0, 24) || 'VIPER_01';
+    }
+  }, [playerName]);
+
+  // Ephemeral session-only admin kick receiver (resets automatically on page reload; never stored on server)
+  useEffect(() => {
+    handleIncomingAdminKickRef.current = (targetPlayerId: string, issuedByClientId: string) => {
+      const myId = playerIdRef.current;
+      if (issuedByClientId === myId) return;
+      if (targetPlayerId !== myId && targetPlayerId !== '*') return;
+
+      setAdminKickedThisSession(true);
+      setShowAdminModal(false);
+      stopAutoPilot();
+      if (isAdminMusicActiveRef.current) {
+        isAdminMusicActiveRef.current = false;
+        setIsAdminMusicActive(false);
+        if (audioRef.current && !audioRef.current.paused) {
+          audioRef.current.pause();
+          setIsMusicPlaying(false);
+        }
+      }
+    };
+  }, [stopAutoPilot]);
+
+  const handleKickOffAdmin = useCallback(
+    (targetPlayerId: string, displayLabel: string) => {
+      if (!isSuperAdminRy) return;
+      sendCommand({
+        type: 'kick_admin',
+        targetPlayerId,
+        issuedByClientId: playerIdRef.current,
+      });
+      setKickFeedbackMsg(`Kicked ${displayLabel} off admin until they reload the page.`);
+    },
+    [isSuperAdminRy, sendCommand]
+  );
+
+  useEffect(() => {
+    if (!kickFeedbackMsg) return;
+    const timer = setTimeout(() => setKickFeedbackMsg(null), 3000);
+    return () => clearTimeout(timer);
+  }, [kickFeedbackMsg]);
+
+  const openAdminModal = useCallback(() => {
+    if (!isAdminName) return;
+    setShowAdminModal(true);
+    if (gameState === 'PLAYING' && isAdminName && adminAutoPilot) {
+      autoPilotActiveRef.current = true;
+      setAutoPilotActive(true);
+    }
+  }, [adminAutoPilot, gameState, isAdminName]);
+
+  const closeAdminModal = useCallback(
+    (forceKeepAutopilot = false) => {
+      if (forceKeepAutopilot && gameState === 'PLAYING' && isAdminName) {
+        autoPilotActiveRef.current = true;
+        setAutoPilotActive(true);
+      } else if (!keepAutoPilotOnCloseRef.current) {
+        stopAutoPilot();
+      }
+      setShowAdminModal(false);
+    },
+    [gameState, isAdminName, stopAutoPilot]
+  );
+
   const handleStartOrRespawn = useCallback(() => {
-    const cleanName = playerName.trim().toUpperCase().slice(0, 14) || 'VIPER_01';
+    const cleanName = playerName.trim().toUpperCase().slice(0, 24) || 'VIPER_01';
     lastAutoJoinSentAtRef.current = performance.now();
     lastSentAutoPilotRef.current = false;
+    autoPilotActiveRef.current = false;
+    setAutoPilotActive(false);
     sendCommand({
       type: 'join',
       name: cleanName,
@@ -1282,10 +1456,13 @@ export default function App() {
   const handleMobileTurn = useCallback(
     (dir: Direction) => {
       if (gameState !== 'PLAYING') return;
+      if (autoPilotActiveRef.current) {
+        stopAutoPilot();
+      }
       soundEngine.playTurnBlip();
       sendCommand({ type: 'turn', dir });
     },
-    [gameState, sendCommand]
+    [gameState, sendCommand, stopAutoPilot]
   );
 
   const handleToggleAdminAutoPilot = useCallback(() => {
@@ -1296,19 +1473,48 @@ export default function App() {
       } catch {
         // ignore storage errors
       }
+      if (gameState === 'PLAYING' && isAdminName && showAdminModal) {
+        autoPilotActiveRef.current = next;
+        setAutoPilotActive(next);
+      } else if (!next) {
+        autoPilotActiveRef.current = false;
+        setAutoPilotActive(false);
+      }
+      return next;
+    });
+  }, [gameState, isAdminName, showAdminModal]);
+
+  const handleToggleKeepAutoPilotOnClose = useCallback(() => {
+    setKeepAutoPilotOnClose((prev) => {
+      const next = !prev;
+      keepAutoPilotOnCloseRef.current = next;
+      try {
+        localStorage.setItem('gridslurp_admin_autopilot_keep_on_close', String(next));
+      } catch {
+        // ignore storage errors
+      }
       return next;
     });
   }, []);
 
-  // Automatically enable AI Autopilot whenever an Admin opens the Admin Menu while playing
+  // Reset AI Autopilot cleanly when leaving PLAYING state or losing admin status
   useEffect(() => {
-    const shouldEnable =
-      gameState === 'PLAYING' && isAdminName && showAdminModal && adminAutoPilot;
+    if (gameState !== 'PLAYING' || !isAdminName) {
+      if (autoPilotActiveRef.current) {
+        autoPilotActiveRef.current = false;
+        setAutoPilotActive(false);
+      }
+    }
+  }, [gameState, isAdminName]);
+
+  // Sync AI Autopilot state with the server / arena coordinator
+  useEffect(() => {
+    const shouldEnable = gameState === 'PLAYING' && isAdminName && autoPilotActive;
     if (shouldEnable !== lastSentAutoPilotRef.current) {
       lastSentAutoPilotRef.current = shouldEnable;
       sendCommand({ type: 'autopilot', enabled: shouldEnable });
     }
-  }, [adminAutoPilot, gameState, isAdminName, sendCommand, showAdminModal]);
+  }, [autoPilotActive, gameState, isAdminName, sendCommand]);
 
   // Strict WASD & Arrow Keys directional input listener
   useEffect(() => {
@@ -1352,7 +1558,7 @@ export default function App() {
       if (e.key === 'Escape') {
         e.preventDefault();
         if (showAdminModal) {
-          setShowAdminModal(false);
+          closeAdminModal(false);
           return;
         }
         setGameState((prev) => (prev === 'PLAYING' ? 'PAUSED' : 'PLAYING'));
@@ -1363,7 +1569,7 @@ export default function App() {
 
       if (gameState !== 'PLAYING') return;
 
-      // Strictly WASD and Arrow Keys for directional movement on the 32x32 grid
+      // Strictly WASD and Arrow Keys for directional movement on the grid
       let requestedDir: Direction | null = null;
       switch (e.code) {
         case 'KeyW':
@@ -1388,6 +1594,9 @@ export default function App() {
 
       if (requestedDir) {
         e.preventDefault();
+        if (autoPilotActiveRef.current) {
+          stopAutoPilot();
+        }
         soundEngine.playTurnBlip();
         sendCommand({ type: 'turn', dir: requestedDir });
       }
@@ -1395,7 +1604,16 @@ export default function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [gameState, handleStartOrRespawn, handleToggleMute, handleToggleZoom, sendCommand, showAdminModal]);
+  }, [
+    closeAdminModal,
+    gameState,
+    handleStartOrRespawn,
+    handleToggleMute,
+    handleToggleZoom,
+    sendCommand,
+    showAdminModal,
+    stopAutoPilot,
+  ]);
 
   // 60FPS Hardware-Accelerated Pixel Matrix Canvas Loop
   useEffect(() => {
@@ -2033,7 +2251,7 @@ export default function App() {
           {isAdminName && (
             <button
               type="button"
-              onClick={() => setShowAdminModal(true)}
+              onClick={openAdminModal}
               className="px-2.5 py-1 text-xs font-semibold bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-400/60 rounded transition-colors whitespace-nowrap cursor-pointer"
             >
               Admin Menu
@@ -2121,6 +2339,15 @@ export default function App() {
                 ref={canvasRef}
                 className="w-full h-full block rounded-sm bg-[#070A0F]"
               />
+
+              {gameState === 'PLAYING' && autoPilotActive && !showAdminModal && (
+                <div className="absolute top-5 left-1/2 -translate-x-1/2 z-10 pointer-events-none px-3.5 py-1.5 rounded-lg bg-[#080B10]/90 border border-emerald-400/70 shadow-lg flex items-center gap-2 whitespace-nowrap">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  <span className="text-[11px] font-mono-tabular font-bold text-emerald-300 tracking-wide">
+                    AI AUTOPILOT ACTIVE · PRESS ANY DIRECTION TO DRIVE
+                  </span>
+                </div>
+              )}
             </div>
           </div>
 
@@ -2421,7 +2648,7 @@ export default function App() {
                     {isAdminName && (
                       <button
                         type="button"
-                        onClick={() => setShowAdminModal(true)}
+                        onClick={openAdminModal}
                         className="px-3 py-1 rounded-md bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs tracking-wide transition-colors cursor-pointer shadow-sm"
                       >
                         ADMIN MENU
@@ -2432,7 +2659,7 @@ export default function App() {
                     <input
                       id="callsign-input"
                       type="text"
-                      maxLength={14}
+                      maxLength={24}
                       value={playerName}
                       onChange={(e) => setPlayerName(e.target.value.toUpperCase())}
                       placeholder="VIPER_01"
@@ -2441,7 +2668,7 @@ export default function App() {
                     {isAdminName && (
                       <button
                         type="button"
-                        onClick={() => setShowAdminModal(true)}
+                        onClick={openAdminModal}
                         className="shrink-0 px-4 py-2.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/70 text-amber-300 font-display font-bold text-xs tracking-wider transition-colors cursor-pointer"
                       >
                         OPEN ADMIN MENU
@@ -2712,7 +2939,7 @@ export default function App() {
           <div className="absolute inset-0 z-40 bg-[#080B10]/85 flex items-center justify-center p-4">
             <div className="w-full max-w-2xl max-h-[90vh] flex flex-col rounded-xl bg-[#0D131F] border border-amber-500/50 shadow-2xl overflow-hidden">
               {/* Modal Header */}
-              <div className="px-6 py-4 bg-[#090D16] border-b border-slate-800 flex items-center justify-between">
+              <div className="px-6 py-4 bg-[#090D16] border-b border-slate-800 flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <div className="text-[11px] font-mono-tabular text-amber-400 font-semibold">
                     ADMIN AUDIO CONSOLE · FOLDER: src/audio/
@@ -2721,47 +2948,185 @@ export default function App() {
                     SHUFFLED GAME AUDIO PLAYLISTS
                   </h2>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setShowAdminModal(false)}
-                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold cursor-pointer"
-                >
-                  Close
-                </button>
+                <div className="flex items-center gap-2">
+                  {gameState === 'PLAYING' && isAdminName && (
+                    <button
+                      type="button"
+                      onClick={() => closeAdminModal(true)}
+                      className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold cursor-pointer transition-colors"
+                      title="Close the Admin Menu while AI Autopilot continues steering until you press a direction"
+                    >
+                      Close & Keep Autopilot
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => closeAdminModal(false)}
+                    className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold cursor-pointer"
+                  >
+                    Close
+                  </button>
+                </div>
               </div>
 
               {/* Modal Body */}
               <div className="p-6 overflow-y-auto space-y-5 text-xs">
-                {/* Admin Menu AI Autopilot Toggle (On by Default) */}
-                <div className="p-4 rounded-lg bg-[#080B10] border border-emerald-500/40 flex flex-wrap items-center justify-between gap-3">
-                  <div className="space-y-1 max-w-md">
-                    <div className="flex items-center gap-2">
-                      <span className="font-display font-semibold text-emerald-300 tracking-wide">
-                        ADMIN MENU AI AUTOPILOT
-                      </span>
-                      {gameState === 'PLAYING' && isAdminName && adminAutoPilot && (
-                        <span className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/60 text-emerald-300 font-mono-tabular text-[10px] font-bold animate-pulse">
-                          STEERING ACTIVE
-                        </span>
+                {/* Super-Admin ADMINRY Section: Kick Anyone Off Admin (Session-Only, Not Stored on Server) */}
+                {isSuperAdminRy && (
+                  <div className="p-4 rounded-lg bg-[#080B10] border border-rose-500/50 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="space-y-1 max-w-md">
+                        <div className="flex items-center gap-2">
+                          <span className="font-display font-semibold text-rose-300 tracking-wide">
+                            ADMINRY OVERRIDE · KICK OFF ADMIN
+                          </span>
+                          <span className="px-2 py-0.5 rounded bg-rose-500/20 border border-rose-400/50 text-rose-200 font-mono-tabular text-[10px] font-bold">
+                            SESSION ONLY
+                          </span>
+                        </div>
+                        <p className="text-slate-400 leading-relaxed text-[11px]">
+                          Revoke admin access for any connected player right now. Nothing is stored
+                          on the server—reloading the page restores normal access.
+                        </p>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => handleKickOffAdmin('*', 'all other admins')}
+                        className="px-3.5 py-2 rounded-lg bg-rose-500 hover:bg-rose-400 text-slate-950 font-mono-tabular font-bold text-xs transition-colors cursor-pointer shrink-0"
+                      >
+                        Kick All Other Admins
+                      </button>
+                    </div>
+
+                    {kickFeedbackMsg && (
+                      <div className="px-3 py-2 rounded bg-rose-500/15 border border-rose-400/40 text-rose-200 font-mono-tabular text-[11px]">
+                        {kickFeedbackMsg}
+                      </div>
+                    )}
+
+                    <div className="pt-2 border-t border-slate-800/80 space-y-2">
+                      <div className="text-[11px] font-mono-tabular text-slate-400">
+                        CONNECTED PLAYERS ({hudStats.humanPlayers.length} OTHER HUMAN
+                        {hudStats.humanPlayers.length === 1 ? '' : 'S'})
+                      </div>
+                      {hudStats.humanPlayers.length === 0 ? (
+                        <div className="text-[11px] text-slate-500 py-1">
+                          No other spawned players detected right now. Use &ldquo;Kick All Other
+                          Admins&rdquo; above to also kick anyone sitting on the menu.
+                        </div>
+                      ) : (
+                        <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                          {hudStats.humanPlayers.map((p) => {
+                            const looksAdmin = p.name.trim().toUpperCase().startsWith('ADMIN');
+                            return (
+                              <div
+                                key={p.id}
+                                className="flex items-center justify-between gap-2 px-3 py-2 rounded bg-[#0D131F] border border-slate-800"
+                              >
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span
+                                    className="w-2.5 h-2.5 rounded-xs shrink-0"
+                                    style={{ backgroundColor: p.color }}
+                                  />
+                                  <span className="font-mono-tabular font-semibold text-slate-200 truncate">
+                                    {p.name}
+                                  </span>
+                                  {looksAdmin && (
+                                    <span className="px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-400/50 text-amber-300 font-mono-tabular text-[10px] font-bold shrink-0">
+                                      ADMIN
+                                    </span>
+                                  )}
+                                  {p.autoPilot && (
+                                    <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/50 text-emerald-300 font-mono-tabular text-[10px] shrink-0">
+                                      AI
+                                    </span>
+                                  )}
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => handleKickOffAdmin(p.id, p.name)}
+                                  className="px-2.5 py-1 rounded bg-rose-500/20 hover:bg-rose-500/35 border border-rose-400/60 text-rose-200 font-mono-tabular font-semibold text-[11px] transition-colors cursor-pointer shrink-0"
+                                >
+                                  Kick Off Admin
+                                </button>
+                              </div>
+                            );
+                          })}
+                        </div>
                       )}
                     </div>
-                    <p className="text-slate-400 leading-relaxed text-[11px]">
-                      When enabled, an AI automatically steers your snake safely away from outer
-                      walls and rival trails while you have the Admin Menu open.
-                    </p>
+                  </div>
+                )}
+
+                {/* Admin Menu AI Autopilot Controls */}
+                <div className="p-4 rounded-lg bg-[#080B10] border border-emerald-500/40 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="space-y-1 max-w-md">
+                      <div className="flex items-center gap-2">
+                        <span className="font-display font-semibold text-emerald-300 tracking-wide">
+                          ADMIN MENU AI AUTOPILOT
+                        </span>
+                        {gameState === 'PLAYING' && isAdminName && autoPilotActive && (
+                          <span className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/60 text-emerald-300 font-mono-tabular text-[10px] font-bold animate-pulse">
+                            STEERING ACTIVE
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-slate-400 leading-relaxed text-[11px]">
+                        When enabled, an AI automatically steers your snake safely away from outer
+                        walls and rival trails while you have the Admin Menu open.
+                      </p>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleToggleAdminAutoPilot}
+                      className={`px-3.5 py-2 rounded-lg border font-mono-tabular font-semibold text-xs transition-colors cursor-pointer shrink-0 ${
+                        adminAutoPilot
+                          ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300 hover:bg-emerald-500/30'
+                          : 'bg-[#0D131F] border-slate-700 text-slate-400 hover:border-slate-500'
+                      }`}
+                    >
+                      {adminAutoPilot ? 'AI AUTOPILOT: ON' : 'AI AUTOPILOT: OFF'}
+                    </button>
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={handleToggleAdminAutoPilot}
-                    className={`px-3.5 py-2 rounded-lg border font-mono-tabular font-semibold text-xs transition-colors cursor-pointer shrink-0 ${
-                      adminAutoPilot
-                        ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300 hover:bg-emerald-500/30'
-                        : 'bg-[#0D131F] border-slate-700 text-slate-400 hover:border-slate-500'
-                    }`}
-                  >
-                    {adminAutoPilot ? 'AI AUTOPILOT: ON' : 'AI AUTOPILOT: OFF'}
-                  </button>
+                  <div className="pt-2.5 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
+                    <div className="space-y-0.5 max-w-md">
+                      <div className="font-semibold text-slate-200 text-[11px]">
+                        Keep Autopilot Running After Closing Admin Menu
+                      </div>
+                      <p className="text-slate-400 text-[11px] leading-relaxed">
+                        AI stays in control after closing this menu and only hands steering back
+                        once you press a direction key or D-Pad button.
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={handleToggleKeepAutoPilotOnClose}
+                        className={`px-3 py-1.5 rounded-lg border font-mono-tabular font-semibold text-[11px] transition-colors cursor-pointer ${
+                          keepAutoPilotOnClose
+                            ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300 hover:bg-emerald-500/30'
+                            : 'bg-[#0D131F] border-slate-700 text-slate-400 hover:border-slate-500'
+                        }`}
+                      >
+                        {keepAutoPilotOnClose ? 'KEEP ON CLOSE: ON' : 'KEEP ON CLOSE: OFF'}
+                      </button>
+
+                      {gameState === 'PLAYING' && isAdminName && (
+                        <button
+                          type="button"
+                          onClick={() => closeAdminModal(true)}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-mono-tabular font-bold text-[11px] transition-colors cursor-pointer"
+                        >
+                          Close & Keep Steering
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 </div>
 
                 {/* Folder Info Banners (Default Folder vs Extra Admin Folder) */}
