@@ -6,11 +6,13 @@ import {
   ClientToServerMessage,
   Direction,
   GRID_SIZE,
+  PackedArenaSnapshot,
   ServerGridSize,
   ServerToClientMessage,
   SNAKE_PALETTES,
   TICK_MS,
 } from './shared/gameTypes';
+import { packSnapshot, unpackSnapshot } from './shared/wireProtocol';
 import {
   ADMIN_AUDIO_TRACKS,
   DISCOVERED_AUDIO_TRACKS,
@@ -20,10 +22,10 @@ import {
 } from './utils/playlistManager';
 import { soundEngine } from './utils/soundEngine';
 
-const getMeshTopic = (size: ServerGridSize) => `gridslurp/v2/arena/global_main_${size}x${size}`;
+const getMeshTopic = (size: ServerGridSize) => `gridslurp/v3/arena/global_main_${size}x${size}`;
 const MQTT_BROKERS = [
   'wss://broker.emqx.io:8084/mqtt',
-  'wss://broker-cn.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
 ];
 
 type GameState = 'TITLE_MENU' | 'PLAYING' | 'PAUSED' | 'GAME_OVER';
@@ -82,6 +84,14 @@ export default function App() {
   const [muted, setMuted] = useState<boolean>(soundEngine.muted);
   const [, setConnectionMode] = useState<'ws' | 'local-sync'>('ws');
   const [showAdminModal, setShowAdminModal] = useState<boolean>(false);
+  const [adminAutoPilot, setAdminAutoPilot] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('gridslurp_admin_autopilot');
+      return saved === null ? true : saved === 'true';
+    } catch {
+      return true;
+    }
+  });
   const [playlistStore, setPlaylistStore] = useState<PlaylistStoreState>(() => loadPlaylistStore());
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string>(
     () => loadPlaylistStore().activePlaylistId
@@ -89,15 +99,10 @@ export default function App() {
   const [newPlaylistName, setNewPlaylistName] = useState<string>('');
   const [currentTrackId, setCurrentTrackId] = useState<string | null>(null);
   const [isMusicPlaying, setIsMusicPlaying] = useState<boolean>(false);
-  const [adminInServer, setAdminInServer] = useState<boolean>(false);
   const [isAdminMusicActive, setIsAdminMusicActive] = useState<boolean>(false);
-  const [adminLeaveSecondsLeft, setAdminLeaveSecondsLeft] = useState<number | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const isAdminMusicActiveRef = useRef<boolean>(false);
-  const manualDefaultMusicPlayingRef = useRef<boolean>(false);
-  const adminLeaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const adminLeaveCountdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const playNextAdminTrackRef = useRef<(forceTrackId?: string) => void>(() => {});
   const isAdminName = playerName.trim().toUpperCase() === 'ADMIN';
 
@@ -152,12 +157,10 @@ export default function App() {
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
 
   const playerIdRef = useRef<string>(`plr_${Math.random().toString(36).slice(2, 9)}`);
-  const peerOrderRef = useRef<number>(Date.now() + Math.random());
   const activePeersRef = useRef<
     Map<
       string,
       {
-        order: number;
         lastSeen: number;
         playing: boolean;
         name: string;
@@ -165,7 +168,25 @@ export default function App() {
       }
     >
   >(new Map());
-  const lastRemoteCoordStateAtRef = useRef<number>(0);
+  const meshCoordRef = useRef<{
+    isCoordinator: boolean;
+    activeCoordId: string | null;
+    coordEpoch: number;
+    lastAcceptedEpoch: number;
+    lastAcceptedTick: number;
+    lastCoordMsgAt: number;
+    needsHydrateBeforeStep: boolean;
+    readyToLeadAt: number;
+  }>({
+    isCoordinator: false,
+    activeCoordId: null,
+    coordEpoch: 0,
+    lastAcceptedEpoch: 0,
+    lastAcceptedTick: -1,
+    lastCoordMsgAt: 0,
+    needsHydrateBeforeStep: false,
+    readyToLeadAt: 0,
+  });
   const lastAutoJoinSentAtRef = useRef<number>(0);
   const myJoinInfoRef = useRef<{ name: string; colorId: string; playing: boolean }>({
     name: 'VIPER_01',
@@ -319,6 +340,8 @@ export default function App() {
           }
 
           if (kill.victimId === myId && gameStateRef.current === 'PLAYING') {
+            gameStateRef.current = 'GAME_OVER';
+            myJoinInfoRef.current.playing = false;
             soundEngine.playPlayerDeath();
             shakeRef.current = 14;
             hitstopUntilRef.current = performance.now() + 65;
@@ -432,18 +455,6 @@ export default function App() {
         })),
         killFeed: feed,
       }));
-
-      // Check if any player named ADMIN is currently active in the server
-      const hasAdminSnake = snap.snakes.some(
-        (s) => !s.isBot && s.alive && s.name.trim().toUpperCase() === 'ADMIN'
-      );
-      const hasAdminPeer = Array.from(activePeersRef.current.values()).some(
-        (p) =>
-          performance.now() - p.lastSeen < 6500 &&
-          p.playing &&
-          p.name.trim().toUpperCase() === 'ADMIN'
-      );
-      setAdminInServer(hasAdminSnake || hasAdminPeer);
     },
     [pickRandomSpectatedSnake, spawnBurst]
   );
@@ -451,12 +462,24 @@ export default function App() {
   // Setup Live Multiplayer: Direct /ws Server + Global Cross-Device WSS Mesh (for Vercel) + BroadcastChannel
   useEffect(() => {
     let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
-    let localInterval: ReturnType<typeof setInterval> | null = null;
+    let tickTimeout: ReturnType<typeof setTimeout> | null = null;
     let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
     let isUnmounted = false;
     const meshTopic = getMeshTopic(serverGridSize);
     activePeersRef.current.clear();
     localEngineRef.current = null;
+
+    // Reset coordinator state cleanly for this room
+    meshCoordRef.current = {
+      isCoordinator: false,
+      activeCoordId: null,
+      coordEpoch: 0,
+      lastAcceptedEpoch: 0,
+      lastAcceptedTick: -1,
+      lastCoordMsgAt: 0,
+      needsHydrateBeforeStep: false,
+      readyToLeadAt: performance.now() + 1250,
+    };
 
     const publishMeshPacket = (packet: Record<string, unknown>) => {
       const serialized = JSON.stringify(packet);
@@ -474,77 +497,168 @@ export default function App() {
       }
     };
 
-    const isSelfCoordinator = (now: number): boolean => {
+    const canBecomeCoordinator = (now: number): boolean => {
+      const mc = meshCoordRef.current;
+      if (mc.isCoordinator) return true;
+
+      // Wait for initial discovery window so we never collide with an active room host
+      if (now < mc.readyToLeadAt) return false;
+
+      // Never hijack while an active coordinator has sent state recently (< 4500ms)
+      if (mc.activeCoordId && now - mc.lastCoordMsgAt < 4500) {
+        return false;
+      }
+
+      // Deterministic clock-independent tie-break: smallest alive peer ID steps up
       const myId = playerIdRef.current;
-      const myOrder = peerOrderRef.current;
       for (const [pid, info] of activePeersRef.current.entries()) {
         if (pid === myId) continue;
-        if (now - info.lastSeen > 3000) continue;
-        if (info.order < myOrder || (info.order === myOrder && pid < myId)) {
-          // Another active peer has higher priority; only yield if they are actively broadcasting state
-          if (now - lastRemoteCoordStateAtRef.current < 2200) {
-            return false;
-          }
+        if (now - info.lastSeen > 5000) continue;
+        if (pid < myId) {
+          return false;
         }
       }
       return true;
     };
 
+    const applyAuthoritativeSnapshot = (remoteSnap: ArenaSnapshot, now: number) => {
+      snapshotRef.current = remoteSnap;
+      lastSnapshotTimeRef.current = now;
+      processSnapshotEvents(remoteSnap);
+
+      const myId = playerIdRef.current;
+      const mySnake = remoteSnap.snakes.find((s) => s.id === myId);
+
+      // Sync GAME_OVER synchronously if coordinator reports our snake dead
+      if (mySnake && !mySnake.alive && gameStateRef.current === 'PLAYING') {
+        gameStateRef.current = 'GAME_OVER';
+        myJoinInfoRef.current.playing = false;
+        setGameState('GAME_OVER');
+        return;
+      }
+
+      // If we just joined and aren't on the coordinator's board yet, resend join cleanly once per 850ms
+      if (
+        myJoinInfoRef.current.playing &&
+        gameStateRef.current === 'PLAYING' &&
+        !mySnake &&
+        now - lastAutoJoinSentAtRef.current > 850
+      ) {
+        lastAutoJoinSentAtRef.current = now;
+        publishMeshPacket({
+          type: 'mesh_cmd',
+          senderId: myId,
+          cmd: {
+            type: 'join',
+            clientId: myId,
+            name: myJoinInfoRef.current.name,
+            colorId: myJoinInfoRef.current.colorId,
+            gridSize: serverGridSize,
+          },
+        });
+      }
+    };
+
     const handleMeshPacket = (data: Record<string, unknown>) => {
       if (!data || typeof data.type !== 'string') return;
       const senderId = String(data.senderId || '');
-      if (!senderId || senderId === playerIdRef.current) return;
+      const myId = playerIdRef.current;
+      if (!senderId || senderId === myId) return;
 
       const now = performance.now();
-      const senderOrder = Number(data.senderOrder) || now;
-
       const existingPeer = activePeersRef.current.get(senderId);
       activePeersRef.current.set(senderId, {
-        order: senderOrder,
         lastSeen: now,
         playing: typeof data.playing === 'boolean' ? data.playing : existingPeer?.playing ?? false,
         name: typeof data.name === 'string' ? data.name : existingPeer?.name ?? 'PLAYER',
         colorId: typeof data.colorId === 'string' ? data.colorId : existingPeer?.colorId ?? 'cyan',
       });
 
-      if (data.type === 'mesh_state' && data.state && localEngineRef.current) {
-        const myId = playerIdRef.current;
-        const myOrder = peerOrderRef.current;
-        const senderIsPrior =
-          senderOrder < myOrder || (senderOrder === myOrder && senderId < myId);
+      const mc = meshCoordRef.current;
 
-        if (senderIsPrior) {
-          lastRemoteCoordStateAtRef.current = now;
-          const remoteSnap = data.state as ArenaSnapshot;
-          localEngineRef.current.hydrateFromSnapshot(remoteSnap);
+      if (data.type === 'mesh_state' && data.state && localEngineRef.current) {
+        const remoteEpoch = Number(data.epoch) || 1;
+        const remoteSnap = unpackSnapshot(data.state as ArenaSnapshot | PackedArenaSnapshot);
+
+        // If we thought we were coordinator, yield cleanly to higher epoch, higher tick, or lower ID
+        if (mc.isCoordinator) {
+          const ourTick = localEngineRef.current.tick;
+          const remoteWins =
+            remoteEpoch > mc.coordEpoch ||
+            (remoteEpoch === mc.coordEpoch && remoteSnap.tick > ourTick + 1) ||
+            (remoteEpoch === mc.coordEpoch &&
+              Math.abs(remoteSnap.tick - ourTick) <= 1 &&
+              senderId < myId);
+          if (!remoteWins) {
+            return;
+          }
+          mc.isCoordinator = false;
+        }
+
+        // Strict monotonic epoch + tick guard: never accept stale or out-of-order states
+        if (
+          remoteEpoch < mc.lastAcceptedEpoch ||
+          (remoteEpoch === mc.lastAcceptedEpoch && remoteSnap.tick <= mc.lastAcceptedTick)
+        ) {
+          return;
+        }
+
+        // Ignore rogue weaker sender while active coordinator is healthy
+        if (
+          mc.activeCoordId &&
+          senderId !== mc.activeCoordId &&
+          remoteEpoch === mc.lastAcceptedEpoch &&
+          now - mc.lastCoordMsgAt < 3500
+        ) {
+          return;
+        }
+
+        mc.activeCoordId = senderId;
+        mc.coordEpoch = remoteEpoch;
+        mc.lastAcceptedEpoch = remoteEpoch;
+        mc.lastAcceptedTick = remoteSnap.tick;
+        mc.lastCoordMsgAt = now;
+        mc.needsHydrateBeforeStep = true;
+
+        applyAuthoritativeSnapshot(remoteSnap, now);
+      } else if (data.type === 'mesh_handoff' && data.state && localEngineRef.current) {
+        const remoteEpoch = Number(data.epoch) || 1;
+        const remoteSnap = unpackSnapshot(data.state as ArenaSnapshot | PackedArenaSnapshot);
+        if (
+          remoteEpoch > mc.lastAcceptedEpoch ||
+          (remoteEpoch === mc.lastAcceptedEpoch && remoteSnap.tick > mc.lastAcceptedTick)
+        ) {
+          mc.lastAcceptedEpoch = remoteEpoch;
+          mc.lastAcceptedTick = remoteSnap.tick;
           snapshotRef.current = remoteSnap;
           lastSnapshotTimeRef.current = now;
-          processSnapshotEvents(remoteSnap);
-
-          // If we are currently playing and not yet spawned on the remote coordinator's board, request spawn
-          if (
-            myJoinInfoRef.current.playing &&
-            gameStateRef.current === 'PLAYING' &&
-            !remoteSnap.snakes.some((s) => s.id === myId && s.alive) &&
-            now - lastAutoJoinSentAtRef.current > 650
-          ) {
-            lastAutoJoinSentAtRef.current = now;
-            publishMeshPacket({
-              type: 'mesh_cmd',
-              senderId: myId,
-              senderOrder: myOrder,
-              cmd: {
-                type: 'join',
-                clientId: myId,
-                name: myJoinInfoRef.current.name,
-                colorId: myJoinInfoRef.current.colorId,
-                gridSize: serverGridSize,
-              },
-            });
+          mc.needsHydrateBeforeStep = true;
+        }
+        if (data.nextCoordId === myId) {
+          if (snapshotRef.current) {
+            localEngineRef.current.hydrateFromSnapshot(snapshotRef.current);
+            mc.needsHydrateBeforeStep = false;
           }
+          mc.isCoordinator = true;
+          mc.activeCoordId = myId;
+          mc.coordEpoch = mc.lastAcceptedEpoch + 1;
+          mc.lastCoordMsgAt = now;
+        } else {
+          mc.activeCoordId = typeof data.nextCoordId === 'string' ? data.nextCoordId : null;
+          mc.lastCoordMsgAt = now;
         }
       } else if (data.type === 'mesh_cmd' && data.cmd && localEngineRef.current) {
         const cmd = data.cmd as ClientToServerMessage & { clientId?: string };
+        if (cmd.type === 'admin_track') {
+          isAdminMusicActiveRef.current = true;
+          setIsAdminMusicActive(true);
+          playNextAdminTrackRef.current(cmd.trackId);
+          return;
+        }
+
+        // Only the authoritative coordinator mutates the simulation on incoming commands
+        if (!mc.isCoordinator) return;
+
         const targetId = cmd.clientId || senderId;
         const engine = localEngineRef.current;
 
@@ -557,15 +671,36 @@ export default function App() {
           engine.spawnPlayer(targetId, cmd.name, cmd.colorId);
         } else if (cmd.type === 'turn') {
           engine.queueTurn(targetId, cmd.dir);
-        } else if (cmd.type === 'admin_track') {
-          isAdminMusicActiveRef.current = true;
-          setIsAdminMusicActive(true);
-          playNextAdminTrackRef.current(cmd.trackId);
+        } else if (cmd.type === 'autopilot') {
+          engine.setAutopilot(targetId, Boolean(cmd.enabled));
         } else if (cmd.type === 'leave') {
           engine.removePlayer(targetId);
-          myJoinInfoRef.current = { ...myJoinInfoRef.current };
         }
       }
+    };
+
+    const sendCoordinatorHandoff = () => {
+      const mc = meshCoordRef.current;
+      if (!mc.isCoordinator || !localEngineRef.current) return;
+      const now = performance.now();
+      let nextCoordId: string | null = null;
+      for (const [pid, info] of activePeersRef.current.entries()) {
+        if (pid === playerIdRef.current) continue;
+        if (now - info.lastSeen > 5000) continue;
+        if (!nextCoordId || pid < nextCoordId) {
+          nextCoordId = pid;
+        }
+      }
+      if (nextCoordId) {
+        publishMeshPacket({
+          type: 'mesh_handoff',
+          senderId: playerIdRef.current,
+          nextCoordId,
+          epoch: mc.coordEpoch,
+          state: packSnapshot(snapshotRef.current || localEngineRef.current.getSnapshot()),
+        });
+      }
+      mc.isCoordinator = false;
     };
 
     const startGlobalMeshEngine = () => {
@@ -577,7 +712,7 @@ export default function App() {
 
       // 1. Local multi-tab BroadcastChannel
       try {
-        const bc = new BroadcastChannel(`gridslurp_${serverGridSize}x${serverGridSize}_arena_v2`);
+        const bc = new BroadcastChannel(`gridslurp_${serverGridSize}x${serverGridSize}_arena_v3`);
         broadcastChannelRef.current = bc;
         bc.onmessage = (ev) => {
           handleMeshPacket(ev.data);
@@ -587,92 +722,160 @@ export default function App() {
       }
 
       // 2. Global Cross-Device WSS Relay (MQTT over WebSockets - works on Vercel & worldwide browsers)
-      try {
-        const client = mqtt.connect(MQTT_BROKERS[0], {
-          clientId: `gridslurp_${playerIdRef.current}_${Math.random().toString(16).slice(2, 6)}`,
-          clean: true,
-          connectTimeout: 4000,
-          reconnectPeriod: 2000,
-        });
-        mqttRef.current = client;
+      const connectMqttBroker = (brokerIndex: number) => {
+        if (isUnmounted) return;
+        const brokerUrl = MQTT_BROKERS[brokerIndex] || MQTT_BROKERS[0];
+        let connectedOnce = false;
+        let brokerFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
-        client.on('connect', () => {
-          if (isUnmounted) return;
-          setConnectionMode('ws');
-          client.subscribe(meshTopic, { qos: 0 });
-          publishMeshPacket({
-            type: 'mesh_heartbeat',
-            senderId: playerIdRef.current,
-            senderOrder: peerOrderRef.current,
-            playing: myJoinInfoRef.current.playing,
-            name: myJoinInfoRef.current.name,
-            colorId: myJoinInfoRef.current.colorId,
+        try {
+          const client = mqtt.connect(brokerUrl, {
+            clientId: `gridslurp_${playerIdRef.current}_${Math.random().toString(16).slice(2, 6)}`,
+            clean: true,
+            keepalive: 20,
+            connectTimeout: 3500,
+            reconnectPeriod: 1500,
           });
-        });
+          mqttRef.current = client;
 
-        client.on('message', (_topic, payload) => {
-          try {
-            const parsed = JSON.parse(payload.toString());
-            handleMeshPacket(parsed);
-          } catch {
-            // ignore malformed packet
+          if (brokerIndex === 0 && MQTT_BROKERS.length > 1) {
+            brokerFallbackTimer = setTimeout(() => {
+              if (!connectedOnce && !isUnmounted) {
+                try {
+                  client.end(true);
+                } catch {
+                  // ignore
+                }
+                connectMqttBroker(1);
+              }
+            }, 3800);
           }
-        });
-      } catch {
-        // Fallback if WSS blocked
-      }
+
+          client.on('connect', () => {
+            connectedOnce = true;
+            if (brokerFallbackTimer) clearTimeout(brokerFallbackTimer);
+            if (isUnmounted) return;
+            setConnectionMode('ws');
+            client.subscribe(meshTopic, { qos: 0 });
+            publishMeshPacket({
+              type: 'mesh_heartbeat',
+              senderId: playerIdRef.current,
+              playing: myJoinInfoRef.current.playing,
+              name: myJoinInfoRef.current.name,
+              colorId: myJoinInfoRef.current.colorId,
+            });
+          });
+
+          client.on('message', (_topic, payload) => {
+            try {
+              const parsed = JSON.parse(payload.toString());
+              handleMeshPacket(parsed);
+            } catch {
+              // ignore malformed packet
+            }
+          });
+        } catch {
+          // Fallback if WSS blocked
+        }
+      };
+
+      connectMqttBroker(0);
 
       const initialSnap = engine.getSnapshot();
       snapshotRef.current = initialSnap;
       lastSnapshotTimeRef.current = performance.now();
       processSnapshotEvents(initialSnap);
 
-      // Periodic peer heartbeat & stale player cleanup
+      // Lightweight periodic peer heartbeat & stale player cleanup
       heartbeatInterval = setInterval(() => {
         const now = performance.now();
-        publishMeshPacket({
-          type: 'mesh_heartbeat',
-          senderId: playerIdRef.current,
-          senderOrder: peerOrderRef.current,
-          playing: myJoinInfoRef.current.playing,
-          name: myJoinInfoRef.current.name,
-          colorId: myJoinInfoRef.current.colorId,
-        });
+        // Coordinator already proves liveness every tick via mesh_state when active
+        if (!meshCoordRef.current.isCoordinator || activePeersRef.current.size === 0) {
+          publishMeshPacket({
+            type: 'mesh_heartbeat',
+            senderId: playerIdRef.current,
+            playing: myJoinInfoRef.current.playing,
+            name: myJoinInfoRef.current.name,
+            colorId: myJoinInfoRef.current.colorId,
+          });
+        }
 
         // Clean up disconnected remote human players after 6.5s of silence
         for (const [pid, info] of activePeersRef.current.entries()) {
           if (now - info.lastSeen > 6500) {
             activePeersRef.current.delete(pid);
-            localEngineRef.current?.removePlayer(pid);
+            if (meshCoordRef.current.isCoordinator) {
+              localEngineRef.current?.removePlayer(pid);
+            }
           }
         }
-      }, 950);
+      }, 1500);
 
-      // Authoritative Room Coordinator step loop
-      localInterval = setInterval(() => {
+      // Drift-compensated Authoritative Room Coordinator step loop
+      let nextTickAt = performance.now() + TICK_MS;
+      const runMeshTick = () => {
+        if (isUnmounted) return;
         const now = performance.now();
-        if (!isSelfCoordinator(now)) {
-          return;
+        const mc = meshCoordRef.current;
+
+        if (canBecomeCoordinator(now)) {
+          if (!mc.isCoordinator) {
+            mc.isCoordinator = true;
+            mc.activeCoordId = playerIdRef.current;
+            mc.coordEpoch = Math.max(1, mc.lastAcceptedEpoch + 1);
+            if (mc.needsHydrateBeforeStep && snapshotRef.current) {
+              engine.hydrateFromSnapshot(snapshotRef.current);
+              mc.needsHydrateBeforeStep = false;
+            }
+            // If local user joined during discovery window before promotion, ensure they spawn now
+            if (
+              myJoinInfoRef.current.playing &&
+              gameStateRef.current === 'PLAYING' &&
+              !engine.snakes.get(playerIdRef.current)?.alive
+            ) {
+              engine.spawnPlayer(
+                playerIdRef.current,
+                myJoinInfoRef.current.name,
+                myJoinInfoRef.current.colorId
+              );
+            }
+          }
+
+          const snap = engine.step();
+          const activeHumans =
+            1 +
+            Array.from(activePeersRef.current.values()).filter((p) => now - p.lastSeen < 6500)
+              .length;
+          snap.onlinePlayers = Math.max(snap.onlinePlayers, activeHumans);
+
+          mc.lastAcceptedEpoch = mc.coordEpoch;
+          mc.lastAcceptedTick = snap.tick;
+          mc.lastCoordMsgAt = now;
+
+          snapshotRef.current = snap;
+          lastSnapshotTimeRef.current = now;
+          processSnapshotEvents(snap);
+
+          publishMeshPacket({
+            type: 'mesh_state',
+            senderId: playerIdRef.current,
+            epoch: mc.coordEpoch,
+            state: packSnapshot(snap),
+          });
         }
-        const snap = engine.step();
-        const activeHumans =
-          1 +
-          Array.from(activePeersRef.current.values()).filter((p) => now - p.lastSeen < 6500)
-            .length;
-        snap.onlinePlayers = Math.max(snap.onlinePlayers, activeHumans);
 
-        snapshotRef.current = snap;
-        lastSnapshotTimeRef.current = now;
-        processSnapshotEvents(snap);
-
-        publishMeshPacket({
-          type: 'mesh_state',
-          senderId: playerIdRef.current,
-          senderOrder: peerOrderRef.current,
-          state: snap,
-        });
-      }, TICK_MS);
+        nextTickAt += TICK_MS;
+        if (nextTickAt < now - TICK_MS) {
+          nextTickAt = now + TICK_MS;
+        }
+        tickTimeout = setTimeout(runMeshTick, Math.max(1, nextTickAt - performance.now()));
+      };
+      tickTimeout = setTimeout(runMeshTick, TICK_MS);
     };
+
+    window.addEventListener('pagehide', sendCoordinatorHandoff);
+
+    let activeTickSeenOnWs = -1;
 
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -689,7 +892,7 @@ export default function App() {
           }
           startGlobalMeshEngine();
         }
-      }, 950);
+      }, 2000);
 
       ws.onopen = () => {
         if (fallbackTimer) clearTimeout(fallbackTimer);
@@ -702,13 +905,18 @@ export default function App() {
           const msg = JSON.parse(event.data) as ServerToClientMessage;
           if (msg.type === 'welcome') {
             playerIdRef.current = msg.playerId;
-            snapshotRef.current = msg.state;
+            const unpacked = unpackSnapshot(msg.state);
+            activeTickSeenOnWs = unpacked.tick;
+            snapshotRef.current = unpacked;
             lastSnapshotTimeRef.current = performance.now();
-            processSnapshotEvents(msg.state);
+            processSnapshotEvents(unpacked);
           } else if (msg.type === 'state') {
-            snapshotRef.current = msg.state;
+            const unpacked = unpackSnapshot(msg.state);
+            if (unpacked.tick < activeTickSeenOnWs) return;
+            activeTickSeenOnWs = unpacked.tick;
+            snapshotRef.current = unpacked;
             lastSnapshotTimeRef.current = performance.now();
-            processSnapshotEvents(msg.state);
+            processSnapshotEvents(unpacked);
           } else if (msg.type === 'admin_track') {
             isAdminMusicActiveRef.current = true;
             setIsAdminMusicActive(true);
@@ -732,8 +940,10 @@ export default function App() {
 
     return () => {
       isUnmounted = true;
+      window.removeEventListener('pagehide', sendCoordinatorHandoff);
+      sendCoordinatorHandoff();
       if (fallbackTimer) clearTimeout(fallbackTimer);
-      if (localInterval) clearInterval(localInterval);
+      if (tickTimeout) clearTimeout(tickTimeout);
       if (heartbeatInterval) clearInterval(heartbeatInterval);
       if (wsRef.current) {
         try {
@@ -778,14 +988,18 @@ export default function App() {
         return;
       }
 
-      // Global Mesh / Vercel Multiplayer command dispatch
+      // Global Mesh / Vercel Multiplayer command dispatch:
+      // Only mutate localEngineRef directly when WE are the coordinator (or no coordinator is active yet)
       const engine = localEngineRef.current;
-      if (engine) {
+      const mc = meshCoordRef.current;
+      if (engine && (mc.isCoordinator || !mc.activeCoordId)) {
         if (msg.type === 'join' || msg.type === 'respawn') {
           engine.spawnPlayer(pid, msg.name, msg.colorId);
           snapshotRef.current = engine.getSnapshot();
         } else if (msg.type === 'turn') {
           engine.queueTurn(pid, msg.dir);
+        } else if (msg.type === 'autopilot') {
+          engine.setAutopilot(pid, Boolean(msg.enabled));
         } else if (msg.type === 'leave') {
           engine.removePlayer(pid);
         }
@@ -794,7 +1008,6 @@ export default function App() {
       const packet = {
         type: 'mesh_cmd',
         senderId: pid,
-        senderOrder: peerOrderRef.current,
         cmd: { ...msg, clientId: pid },
       };
 
@@ -922,6 +1135,9 @@ export default function App() {
       const audio = audioRef.current;
       if (!audio) return;
 
+      isAdminMusicActiveRef.current = false;
+      setIsAdminMusicActive(false);
+
       const activePl =
         playlistStore.playlists.find((p) => p.id === playlistStore.activePlaylistId) ||
         playlistStore.playlists[0];
@@ -991,71 +1207,6 @@ export default function App() {
     [createShuffledOrder, playlistStore, currentTrackId, muted]
   );
 
-  // Automatically start playing from src/audio/admin/ whenever a player named ADMIN is in the server,
-  // and stop 10 seconds after the ADMIN leaves the server (returning to default music).
-  useEffect(() => {
-    if (adminInServer) {
-      // Cancel any pending 10-second leave timer if ADMIN is back in the server
-      if (adminLeaveTimerRef.current) {
-        clearTimeout(adminLeaveTimerRef.current);
-        adminLeaveTimerRef.current = null;
-      }
-      if (adminLeaveCountdownRef.current) {
-        clearInterval(adminLeaveCountdownRef.current);
-        adminLeaveCountdownRef.current = null;
-      }
-      setAdminLeaveSecondsLeft(null);
-
-      if (!isAdminMusicActiveRef.current) {
-        isAdminMusicActiveRef.current = true;
-        setIsAdminMusicActive(true);
-        playNextAdminTrack();
-      } else if (audioRef.current && audioRef.current.paused && playlistStore.musicEnabled) {
-        playNextAdminTrack();
-      }
-    } else if (isAdminMusicActiveRef.current && !adminLeaveTimerRef.current) {
-      // ADMIN just left the server: keep playing admin music for 10 seconds, then stop and return to default music
-      const leaveDeadline = performance.now() + 10000;
-      setAdminLeaveSecondsLeft(10);
-
-      adminLeaveCountdownRef.current = setInterval(() => {
-        const rem = Math.max(0, Math.ceil((leaveDeadline - performance.now()) / 1000));
-        setAdminLeaveSecondsLeft(rem);
-      }, 250);
-
-      adminLeaveTimerRef.current = setTimeout(() => {
-        adminLeaveTimerRef.current = null;
-        if (adminLeaveCountdownRef.current) {
-          clearInterval(adminLeaveCountdownRef.current);
-          adminLeaveCountdownRef.current = null;
-        }
-        setAdminLeaveSecondsLeft(null);
-        isAdminMusicActiveRef.current = false;
-        setIsAdminMusicActive(false);
-
-        const audio = audioRef.current;
-        if (audio) {
-          audio.pause();
-        }
-        // Return to default music if it was manually enabled/started, otherwise stay stopped
-        if (manualDefaultMusicPlayingRef.current && playlistStore.musicEnabled) {
-          playNextPlaylistTrack();
-        } else {
-          setIsMusicPlaying(false);
-          setCurrentTrackId(null);
-        }
-      }, 10000);
-    }
-  }, [adminInServer, playNextAdminTrack, playNextPlaylistTrack, playlistStore.musicEnabled]);
-
-  // Cleanup admin leave timers on unmount
-  useEffect(() => {
-    return () => {
-      if (adminLeaveTimerRef.current) clearTimeout(adminLeaveTimerRef.current);
-      if (adminLeaveCountdownRef.current) clearInterval(adminLeaveCountdownRef.current);
-    };
-  }, []);
-
   // Sync volume & mute state to the HTML5 Audio element
   useEffect(() => {
     const audio = audioRef.current;
@@ -1067,9 +1218,12 @@ export default function App() {
     }
   }, [muted, playlistStore.volume, playlistStore.musicEnabled]);
 
+  const lastSentAutoPilotRef = useRef<boolean>(false);
+
   const handleStartOrRespawn = useCallback(() => {
     const cleanName = playerName.trim().toUpperCase().slice(0, 14) || 'VIPER_01';
     lastAutoJoinSentAtRef.current = performance.now();
+    lastSentAutoPilotRef.current = false;
     sendCommand({
       type: 'join',
       name: cleanName,
@@ -1079,17 +1233,6 @@ export default function App() {
     });
     setIsSpectating(false);
     setGameState('PLAYING');
-
-    // Nothing starts playing automatically except for the admin music when a player named ADMIN is in the server!
-    if (cleanName === 'ADMIN') {
-      setAdminInServer(true);
-    } else if (isAdminMusicActiveRef.current && audioRef.current && audioRef.current.paused) {
-      // If another player named ADMIN is already in the server, resume admin music on user gesture
-      audioRef.current
-        .play()
-        .then(() => setIsMusicPlaying(true))
-        .catch(() => {});
-    }
   }, [playerName, selectedColorId, serverGridSize, sendCommand]);
 
   const handleToggleMute = useCallback(() => {
@@ -1145,6 +1288,28 @@ export default function App() {
     [gameState, sendCommand]
   );
 
+  const handleToggleAdminAutoPilot = useCallback(() => {
+    setAdminAutoPilot((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('gridslurp_admin_autopilot', String(next));
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  }, []);
+
+  // Automatically enable AI Autopilot whenever an Admin opens the Admin Menu while playing
+  useEffect(() => {
+    const shouldEnable =
+      gameState === 'PLAYING' && isAdminName && showAdminModal && adminAutoPilot;
+    if (shouldEnable !== lastSentAutoPilotRef.current) {
+      lastSentAutoPilotRef.current = shouldEnable;
+      sendCommand({ type: 'autopilot', enabled: shouldEnable });
+    }
+  }, [adminAutoPilot, gameState, isAdminName, sendCommand, showAdminModal]);
+
   // Strict WASD & Arrow Keys directional input listener
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -1186,9 +1351,15 @@ export default function App() {
 
       if (e.key === 'Escape') {
         e.preventDefault();
+        if (showAdminModal) {
+          setShowAdminModal(false);
+          return;
+        }
         setGameState((prev) => (prev === 'PLAYING' ? 'PAUSED' : 'PLAYING'));
         return;
       }
+
+      if (showAdminModal) return;
 
       if (gameState !== 'PLAYING') return;
 
@@ -1224,7 +1395,7 @@ export default function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [gameState, handleStartOrRespawn, handleToggleMute, handleToggleZoom, sendCommand]);
+  }, [gameState, handleStartOrRespawn, handleToggleMute, handleToggleZoom, sendCommand, showAdminModal]);
 
   // 60FPS Hardware-Accelerated Pixel Matrix Canvas Loop
   useEffect(() => {
@@ -2561,6 +2732,38 @@ export default function App() {
 
               {/* Modal Body */}
               <div className="p-6 overflow-y-auto space-y-5 text-xs">
+                {/* Admin Menu AI Autopilot Toggle (On by Default) */}
+                <div className="p-4 rounded-lg bg-[#080B10] border border-emerald-500/40 flex flex-wrap items-center justify-between gap-3">
+                  <div className="space-y-1 max-w-md">
+                    <div className="flex items-center gap-2">
+                      <span className="font-display font-semibold text-emerald-300 tracking-wide">
+                        ADMIN MENU AI AUTOPILOT
+                      </span>
+                      {gameState === 'PLAYING' && isAdminName && adminAutoPilot && (
+                        <span className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/60 text-emerald-300 font-mono-tabular text-[10px] font-bold animate-pulse">
+                          STEERING ACTIVE
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-slate-400 leading-relaxed text-[11px]">
+                      When enabled, an AI automatically steers your snake safely away from outer
+                      walls and rival trails while you have the Admin Menu open.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleToggleAdminAutoPilot}
+                    className={`px-3.5 py-2 rounded-lg border font-mono-tabular font-semibold text-xs transition-colors cursor-pointer shrink-0 ${
+                      adminAutoPilot
+                        ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300 hover:bg-emerald-500/30'
+                        : 'bg-[#0D131F] border-slate-700 text-slate-400 hover:border-slate-500'
+                    }`}
+                  >
+                    {adminAutoPilot ? 'AI AUTOPILOT: ON' : 'AI AUTOPILOT: OFF'}
+                  </button>
+                </div>
+
                 {/* Folder Info Banners (Default Folder vs Extra Admin Folder) */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div className="p-3.5 rounded-lg bg-[#080B10] border border-slate-800 space-y-1">
@@ -2580,16 +2783,14 @@ export default function App() {
                   <div className="p-3.5 rounded-lg bg-[#080B10] border border-amber-500/40 space-y-1">
                     <div className="flex items-center justify-between">
                       <span className="font-semibold text-amber-300">
-                        Admin Auto-Play (<code className="text-amber-200">src/audio/admin/</code>)
+                        Admin Folder (<code className="text-amber-200">src/audio/admin/</code>)
                       </span>
                       <span className="px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 font-mono-tabular text-[11px] font-semibold">
                         {ADMIN_AUDIO_TRACKS.length} ADMIN TRACKS
                       </span>
                     </div>
                     <p className="text-slate-400 leading-relaxed text-[11px]">
-                      Hidden from default playlists. Auto-plays whenever a player named{' '}
-                      <strong className="text-white">ADMIN</strong> is in the server, and stops 10s
-                      after they leave.
+                      Hidden from default playlists. Does not auto-play on join—select any song below whenever you want to play it.
                     </p>
                   </div>
                 </div>
@@ -2600,11 +2801,7 @@ export default function App() {
                     <div className="space-y-0.5">
                       <div className="text-[11px] font-mono-tabular text-slate-400">
                         {isAdminMusicActive
-                          ? `ADMIN PRESENCE MUSIC ACTIVE${
-                              adminLeaveSecondsLeft !== null
-                                ? ` (STOPPING IN ${adminLeaveSecondsLeft}s)`
-                                : ' (ADMIN IN SERVER)'
-                            }`
+                          ? 'ADMIN FOLDER MUSIC ACTIVE'
                           : `DEFAULT PLAYLIST (${playlistStore.shuffle ? 'SHUFFLED' : 'IN ORDER'})`}
                       </div>
                       <div className="text-sm font-mono-tabular font-semibold text-amber-300">
@@ -2612,7 +2809,7 @@ export default function App() {
                           ? DISCOVERED_AUDIO_TRACKS.find((t) => t.id === currentTrackId)?.title ||
                             ADMIN_AUDIO_TRACKS.find((t) => t.id === currentTrackId)?.title ||
                             currentTrackId
-                          : 'Stopped (Only Admin Music Starts Automatically)'}
+                          : 'Stopped (Manual Play Only)'}
                       </div>
                     </div>
 
@@ -2624,10 +2821,8 @@ export default function App() {
                           if (!audio) return;
                           if (isMusicPlaying && !audio.paused) {
                             audio.pause();
-                            manualDefaultMusicPlayingRef.current = false;
                             setIsMusicPlaying(false);
                           } else {
-                            manualDefaultMusicPlayingRef.current = true;
                             if (isAdminMusicActiveRef.current) {
                               playNextAdminTrack();
                             } else {
@@ -2642,7 +2837,6 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => {
-                          manualDefaultMusicPlayingRef.current = true;
                           if (isAdminMusicActiveRef.current) {
                             playNextAdminTrack();
                           } else {

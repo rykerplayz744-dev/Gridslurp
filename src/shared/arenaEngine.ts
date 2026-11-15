@@ -275,6 +275,15 @@ export class ArenaEngine {
     this.snakes.delete(id);
   }
 
+  public setAutopilot(id: string, enabled: boolean) {
+    const snake = this.snakes.get(id);
+    if (!snake || !snake.alive) return;
+    snake.autoPilot = enabled;
+    if (enabled) {
+      snake.nextDirs = [];
+    }
+  }
+
   public queueTurn(id: string, requestedDir: Direction) {
     const snake = this.snakes.get(id);
     if (!snake || !snake.alive) return;
@@ -452,6 +461,117 @@ export class ArenaEngine {
     return bestDir;
   }
 
+  /**
+   * Smart survival AI for Admin Menu Autopilot: strictly avoids outer walls, rival trails,
+   * dead-end pockets, and rival head collisions while cruising safely for pellets.
+   */
+  private computeAutopilotDirection(snake: SnakeEntity): Direction {
+    const head = snake.segments[0];
+    const allDirs: Direction[] = ['UP', 'DOWN', 'LEFT', 'RIGHT'];
+    const validDirs = allDirs.filter((d) => !isOppositeDirection(d, snake.dir));
+
+    // Exact hazard lookup of unshielded rival snake segments & predicted head danger zones
+    const rivalCells = new Set<number>();
+    const rivalHeadDanger = new Set<number>();
+    const isSelfShielded = snake.shieldTicks > 0;
+
+    if (!isSelfShielded) {
+      for (const other of this.snakes.values()) {
+        if (!other.alive || other.id === snake.id || other.shieldTicks > 0) continue;
+        const segs = other.segments;
+        for (let i = 0; i < segs.length; i++) {
+          rivalCells.add((segs[i].x << 8) | segs[i].y);
+        }
+        // Mark the cell directly in front of a rival head as risky
+        if (segs[0]) {
+          const rivalNext = stepPoint(segs[0], other.dir);
+          if (isInsideGrid(rivalNext, this.gridSize)) {
+            rivalHeadDanger.add((rivalNext.x << 8) | rivalNext.y);
+          }
+        }
+      }
+    }
+
+    // Closest safe pellet within 10 tiles for gentle cruising attraction
+    let nearestPellet: Point | null = null;
+    let minPelletDist = 11;
+    for (let i = 0; i < this.pellets.length; i++) {
+      const p = this.pellets[i];
+      if (rivalCells.has((p.x << 8) | p.y)) continue;
+      const dist = Math.abs(p.x - head.x) + Math.abs(p.y - head.y);
+      if (dist < minPelletDist) {
+        minPelletDist = dist;
+        nearestPellet = p;
+      }
+    }
+
+    let bestDir = validDirs[0] || snake.dir;
+    let bestScore = -9999999;
+
+    for (const dir of validDirs) {
+      const nextPt = stepPoint(head, dir);
+      if (!isInsideGrid(nextPt, this.gridSize)) {
+        continue; // Never walk off the outer wall
+      }
+
+      const key = (nextPt.x << 8) | nextPt.y;
+      let score = 0;
+
+      if (rivalCells.has(key)) {
+        score -= 50000;
+      } else if (rivalHeadDanger.has(key)) {
+        score -= 450;
+      }
+
+      // 2-step lookahead so autopilot never boxes itself into a dead-end corner
+      let safeExits = 0;
+      for (const d2 of allDirs) {
+        if (isOppositeDirection(d2, dir)) continue;
+        const step2 = stepPoint(nextPt, d2);
+        if (!isInsideGrid(step2, this.gridSize)) continue;
+        if (!rivalCells.has((step2.x << 8) | step2.y)) {
+          safeExits++;
+        }
+      }
+      if (safeExits === 0) score -= 5000;
+      else if (safeExits === 1) score -= 140;
+      else score += safeExits * 25;
+
+      // Strong outer-wall cushion so it smoothly turns inward well before the edge
+      const wallDist = Math.min(
+        nextPt.x,
+        this.gridSize - 1 - nextPt.x,
+        nextPt.y,
+        this.gridSize - 1 - nextPt.y
+      );
+      if (wallDist === 0) score -= 350;
+      else if (wallDist === 1) score -= 90;
+      else if (wallDist >= 3) score += 45;
+
+      // Safe pellet cruising bonus
+      if (nearestPellet) {
+        const currDist = Math.abs(nearestPellet.x - head.x) + Math.abs(nearestPellet.y - head.y);
+        const nextDist =
+          Math.abs(nearestPellet.x - nextPt.x) + Math.abs(nearestPellet.y - nextPt.y);
+        if (nextDist < currDist) score += 28;
+      }
+
+      // Slight momentum preference so movement feels smooth rather than jittering
+      if (dir === snake.dir) {
+        score += 14;
+      }
+
+      score += (Math.random() - 0.5) * 4;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestDir = dir;
+      }
+    }
+
+    return bestDir;
+  }
+
   public step(): ArenaSnapshot {
     this.tick++;
 
@@ -500,6 +620,11 @@ export class ArenaEngine {
         if (!isOppositeDirection(chosen, snake.dir)) {
           snake.dir = chosen;
         }
+      } else if (snake.autoPilot) {
+        const chosen = this.computeAutopilotDirection(snake);
+        if (!isOppositeDirection(chosen, snake.dir)) {
+          snake.dir = chosen;
+        }
       } else if (snake.nextDirs.length > 0) {
         const nextDir = snake.nextDirs.shift()!;
         snake.dir = nextDir;
@@ -509,22 +634,38 @@ export class ArenaEngine {
       nextHeads.set(snake.id, nextHead);
     }
 
-    // 4. Advance snake segments provisionally & check pellet slurping
+    // 4. Advance snake segments provisionally & check pellet slurping in O(1) per snake via spatial cell map
     const pendingGrowth = new Map<string, number>();
 
-    for (const snake of aliveSnakes) {
-      const nextHead = nextHeads.get(snake.id)!;
-      let growAmount = 0;
+    if (this.pellets.length > 0) {
+      const pelletAtCell = new Map<number, BigPellet>();
+      for (let i = 0; i < this.pellets.length; i++) {
+        const p = this.pellets[i];
+        pelletAtCell.set((p.x << 8) | p.y, p);
+      }
 
-      // Check if snake head steps onto or within 1-tile slurp radius of any Big Flashing Pellet!
-      if (this.pellets.length > 0) {
-        const remainingPellets: BigPellet[] = [];
-        for (let i = 0; i < this.pellets.length; i++) {
-          const pellet = this.pellets[i];
-          const dx = Math.abs(pellet.x - nextHead.x);
-          const dy = Math.abs(pellet.y - nextHead.y);
-          // Direct hit or tight magnetic slurp (Manhattan distance <= 1)
-          if (dx + dy <= 1) {
+      const eatenPellets = new Set<BigPellet>();
+      const slurpOffsets = [
+        [0, 0],
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ];
+
+      for (const snake of aliveSnakes) {
+        const nextHead = nextHeads.get(snake.id)!;
+        let growAmount = 0;
+
+        for (let o = 0; o < 5; o++) {
+          const px = nextHead.x + slurpOffsets[o][0];
+          const py = nextHead.y + slurpOffsets[o][1];
+          if (px < 0 || px >= this.gridSize || py < 0 || py >= this.gridSize) continue;
+          const pellet = pelletAtCell.get((px << 8) | py);
+          if (pellet && !eatenPellets.has(pellet)) {
+            eatenPellets.add(pellet);
+            pelletAtCell.delete((px << 8) | py);
+
             snake.score += pellet.value;
             snake.pelletsSlurped += 1;
             growAmount += pellet.growth;
@@ -541,16 +682,21 @@ export class ArenaEngine {
               color: pellet.color,
               value: pellet.value,
             });
-          } else {
-            remainingPellets.push(pellet);
           }
         }
-        this.pellets = remainingPellets;
+        pendingGrowth.set(snake.id, growAmount);
       }
-      pendingGrowth.set(snake.id, growAmount);
+
+      if (eatenPellets.size > 0) {
+        this.pellets = this.pellets.filter((p) => !eatenPellets.has(p));
+      }
+    } else {
+      for (const snake of aliveSnakes) {
+        pendingGrowth.set(snake.id, 0);
+      }
     }
 
-    // Move segments forward in-place without cloning the entire array unnecessarily
+    // Move segments forward
     for (const snake of aliveSnakes) {
       const nextHead = nextHeads.get(snake.id)!;
       const grow = pendingGrowth.get(snake.id) || 0;
@@ -566,7 +712,7 @@ export class ArenaEngine {
       }
     }
 
-    // 5. Evaluate unforgiving collisions:
+    // 5. Evaluate unforgiving collisions in O(totalSegments) using spatial lookup maps:
     // - Out of bounds (off the grid)
     // - Running into another snake's body (Snake.io cut-off!)
     // - Head-to-head collision
@@ -577,6 +723,28 @@ export class ArenaEngine {
         killer?: SnakeEntity;
       }
     >();
+
+    // Build spatial occupancy maps once for all unshielded snakes
+    const bodyOwners = new Map<number, SnakeEntity | SnakeEntity[]>();
+    const unshieldedSnakes: SnakeEntity[] = [];
+
+    for (const other of aliveSnakes) {
+      if (other.shieldTicks > 0) continue;
+      unshieldedSnakes.push(other);
+      const otherSegs = other.segments;
+      for (let i = 1, len = otherSegs.length; i < len; i++) {
+        const seg = otherSegs[i];
+        const key = (seg.x << 8) | seg.y;
+        const existing = bodyOwners.get(key);
+        if (!existing) {
+          bodyOwners.set(key, other);
+        } else if (Array.isArray(existing)) {
+          if (!existing.includes(other)) existing.push(other);
+        } else if (existing !== other) {
+          bodyOwners.set(key, [existing, other]);
+        }
+      }
+    }
 
     for (const snake of aliveSnakes) {
       const head = snake.segments[0];
@@ -594,16 +762,15 @@ export class ArenaEngine {
         continue;
       }
 
-      for (const other of aliveSnakes) {
-        if (other.id === snake.id) continue;
-        // If the other snake is still within its fail-safe spawn timer, it is phased/non-lethal
-        if (other.shieldTicks > 0) continue;
+      const myPrevHead = snake.prevSegments[0] || head;
 
+      // Check head-to-head collisions with other unshielded snakes (small set of heads)
+      for (let u = 0; u < unshieldedSnakes.length; u++) {
+        const other = unshieldedSnakes[u];
+        if (other.id === snake.id) continue;
         const otherHead = other.segments[0];
         const otherPrevHead = other.prevSegments[0] || otherHead;
-        const myPrevHead = snake.prevSegments[0] || head;
 
-        // Did we collide head-to-head on the exact same cell, or swap heads?
         const sameHeadCell = head.x === otherHead.x && head.y === otherHead.y;
         const swappedHeads =
           head.x === otherPrevHead.x &&
@@ -615,16 +782,24 @@ export class ArenaEngine {
           if (snake.segments.length <= other.segments.length) {
             doomed.set(snake.id, { reason: 'HEAD_COLLISION', killer: other });
           }
-          continue;
+          break;
         }
+      }
 
-        // Did snake's head run into any body segment (index >= 1) of `other`?
-        const otherSegs = other.segments;
-        for (let i = 1, len = otherSegs.length; i < len; i++) {
-          if (otherSegs[i].x === head.x && otherSegs[i].y === head.y) {
-            doomed.set(snake.id, { reason: 'KILLED_BY_SNAKE', killer: other });
-            break;
+      if (doomed.has(snake.id)) continue;
+
+      // O(1) body trail collision check
+      const hitOwner = bodyOwners.get((head.x << 8) | head.y);
+      if (hitOwner) {
+        if (Array.isArray(hitOwner)) {
+          for (let h = 0; h < hitOwner.length; h++) {
+            if (hitOwner[h].id !== snake.id) {
+              doomed.set(snake.id, { reason: 'KILLED_BY_SNAKE', killer: hitOwner[h] });
+              break;
+            }
           }
+        } else if (hitOwner.id !== snake.id) {
+          doomed.set(snake.id, { reason: 'KILLED_BY_SNAKE', killer: hitOwner });
         }
       }
     }
@@ -691,14 +866,14 @@ export class ArenaEngine {
       }
     }
 
-    // 7. Age pellets and prune old events
+    // 7. Age pellets and prune old events (short window minimizes repeated payload bytes)
     this.pellets = this.pellets.filter((p) => {
       p.ttlTicks--;
       return p.ttlTicks > 0;
     });
 
-    this.recentKills = this.recentKills.filter((k) => this.tick - k.tick <= 45);
-    this.recentSlurps = this.recentSlurps.filter((s) => this.tick - s.tick <= 8);
+    this.recentKills = this.recentKills.filter((k) => this.tick - k.tick <= 18);
+    this.recentSlurps = this.recentSlurps.filter((s) => this.tick - s.tick <= 4);
 
     return this.getSnapshot();
   }

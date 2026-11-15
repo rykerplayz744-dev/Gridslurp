@@ -11,6 +11,7 @@ import {
   ServerToClientMessage,
   TICK_MS,
 } from './src/shared/gameTypes';
+import { packSnapshot } from './src/shared/wireProtocol';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,7 +21,17 @@ async function startServer() {
   app.use(express.json());
 
   const httpServer = createServer(app);
-  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+  // Disable TCP Nagle buffering so directional turns and tick updates flush immediately
+  httpServer.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+
+  // Disable perMessageDeflate so multi-player tick broadcasts don't stall on zlib CPU compression
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: '/ws',
+    perMessageDeflate: false,
+  });
 
   // Maintain both the 32x32 Server (2 AI snakes) and the 64x64 Server (4 AI snakes) simultaneously
   const arenas = new Map<ServerGridSize, ArenaEngine>([
@@ -28,7 +39,19 @@ async function startServer() {
     [64, new ArenaEngine(4, 64)],
   ]);
 
-  const clientPlayers = new Map<WebSocket, { id: string; gridSize: ServerGridSize }>();
+  const clientPlayers = new Map<
+    WebSocket,
+    { id: string; gridSize: ServerGridSize; isAlive: boolean }
+  >();
+
+  const isPlayerIdOwnedElsewhere = (playerId: string, gridSize: ServerGridSize, skipWs: WebSocket) => {
+    for (const [sock, info] of clientPlayers.entries()) {
+      if (sock !== skipWs && info.id === playerId && info.gridSize === gridSize) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   app.get('/api/arena', (req, res) => {
     const requestedSize = Number(req.query.size) === 64 ? 64 : 32;
@@ -46,10 +69,12 @@ async function startServer() {
     res.json({ ok: true, snapshot: arena.getSnapshot() });
   });
 
-  wss.on('connection', (ws: WebSocket) => {
+  wss.on('connection', (ws: WebSocket, req) => {
+    req.socket?.setNoDelay(true);
+
     let assignedPlayerId = `plr_${Math.random().toString(36).slice(2, 9)}`;
     let activeGridSize: ServerGridSize = 32;
-    clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize });
+    clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize, isAlive: true });
 
     const sendMsg = (msg: ServerToClientMessage) => {
       if (ws.readyState === WebSocket.OPEN) {
@@ -57,11 +82,16 @@ async function startServer() {
       }
     };
 
-    // Send initial welcome + current 32x32 arena state immediately
+    ws.on('pong', () => {
+      const entry = clientPlayers.get(ws);
+      if (entry) entry.isAlive = true;
+    });
+
+    // Send initial welcome + packed 32x32 arena state immediately
     sendMsg({
       type: 'welcome',
       playerId: assignedPlayerId,
-      state: arenas.get(activeGridSize)!.getSnapshot(),
+      state: packSnapshot(arenas.get(activeGridSize)!.getSnapshot()),
     });
 
     ws.on('message', (raw) => {
@@ -70,47 +100,58 @@ async function startServer() {
         if (msg.type === 'select_server') {
           const newSize: ServerGridSize = msg.gridSize === 64 ? 64 : 32;
           if (newSize !== activeGridSize) {
-            arenas.get(activeGridSize)?.removePlayer(assignedPlayerId);
+            if (!isPlayerIdOwnedElsewhere(assignedPlayerId, activeGridSize, ws)) {
+              arenas.get(activeGridSize)?.removePlayer(assignedPlayerId);
+            }
             activeGridSize = newSize;
-            clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize });
+            clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize, isAlive: true });
           }
           sendMsg({
             type: 'state',
-            state: arenas.get(activeGridSize)!.getSnapshot(),
+            state: packSnapshot(arenas.get(activeGridSize)!.getSnapshot()),
           });
         } else if (msg.type === 'join') {
+          const prevId = assignedPlayerId;
           if (msg.clientId && msg.clientId.trim().length > 0) {
-            assignedPlayerId = msg.clientId;
+            assignedPlayerId = msg.clientId.trim().slice(0, 32);
           }
-          if (msg.gridSize === 64 || msg.gridSize === 32) {
-            if (msg.gridSize !== activeGridSize) {
-              arenas.get(activeGridSize)?.removePlayer(assignedPlayerId);
-              activeGridSize = msg.gridSize;
+          const nextSize: ServerGridSize =
+            msg.gridSize === 64 || msg.gridSize === 32 ? msg.gridSize : activeGridSize;
+
+          if (prevId !== assignedPlayerId || nextSize !== activeGridSize) {
+            if (!isPlayerIdOwnedElsewhere(prevId, activeGridSize, ws)) {
+              arenas.get(activeGridSize)?.removePlayer(prevId);
             }
           }
-          clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize });
+          activeGridSize = nextSize;
+          clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize, isAlive: true });
+
           const arena = arenas.get(activeGridSize)!;
           arena.spawnPlayer(assignedPlayerId, msg.name, msg.colorId);
           sendMsg({
             type: 'welcome',
             playerId: assignedPlayerId,
-            state: arena.getSnapshot(),
+            state: packSnapshot(arena.getSnapshot()),
           });
         } else if (msg.type === 'turn') {
           arenas.get(activeGridSize)!.queueTurn(assignedPlayerId, msg.dir);
+        } else if (msg.type === 'autopilot') {
+          arenas.get(activeGridSize)!.setAutopilot(assignedPlayerId, Boolean(msg.enabled));
         } else if (msg.type === 'respawn') {
           if (msg.gridSize === 64 || msg.gridSize === 32) {
             if (msg.gridSize !== activeGridSize) {
-              arenas.get(activeGridSize)?.removePlayer(assignedPlayerId);
+              if (!isPlayerIdOwnedElsewhere(assignedPlayerId, activeGridSize, ws)) {
+                arenas.get(activeGridSize)?.removePlayer(assignedPlayerId);
+              }
               activeGridSize = msg.gridSize;
-              clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize });
+              clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize, isAlive: true });
             }
           }
           const arena = arenas.get(activeGridSize)!;
           arena.spawnPlayer(assignedPlayerId, msg.name, msg.colorId);
           sendMsg({
             type: 'state',
-            state: arena.getSnapshot(),
+            state: packSnapshot(arena.getSnapshot()),
           });
         } else if (msg.type === 'admin_track') {
           const payload = JSON.stringify({
@@ -118,12 +159,18 @@ async function startServer() {
             trackId: msg.trackId,
           } satisfies ServerToClientMessage);
           for (const [client, info] of clientPlayers.entries()) {
-            if (client.readyState === WebSocket.OPEN && info.gridSize === activeGridSize) {
+            if (
+              client.readyState === WebSocket.OPEN &&
+              client.bufferedAmount < 65536 &&
+              info.gridSize === activeGridSize
+            ) {
               client.send(payload);
             }
           }
         } else if (msg.type === 'leave') {
-          arenas.get(activeGridSize)!.removePlayer(assignedPlayerId);
+          if (!isPlayerIdOwnedElsewhere(assignedPlayerId, activeGridSize, ws)) {
+            arenas.get(activeGridSize)!.removePlayer(assignedPlayerId);
+          }
         }
       } catch {
         // Ignore malformed packets
@@ -132,34 +179,81 @@ async function startServer() {
 
     ws.on('close', () => {
       const info = clientPlayers.get(ws);
-      if (info) {
+      clientPlayers.delete(ws);
+      if (info && !isPlayerIdOwnedElsewhere(info.id, info.gridSize, ws)) {
         arenas.get(info.gridSize)?.removePlayer(info.id);
-        clientPlayers.delete(ws);
       }
     });
   });
 
-  // Authoritative game loop stepping both the 32x32 Server and the 64x64 Server every TICK_MS
+  // Periodic keepalive ping to evict half-open dead sockets immediately
   setInterval(() => {
-    const snap32 = arenas.get(32)!.step();
-    const snap64 = arenas.get(64)!.step();
-
-    const payload32 = JSON.stringify({
-      type: 'state',
-      state: snap32,
-    } satisfies ServerToClientMessage);
-
-    const payload64 = JSON.stringify({
-      type: 'state',
-      state: snap64,
-    } satisfies ServerToClientMessage);
-
     for (const [client, info] of clientPlayers.entries()) {
+      if (!info.isAlive) {
+        clientPlayers.delete(client);
+        if (!isPlayerIdOwnedElsewhere(info.id, info.gridSize, client)) {
+          arenas.get(info.gridSize)?.removePlayer(info.id);
+        }
+        client.terminate();
+        continue;
+      }
+      info.isAlive = false;
       if (client.readyState === WebSocket.OPEN) {
-        client.send(info.gridSize === 64 ? payload64 : payload32);
+        client.ping();
       }
     }
-  }, TICK_MS);
+  }, 8000);
+
+  // Drift-compensated authoritative game loop (steps and packs ONLY arenas with active clients)
+  let nextTickAt = performance.now() + TICK_MS;
+  const runTickLoop = () => {
+    const now = performance.now();
+    let count32 = 0;
+    let count64 = 0;
+
+    for (const [client, info] of clientPlayers.entries()) {
+      if (client.readyState !== WebSocket.OPEN) continue;
+      if (info.gridSize === 64) count64++;
+      else count32++;
+    }
+
+    let payload32: string | null = null;
+    if (count32 > 0) {
+      const snap32 = arenas.get(32)!.step();
+      snap32.onlinePlayers = Math.max(snap32.onlinePlayers, count32);
+      payload32 = JSON.stringify({
+        type: 'state',
+        state: packSnapshot(snap32),
+      } satisfies ServerToClientMessage);
+    }
+
+    let payload64: string | null = null;
+    if (count64 > 0) {
+      const snap64 = arenas.get(64)!.step();
+      snap64.onlinePlayers = Math.max(snap64.onlinePlayers, count64);
+      payload64 = JSON.stringify({
+        type: 'state',
+        state: packSnapshot(snap64),
+      } satisfies ServerToClientMessage);
+    }
+
+    for (const [client, info] of clientPlayers.entries()) {
+      if (client.readyState !== WebSocket.OPEN) continue;
+      // Backpressure guard: avoid queueing seconds of stale frames on stalled sockets
+      if (client.bufferedAmount > 65536) continue;
+      const payload = info.gridSize === 64 ? payload64 : payload32;
+      if (payload) {
+        client.send(payload);
+      }
+    }
+
+    nextTickAt += TICK_MS;
+    if (nextTickAt < now - TICK_MS) {
+      nextTickAt = now + TICK_MS;
+    }
+    setTimeout(runTickLoop, Math.max(1, nextTickAt - performance.now()));
+  };
+  setTimeout(runTickLoop, TICK_MS);
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({

@@ -108,6 +108,7 @@ export interface SnakeEntity {
   isBot: boolean;
   spawnTick: number;
   shieldTicks: number;
+  autoPilot?: boolean;
   deathReason?: 'WALL_CRASH' | 'SELF_CRASH' | 'KILLED_BY_SNAKE' | 'HEAD_COLLISION';
   killedByName?: string;
   botStyle?: 'HUNTER' | 'SCAVENGER' | 'INTERCEPTOR' | 'FLANKER';
@@ -150,6 +151,82 @@ export interface ArenaSnapshot {
   onlinePlayers: number;
 }
 
+export interface PackedSnake {
+  i: string; // id
+  n: string; // name
+  c: number | string; // palette index (0..5) or color id
+  d: number; // dir index 0..3
+  s: number; // score
+  k: number; // kills
+  p: number; // pelletsSlurped
+  f: number; // bitmask: bit0=alive, bit1=isBot
+  sh: number; // shieldTicks
+  dr?: number; // deathReason index 0..3
+  kb?: string; // killedByName
+  px: number; // prevHead.x
+  py: number; // prevHead.y
+  g: string; // compact RLE/step-encoded segments string
+}
+
+export type PackedPellet = [
+  id: string,
+  x: number,
+  y: number,
+  value: number,
+  growth: number,
+  color: string,
+  ttlTicks: number,
+];
+
+export type PackedTelegraph = [
+  id: string,
+  x: number,
+  y: number,
+  dir: number,
+  color: number | string,
+  name: string,
+  ticksLeft: number,
+  isBot: number,
+];
+
+export type PackedKill = [
+  id: string,
+  tick: number,
+  victimId: string,
+  victimName: string,
+  killerId: string,
+  killerName: string,
+  reasonIdx: number,
+  x: number,
+  y: number,
+  pelletsDropped: number,
+  victimColor: string,
+];
+
+export type PackedSlurp = [
+  id: string,
+  tick: number,
+  snakeId: string,
+  fromX: number,
+  fromY: number,
+  toX: number,
+  toY: number,
+  color: string,
+  value: number,
+];
+
+export interface PackedArenaSnapshot {
+  v: 2;
+  t: number; // tick
+  gs: number; // gridSize
+  sn: PackedSnake[];
+  pl: PackedPellet[];
+  tl: PackedTelegraph[];
+  rk: PackedKill[];
+  rs: PackedSlurp[];
+  op: number; // onlinePlayers
+}
+
 export type ServerGridSize = 32 | 64;
 
 export type ClientToServerMessage =
@@ -157,10 +234,11 @@ export type ClientToServerMessage =
   | { type: 'turn'; dir: Direction }
   | { type: 'respawn'; name: string; colorId: string; gridSize?: ServerGridSize }
   | { type: 'select_server'; gridSize: ServerGridSize }
+  | { type: 'autopilot'; enabled: boolean }
   | { type: 'admin_track'; trackId: string }
   | { type: 'leave' };
 
 export type ServerToClientMessage =
-  | { type: 'welcome'; playerId: string; state: ArenaSnapshot }
-  | { type: 'state'; state: ArenaSnapshot }
+  | { type: 'welcome'; playerId: string; state: ArenaSnapshot | PackedArenaSnapshot }
+  | { type: 'state'; state: ArenaSnapshot | PackedArenaSnapshot }
   | { type: 'admin_track'; trackId: string };
