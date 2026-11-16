@@ -1,6 +1,11 @@
 import mqtt, { MqttClient } from 'mqtt';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ArenaEngine } from './shared/arenaEngine';
+import {
+  ArenaEngine,
+  isInsideGrid,
+  isOppositeDirection,
+  stepPoint,
+} from './shared/arenaEngine';
 import {
   ArenaSnapshot,
   ClientToServerMessage,
@@ -123,6 +128,12 @@ export default function App() {
   const normalizedPlayerName = playerName.trim().toUpperCase();
   const isSuperAdminRy = !adminKickedThisSession && normalizedPlayerName.startsWith('ADMINRY');
   const isAdminName = !adminKickedThisSession && normalizedPlayerName.startsWith('ADMIN');
+  const isAdminNameRef = useRef<boolean>(isAdminName);
+  const isSuperAdminRyRef = useRef<boolean>(isSuperAdminRy);
+  const playerNameRef = useRef<string>(playerName);
+  const selectedColorIdRef = useRef<string>(selectedColorId);
+  const lastAutoRespawnAtRef = useRef<number>(0);
+  const triggerAutoPilotRespawnRef = useRef<() => void>(() => {});
 
   // HUD state synced at tick rate (not 60fps) to keep React lightweight
   const [hudStats, setHudStats] = useState<{
@@ -237,6 +248,9 @@ export default function App() {
   const spectatedSnakeIdRef = useRef<string | null>(null);
   const zoomIn16Ref = useRef<boolean>(zoomIn16);
   const camRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const predictedTurnsRef = useRef<Array<{ dir: Direction; sentAt: number; baseTick: number }>>([]);
+  const lastHudReactSyncRef = useRef<number>(0);
+  const lastHudSigRef = useRef<string>('');
 
   useEffect(() => {
     gameStateRef.current = gameState;
@@ -366,12 +380,16 @@ export default function App() {
           }
 
           if (kill.victimId === myId && gameStateRef.current === 'PLAYING') {
-            gameStateRef.current = 'GAME_OVER';
-            myJoinInfoRef.current.playing = false;
             soundEngine.playPlayerDeath();
             shakeRef.current = 14;
             hitstopUntilRef.current = performance.now() + 65;
-            setGameState('GAME_OVER');
+            if (autoPilotActiveRef.current && isAdminNameRef.current) {
+              triggerAutoPilotRespawnRef.current();
+            } else {
+              gameStateRef.current = 'GAME_OVER';
+              myJoinInfoRef.current.playing = false;
+              setGameState('GAME_OVER');
+            }
           } else if (kill.killerId === myId && gameStateRef.current === 'PLAYING') {
             soundEngine.playRivalKill(true);
             shakeRef.current = 9;
@@ -451,6 +469,34 @@ export default function App() {
 
       const activeSize = snap.gridSize || GRID_SIZE;
       const nowMs = performance.now();
+
+      // Ensure AI autopilot auto-respawns seamlessly even if the kill event scrolled past
+      if (
+        me &&
+        !me.alive &&
+        gameStateRef.current === 'PLAYING' &&
+        autoPilotActiveRef.current &&
+        isAdminNameRef.current
+      ) {
+        triggerAutoPilotRespawnRef.current();
+      }
+
+      // Reconcile optimistic client turn queue with authoritative snapshot
+      if (!me || !me.alive || me.autoPilot) {
+        predictedTurnsRef.current = [];
+      } else if (predictedTurnsRef.current.length > 0) {
+        while (predictedTurnsRef.current.length > 0) {
+          const front = predictedTurnsRef.current[0];
+          const confirmedByDir = snap.tick > front.baseTick && front.dir === me.dir;
+          const staleTurn = snap.tick > front.baseTick + 2 || nowMs - front.sentAt > 450;
+          if (confirmedByDir || staleTurn) {
+            predictedTurnsRef.current.shift();
+          } else {
+            break;
+          }
+        }
+      }
+
       const humanMap = new Map<
         string,
         { id: string; name: string; color: string; alive: boolean; autoPilot: boolean }
@@ -482,38 +528,43 @@ export default function App() {
         return a.name.localeCompare(b.name);
       });
 
-      setHudStats((prev) => ({
-        score: me ? me.score : prev.score,
-        length: me ? me.segments.length : prev.length,
-        kills: me ? me.kills : prev.kills,
-        slurped: me ? me.pelletsSlurped : prev.slurped,
-        headX: me && me.segments[0] ? Math.max(0, Math.min(activeSize - 1, me.segments[0].x)) : prev.headX,
-        headY: me && me.segments[0] ? Math.max(0, Math.min(activeSize - 1, me.segments[0].y)) : prev.headY,
-        alive: me ? me.alive : false,
-        shieldTicks: me ? me.shieldTicks : 0,
-        deathReason: me?.deathReason || prev.deathReason,
-        killedByName: me?.killedByName || prev.killedByName,
-        bigPelletsOnGrid: snap.pellets.length,
-        onlineCount: Math.max(
-          snap.onlinePlayers,
-          1 +
-            Array.from(activePeersRef.current.values()).filter(
-              (p) => nowMs - p.lastSeen < 6500
-            ).length
-        ),
-        humanPlayers,
-        leaderboard: sorted.slice(0, 6).map((s) => ({
-          id: s.id,
-          name: s.name,
-          score: s.score,
-          length: s.segments.length,
-          kills: s.kills,
-          color: s.color.head,
-          isMe: s.id === myId,
-          isBot: s.isBot,
-        })),
-        killFeed: feed,
-      }));
+      const hudSig = `${me?.alive ?? false}|${me?.score ?? 0}|${me?.kills ?? 0}|${me?.segments.length ?? 0}|${snap.pellets.length}|${snap.onlinePlayers}|${humanPlayers.length}|${feed[0]?.id ?? ''}|${(me?.shieldTicks ?? 0) > 0}`;
+      if (hudSig !== lastHudSigRef.current || nowMs - lastHudReactSyncRef.current >= 250) {
+        lastHudSigRef.current = hudSig;
+        lastHudReactSyncRef.current = nowMs;
+        setHudStats((prev) => ({
+          score: me ? me.score : prev.score,
+          length: me ? me.segments.length : prev.length,
+          kills: me ? me.kills : prev.kills,
+          slurped: me ? me.pelletsSlurped : prev.slurped,
+          headX: me && me.segments[0] ? Math.max(0, Math.min(activeSize - 1, me.segments[0].x)) : prev.headX,
+          headY: me && me.segments[0] ? Math.max(0, Math.min(activeSize - 1, me.segments[0].y)) : prev.headY,
+          alive: me ? me.alive : false,
+          shieldTicks: me ? me.shieldTicks : 0,
+          deathReason: me?.deathReason || prev.deathReason,
+          killedByName: me?.killedByName || prev.killedByName,
+          bigPelletsOnGrid: snap.pellets.length,
+          onlineCount: Math.max(
+            snap.onlinePlayers,
+            1 +
+              Array.from(activePeersRef.current.values()).filter(
+                (p) => nowMs - p.lastSeen < 6500
+              ).length
+          ),
+          humanPlayers,
+          leaderboard: sorted.slice(0, 6).map((s) => ({
+            id: s.id,
+            name: s.name,
+            score: s.score,
+            length: s.segments.length,
+            kills: s.kills,
+            color: s.color.head,
+            isMe: s.id === myId,
+            isBot: s.isBot,
+          })),
+          killFeed: feed,
+        }));
+      }
     },
     [pickRandomSpectatedSnake, spawnBurst]
   );
@@ -588,11 +639,15 @@ export default function App() {
       const myId = playerIdRef.current;
       const mySnake = remoteSnap.snakes.find((s) => s.id === myId);
 
-      // Sync GAME_OVER synchronously if coordinator reports our snake dead
+      // Sync GAME_OVER synchronously if coordinator reports our snake dead (unless AI autopilot auto-respawns)
       if (mySnake && !mySnake.alive && gameStateRef.current === 'PLAYING') {
-        gameStateRef.current = 'GAME_OVER';
-        myJoinInfoRef.current.playing = false;
-        setGameState('GAME_OVER');
+        if (autoPilotActiveRef.current && isAdminNameRef.current) {
+          triggerAutoPilotRespawnRef.current();
+        } else {
+          gameStateRef.current = 'GAME_OVER';
+          myJoinInfoRef.current.playing = false;
+          setGameState('GAME_OVER');
+        }
         return;
       }
 
@@ -739,14 +794,26 @@ export default function App() {
         if (cmd.type === 'join') {
           const existing = engine.snakes.get(targetId);
           if (!existing || !existing.alive) {
-            engine.spawnPlayer(targetId, cmd.name, cmd.colorId);
+            engine.spawnPlayer(
+              targetId,
+              cmd.name,
+              cmd.colorId,
+              Boolean(cmd.autoPilot),
+              cmd.autoPilotTier
+            );
           }
         } else if (cmd.type === 'respawn') {
-          engine.spawnPlayer(targetId, cmd.name, cmd.colorId);
+          engine.spawnPlayer(
+            targetId,
+            cmd.name,
+            cmd.colorId,
+            Boolean(cmd.autoPilot),
+            cmd.autoPilotTier
+          );
         } else if (cmd.type === 'turn') {
           engine.queueTurn(targetId, cmd.dir);
         } else if (cmd.type === 'autopilot') {
-          engine.setAutopilot(targetId, Boolean(cmd.enabled));
+          engine.setAutopilot(targetId, Boolean(cmd.enabled), cmd.tier);
         } else if (cmd.type === 'leave') {
           engine.removePlayer(targetId);
         }
@@ -1070,12 +1137,18 @@ export default function App() {
       const mc = meshCoordRef.current;
       if (engine && (mc.isCoordinator || !mc.activeCoordId)) {
         if (msg.type === 'join' || msg.type === 'respawn') {
-          engine.spawnPlayer(pid, msg.name, msg.colorId);
+          engine.spawnPlayer(
+            pid,
+            msg.name,
+            msg.colorId,
+            Boolean(msg.autoPilot),
+            msg.autoPilotTier
+          );
           snapshotRef.current = engine.getSnapshot();
         } else if (msg.type === 'turn') {
           engine.queueTurn(pid, msg.dir);
         } else if (msg.type === 'autopilot') {
-          engine.setAutopilot(pid, Boolean(msg.enabled));
+          engine.setAutopilot(pid, Boolean(msg.enabled), msg.tier);
         } else if (msg.type === 'kick_admin') {
           if (msg.targetPlayerId === '*') {
             for (const s of engine.snakes.values()) {
@@ -1453,16 +1526,52 @@ export default function App() {
     });
   }, []);
 
-  const handleMobileTurn = useCallback(
-    (dir: Direction) => {
-      if (gameState !== 'PLAYING') return;
+  const issueDirectionalTurn = useCallback(
+    (requestedDir: Direction) => {
+      if (gameStateRef.current !== 'PLAYING') return;
       if (autoPilotActiveRef.current) {
         stopAutoPilot();
       }
+
+      const snap = snapshotRef.current;
+      const me = snap?.snakes.find((s) => s.id === playerIdRef.current && s.alive);
+      const pending = predictedTurnsRef.current;
+      const lastPlannedDir =
+        pending.length > 0
+          ? pending[pending.length - 1].dir
+          : me?.nextDirs && me.nextDirs.length > 0
+            ? me.nextDirs[me.nextDirs.length - 1]
+            : me?.dir;
+
+      if (
+        lastPlannedDir &&
+        (requestedDir === lastPlannedDir || isOppositeDirection(requestedDir, lastPlannedDir))
+      ) {
+        return;
+      }
+
+      const turnEntry = {
+        dir: requestedDir,
+        sentAt: performance.now(),
+        baseTick: snap?.tick ?? 0,
+      };
+      if (pending.length < 2) {
+        pending.push(turnEntry);
+      } else {
+        pending[1] = turnEntry;
+      }
+
       soundEngine.playTurnBlip();
-      sendCommand({ type: 'turn', dir });
+      sendCommand({ type: 'turn', dir: requestedDir });
     },
-    [gameState, sendCommand, stopAutoPilot]
+    [sendCommand, stopAutoPilot]
+  );
+
+  const handleMobileTurn = useCallback(
+    (dir: Direction) => {
+      issueDirectionalTurn(dir);
+    },
+    [issueDirectionalTurn]
   );
 
   const handleToggleAdminAutoPilot = useCallback(() => {
@@ -1497,9 +1606,53 @@ export default function App() {
     });
   }, []);
 
-  // Reset AI Autopilot cleanly when leaving PLAYING state or losing admin status
   useEffect(() => {
-    if (gameState !== 'PLAYING' || !isAdminName) {
+    isAdminNameRef.current = isAdminName;
+    isSuperAdminRyRef.current = isSuperAdminRy;
+    playerNameRef.current = playerName;
+    selectedColorIdRef.current = selectedColorId;
+  }, [isAdminName, isSuperAdminRy, playerName, selectedColorId]);
+
+  useEffect(() => {
+    triggerAutoPilotRespawnRef.current = () => {
+      const now = performance.now();
+      if (now - lastAutoRespawnAtRef.current < 350) return;
+      if (!autoPilotActiveRef.current || !isAdminNameRef.current) return;
+      lastAutoRespawnAtRef.current = now;
+
+      const cleanName = playerNameRef.current.trim().toUpperCase().slice(0, 24) || 'VIPER_01';
+      const tier: 'STANDARD' | 'ADMINRY' = isSuperAdminRyRef.current ? 'ADMINRY' : 'STANDARD';
+
+      predictedTurnsRef.current = [];
+      gameStateRef.current = 'PLAYING';
+      setGameState('PLAYING');
+      setIsSpectating(false);
+      lastSentAutoPilotRef.current = true;
+      lastAutoJoinSentAtRef.current = now;
+
+      sendCommand({
+        type: 'respawn',
+        name: cleanName,
+        colorId: selectedColorIdRef.current,
+        gridSize: serverGridSize,
+        autoPilot: true,
+        autoPilotTier: tier,
+      });
+      sendCommand({
+        type: 'autopilot',
+        enabled: true,
+        tier,
+      });
+    };
+  }, [sendCommand, serverGridSize]);
+
+  // If autopilot is active and GAME_OVER ever opened, automatically close the menu and continue
+  useEffect(() => {
+    if (gameState === 'GAME_OVER' && autoPilotActiveRef.current && isAdminName) {
+      triggerAutoPilotRespawnRef.current();
+      return;
+    }
+    if ((gameState !== 'PLAYING' && gameState !== 'GAME_OVER') || !isAdminName) {
       if (autoPilotActiveRef.current) {
         autoPilotActiveRef.current = false;
         setAutoPilotActive(false);
@@ -1507,14 +1660,18 @@ export default function App() {
     }
   }, [gameState, isAdminName]);
 
-  // Sync AI Autopilot state with the server / arena coordinator
+  // Sync AI Autopilot state & tier with the server / arena coordinator
   useEffect(() => {
     const shouldEnable = gameState === 'PLAYING' && isAdminName && autoPilotActive;
     if (shouldEnable !== lastSentAutoPilotRef.current) {
       lastSentAutoPilotRef.current = shouldEnable;
-      sendCommand({ type: 'autopilot', enabled: shouldEnable });
+      sendCommand({
+        type: 'autopilot',
+        enabled: shouldEnable,
+        tier: isSuperAdminRy ? 'ADMINRY' : 'STANDARD',
+      });
     }
-  }, [autoPilotActive, gameState, isAdminName, sendCommand]);
+  }, [autoPilotActive, gameState, isAdminName, isSuperAdminRy, sendCommand]);
 
   // Strict WASD & Arrow Keys directional input listener
   useEffect(() => {
@@ -1569,6 +1726,8 @@ export default function App() {
 
       if (gameState !== 'PLAYING') return;
 
+      if (e.repeat) return;
+
       // Strictly WASD and Arrow Keys for directional movement on the grid
       let requestedDir: Direction | null = null;
       switch (e.code) {
@@ -1594,11 +1753,7 @@ export default function App() {
 
       if (requestedDir) {
         e.preventDefault();
-        if (autoPilotActiveRef.current) {
-          stopAutoPilot();
-        }
-        soundEngine.playTurnBlip();
-        sendCommand({ type: 'turn', dir: requestedDir });
+        issueDirectionalTurn(requestedDir);
       }
     };
 
@@ -1610,9 +1765,8 @@ export default function App() {
     handleStartOrRespawn,
     handleToggleMute,
     handleToggleZoom,
-    sendCommand,
+    issueDirectionalTurn,
     showAdminModal,
-    stopAutoPilot,
   ]);
 
   // 60FPS Hardware-Accelerated Pixel Matrix Canvas Loop
@@ -1670,12 +1824,65 @@ export default function App() {
       const cellPx = boardPx / visibleSquares;
       const gap = Math.max(0.9, cellPx * 0.09);
 
+      const myId = playerIdRef.current;
+      const rawMe = snap?.snakes.find((s) => s.id === myId && s.alive);
+      let projectedMe = rawMe;
+
+      // Immediate client-side turn & optimistic sub-tick projection so key presses respond in <16ms
+      if (rawMe && gameStateRef.current === 'PLAYING' && !rawMe.autoPilot && !autoPilotActiveRef.current) {
+        const pending = predictedTurnsRef.current;
+        const elapsedSinceSnap = Math.max(0, now - lastSnapshotTimeRef.current);
+        const immediateDir =
+          pending.length > 0 && !isOppositeDirection(pending[0].dir, rawMe.dir)
+            ? pending[0].dir
+            : rawMe.dir;
+
+        const stepsAhead =
+          elapsedSinceSnap >= TICK_MS * 0.85
+            ? Math.min(2, Math.floor((elapsedSinceSnap + TICK_MS * 0.15) / TICK_MS))
+            : 0;
+
+        if (stepsAhead > 0) {
+          let simSegs = rawMe.segments.map((pt) => ({ x: pt.x, y: pt.y }));
+          let simPrevHead = rawMe.prevSegments?.[0] ? { ...rawMe.prevSegments[0] } : { ...simSegs[0] };
+          let simDir = rawMe.dir;
+          const turnQueue = pending.map((t) => t.dir);
+          for (let s = 0; s < stepsAhead; s++) {
+            const nextTurn = turnQueue.shift();
+            if (nextTurn && !isOppositeDirection(nextTurn, simDir)) {
+              simDir = nextTurn;
+            }
+            const nextHead = stepPoint(simSegs[0], simDir);
+            if (!isInsideGrid(nextHead, activeGridSize)) {
+              break;
+            }
+            simPrevHead = { ...simSegs[0] };
+            simSegs.unshift(nextHead);
+            simSegs.pop();
+          }
+          const finalDir =
+            turnQueue.length > 0 && !isOppositeDirection(turnQueue[0], simDir)
+              ? turnQueue[0]
+              : simDir;
+          projectedMe = {
+            ...rawMe,
+            segments: simSegs,
+            prevSegments: [simPrevHead],
+            dir: finalDir,
+          };
+        } else if (immediateDir !== rawMe.dir) {
+          projectedMe = {
+            ...rawMe,
+            dir: immediateDir,
+          };
+        }
+      }
+
       // Compute continuous sub-tick camera offset in grid coordinates when zoomed to 16x16 squares
       if (isZoomed) {
-        const myId = playerIdRef.current;
         const meSnake =
           gameStateRef.current === 'PLAYING' || gameStateRef.current === 'PAUSED'
-            ? snap?.snakes.find((s) => s.id === myId && s.alive)
+            ? projectedMe
             : undefined;
         let trackedSnake = meSnake;
 
@@ -1709,11 +1916,9 @@ export default function App() {
           }
         }
 
-        // Sub-tick interpolation factor (0.0 -> 1.0 over TICK_MS) eliminates 155ms grid-step jolts
-        const tickAlpha = Math.min(
-          1,
-          Math.max(0, (now - lastSnapshotTimeRef.current) / TICK_MS)
-        );
+        // Sub-tick interpolation factor (0.0 -> 1.0 over TICK_MS) eliminates grid-step jolts
+        const elapsedFromSnap = Math.max(0, now - lastSnapshotTimeRef.current);
+        const tickAlpha = Math.min(1, (elapsedFromSnap % TICK_MS) / TICK_MS);
 
         let focusX = activeGridSize * 0.5;
         let focusY = activeGridSize * 0.5;
@@ -1749,8 +1954,8 @@ export default function App() {
           camRef.current.y = targetCamY;
           camInitialized = true;
         } else {
-          // Frame-rate-independent exponential smoothing over the continuous target
-          const smoothFactor = 1 - Math.exp(-dtSec * 14);
+          // Crisp frame-rate-independent exponential smoothing over the continuous target
+          const smoothFactor = 1 - Math.exp(-dtSec * 22);
           camRef.current.x += (targetCamX - camRef.current.x) * smoothFactor;
           camRef.current.y += (targetCamY - camRef.current.y) * smoothFactor;
         }
@@ -1817,8 +2022,7 @@ export default function App() {
       ctx.stroke();
 
       if (snap) {
-        const myId = playerIdRef.current;
-        const me = snap.snakes.find((s) => s.id === myId && s.alive);
+        const me = projectedMe;
 
         // 3. Render Nearby Rival Spawn Telegraphs (Flashing Radar Crosshairs on the grid)
         const pulseFast = Math.sin(now * 0.022) > 0;
@@ -1903,13 +2107,13 @@ export default function App() {
 
         // 5. Render All Snakes as Lit Colored Pixels on the Grid
         // Optimized:
-        // - Player's snake drawn last so it sits on top
+        // - Player's snake drawn last so it sits on top (using optimistic turn/step projection)
         // - Iterates head-to-tail (0..len-1) with visitedCells bitmap so stacked/crossed segments on the same square are drawn ONLY ONCE!
         // - Culls off-screen segments when zoomed in
         // - Zero ctx.save/restore or shadowBlur inside the per-segment loop
-        const orderedSnakes = [...snap.snakes].sort((a, b) =>
-          a.id === myId ? 1 : b.id === myId ? -1 : 0
-        );
+        const orderedSnakes = snap.snakes
+          .map((s) => (s.id === myId && projectedMe ? projectedMe : s))
+          .sort((a, b) => (a.id === myId ? 1 : b.id === myId ? -1 : 0));
 
         const meBorderW = Math.max(1.1, cellPx * 0.065);
         const otherBorderW = Math.max(1, cellPx * 0.05);
@@ -2341,10 +2545,24 @@ export default function App() {
               />
 
               {gameState === 'PLAYING' && autoPilotActive && !showAdminModal && (
-                <div className="absolute top-5 left-1/2 -translate-x-1/2 z-10 pointer-events-none px-3.5 py-1.5 rounded-lg bg-[#080B10]/90 border border-emerald-400/70 shadow-lg flex items-center gap-2 whitespace-nowrap">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                  <span className="text-[11px] font-mono-tabular font-bold text-emerald-300 tracking-wide">
-                    AI AUTOPILOT ACTIVE · PRESS ANY DIRECTION TO DRIVE
+                <div
+                  className={`absolute top-5 left-1/2 -translate-x-1/2 z-10 pointer-events-none px-3.5 py-1.5 rounded-lg bg-[#080B10]/90 shadow-lg flex items-center gap-2 whitespace-nowrap border ${
+                    isSuperAdminRy ? 'border-amber-400/80' : 'border-emerald-400/70'
+                  }`}
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full animate-pulse ${
+                      isSuperAdminRy ? 'bg-amber-400' : 'bg-emerald-400'
+                    }`}
+                  />
+                  <span
+                    className={`text-[11px] font-mono-tabular font-bold tracking-wide ${
+                      isSuperAdminRy ? 'text-amber-300' : 'text-emerald-300'
+                    }`}
+                  >
+                    {isSuperAdminRy
+                      ? 'ADMINRY APEX AI ACTIVE · PRESS ANY DIRECTION TO DRIVE'
+                      : 'AI AUTOPILOT ACTIVE · PRESS ANY DIRECTION TO DRIVE'}
                   </span>
                 </div>
               )}
@@ -3063,10 +3281,15 @@ export default function App() {
                 <div className="p-4 rounded-lg bg-[#080B10] border border-emerald-500/40 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div className="space-y-1 max-w-md">
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <span className="font-display font-semibold text-emerald-300 tracking-wide">
-                          ADMIN MENU AI AUTOPILOT
+                          {isSuperAdminRy ? 'ADMINRY APEX HUNTER AI' : 'ADMIN MENU AI AUTOPILOT'}
                         </span>
+                        {isSuperAdminRy && (
+                          <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-400/60 text-amber-300 font-mono-tabular text-[10px] font-bold">
+                            EXTRA POWERFUL
+                          </span>
+                        )}
                         {gameState === 'PLAYING' && isAdminName && autoPilotActive && (
                           <span className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/60 text-emerald-300 font-mono-tabular text-[10px] font-bold animate-pulse">
                             STEERING ACTIVE
@@ -3074,8 +3297,9 @@ export default function App() {
                         )}
                       </div>
                       <p className="text-slate-400 leading-relaxed text-[11px]">
-                        When enabled, an AI automatically steers your snake safely away from outer
-                        walls and rival trails while you have the Admin Menu open.
+                        {isSuperAdminRy
+                          ? 'ADMINRY unlocks full-grid BFS flood-fill anti-trap pathing, aggressive rival cut-off hunting, head-on kill sweeps when longer, and instant pellet cluster vacuuming.'
+                          : 'When enabled, an AI automatically steers your snake safely away from outer walls and rival trails while you have the Admin Menu open.'}
                       </p>
                     </div>
 

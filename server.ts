@@ -127,7 +127,13 @@ async function startServer() {
           clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize, isAlive: true });
 
           const arena = arenas.get(activeGridSize)!;
-          arena.spawnPlayer(assignedPlayerId, msg.name, msg.colorId);
+          arena.spawnPlayer(
+            assignedPlayerId,
+            msg.name,
+            msg.colorId,
+            Boolean(msg.autoPilot),
+            msg.autoPilotTier
+          );
           sendMsg({
             type: 'welcome',
             playerId: assignedPlayerId,
@@ -136,7 +142,9 @@ async function startServer() {
         } else if (msg.type === 'turn') {
           arenas.get(activeGridSize)!.queueTurn(assignedPlayerId, msg.dir);
         } else if (msg.type === 'autopilot') {
-          arenas.get(activeGridSize)!.setAutopilot(assignedPlayerId, Boolean(msg.enabled));
+          arenas
+            .get(activeGridSize)!
+            .setAutopilot(assignedPlayerId, Boolean(msg.enabled), msg.tier);
         } else if (msg.type === 'respawn') {
           if (msg.gridSize === 64 || msg.gridSize === 32) {
             if (msg.gridSize !== activeGridSize) {
@@ -148,7 +156,13 @@ async function startServer() {
             }
           }
           const arena = arenas.get(activeGridSize)!;
-          arena.spawnPlayer(assignedPlayerId, msg.name, msg.colorId);
+          arena.spawnPlayer(
+            assignedPlayerId,
+            msg.name,
+            msg.colorId,
+            Boolean(msg.autoPilot),
+            msg.autoPilotTier
+          );
           sendMsg({
             type: 'state',
             state: packSnapshot(arena.getSnapshot()),

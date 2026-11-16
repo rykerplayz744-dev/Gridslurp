@@ -66,6 +66,8 @@ export class ArenaEngine {
   private killCounter = 0;
   private slurpCounter = 0;
   private targetBotCount = 2;
+  private readonly bfsVisited = new Uint8Array(64 * 64);
+  private readonly bfsQueue = new Int16Array(64 * 64);
 
   constructor(targetBotCount = 2, gridSize = GRID_SIZE) {
     this.targetBotCount = targetBotCount;
@@ -231,11 +233,22 @@ export class ArenaEngine {
     };
   }
 
-  public spawnPlayer(id: string, name: string, colorId: string): SnakeEntity {
+  public spawnPlayer(
+    id: string,
+    name: string,
+    colorId: string,
+    autoPilot?: boolean,
+    autoPilotTier?: 'STANDARD' | 'ADMINRY'
+  ): SnakeEntity {
     const cleanName = (name || 'PLAYER_1').trim().slice(0, 24).toUpperCase() || 'PLAYER_1';
     const color = this.getColorById(colorId);
     const spawn = this.findNearbySafeSpawn();
     const snake = this.createSnakeEntity(id, cleanName, color, spawn, false);
+    if (autoPilot) {
+      snake.autoPilot = true;
+      snake.autoPilotTier =
+        autoPilotTier || (cleanName.startsWith('ADMINRY') ? 'ADMINRY' : 'STANDARD');
+    }
     this.snakes.set(id, snake);
     return snake;
   }
@@ -275,10 +288,13 @@ export class ArenaEngine {
     this.snakes.delete(id);
   }
 
-  public setAutopilot(id: string, enabled: boolean) {
+  public setAutopilot(id: string, enabled: boolean, tier?: 'STANDARD' | 'ADMINRY') {
     const snake = this.snakes.get(id);
     if (!snake || !snake.alive) return;
     snake.autoPilot = enabled;
+    snake.autoPilotTier = enabled
+      ? tier || (snake.name.trim().toUpperCase().startsWith('ADMINRY') ? 'ADMINRY' : 'STANDARD')
+      : undefined;
     if (enabled) {
       snake.nextDirs = [];
     }
@@ -290,13 +306,17 @@ export class ArenaEngine {
 
     if (snake.autoPilot) {
       snake.autoPilot = false;
+      snake.autoPilotTier = undefined;
       snake.nextDirs = [];
     }
 
     const lastScheduledDir =
       snake.nextDirs.length > 0 ? snake.nextDirs[snake.nextDirs.length - 1] : snake.dir;
 
-    if (requestedDir === lastScheduledDir) {
+    if (
+      requestedDir === lastScheduledDir ||
+      isOppositeDirection(requestedDir, lastScheduledDir)
+    ) {
       return;
     }
 
@@ -574,6 +594,275 @@ export class ArenaEngine {
       }
     }
 
+      return bestDir;
+    }
+
+  /**
+   * Fast zero-allocation BFS flood fill counting reachable safe cells from `start`.
+   */
+  private countReachableSpace(
+    start: Point,
+    blockedGrid: Uint8Array,
+    maxCells: number
+  ): number {
+    const gs = this.gridSize;
+    if (start.x < 0 || start.x >= gs || start.y < 0 || start.y >= gs) return 0;
+    const startIdx = start.y * gs + start.x;
+    if (blockedGrid[startIdx] === 1) return 0;
+
+    this.bfsVisited.fill(0, 0, gs * gs);
+    let headIdx = 0;
+    let tailIdx = 0;
+    this.bfsVisited[startIdx] = 1;
+    this.bfsQueue[tailIdx++] = startIdx;
+
+    while (headIdx < tailIdx && tailIdx < maxCells) {
+      const curr = this.bfsQueue[headIdx++];
+      const cx = curr % gs;
+      const cy = (curr - cx) / gs;
+
+      if (cx > 0) {
+        const n = curr - 1;
+        if (this.bfsVisited[n] === 0 && blockedGrid[n] === 0) {
+          this.bfsVisited[n] = 1;
+          this.bfsQueue[tailIdx++] = n;
+          if (tailIdx >= maxCells) break;
+        }
+      }
+      if (cx + 1 < gs) {
+        const n = curr + 1;
+        if (this.bfsVisited[n] === 0 && blockedGrid[n] === 0) {
+          this.bfsVisited[n] = 1;
+          this.bfsQueue[tailIdx++] = n;
+          if (tailIdx >= maxCells) break;
+        }
+      }
+      if (cy > 0) {
+        const n = curr - gs;
+        if (this.bfsVisited[n] === 0 && blockedGrid[n] === 0) {
+          this.bfsVisited[n] = 1;
+          this.bfsQueue[tailIdx++] = n;
+          if (tailIdx >= maxCells) break;
+        }
+      }
+      if (cy + 1 < gs) {
+        const n = curr + gs;
+        if (this.bfsVisited[n] === 0 && blockedGrid[n] === 0) {
+          this.bfsVisited[n] = 1;
+          this.bfsQueue[tailIdx++] = n;
+          if (tailIdx >= maxCells) break;
+        }
+      }
+    }
+
+    return tailIdx;
+  }
+
+  /**
+   * Extra-powerful ADMINRY Apex Predator AI:
+   * - Full BFS flood-fill territory check to avoid enclosed dead-end loops
+   * - Exploits head-on length advantage (+500 takedowns on shorter rivals)
+   * - Predicts & intercepts rival paths to force cut-off eliminations
+   * - Sweeps high-value flashing pellet clusters & exploits spawn shield safely
+   */
+  private computeAdminRyAutopilotDirection(snake: SnakeEntity): Direction {
+    const gs = this.gridSize;
+    const head = snake.segments[0];
+    const allDirs: Direction[] = ['UP', 'DOWN', 'LEFT', 'RIGHT'];
+    const validDirs = allDirs.filter((d) => !isOppositeDirection(d, snake.dir));
+    const myLen = snake.segments.length;
+    const isShieldInvulnerable = snake.shieldTicks > 2;
+
+    const blockedGrid = new Uint8Array(gs * gs);
+    const riskyHeadCells = new Set<number>();
+    const killHeadCells = new Set<number>();
+    const rivalTargets: Array<{ pt: Point; dist: number; canKillHeadOn: boolean }> = [];
+
+    for (const other of this.snakes.values()) {
+      if (!other.alive || other.id === snake.id) continue;
+      const otherSegs = other.segments;
+      const otherHead = otherSegs[0];
+      const otherShielded = other.shieldTicks > 0;
+
+      if (!isShieldInvulnerable && !otherShielded) {
+        for (let i = 0; i < otherSegs.length; i++) {
+          const seg = otherSegs[i];
+          if (seg.x >= 0 && seg.x < gs && seg.y >= 0 && seg.y < gs) {
+            blockedGrid[seg.y * gs + seg.x] = 1;
+          }
+        }
+
+        if (otherHead) {
+          const canWinHeadOn = myLen > otherSegs.length;
+          for (const d of allDirs) {
+            if (isOppositeDirection(d, other.dir)) continue;
+            const nh = stepPoint(otherHead, d);
+            if (!isInsideGrid(nh, gs)) continue;
+            const nKey = (nh.x << 8) | nh.y;
+            if (canWinHeadOn && d === other.dir) {
+              killHeadCells.add(nKey);
+            } else if (!canWinHeadOn) {
+              riskyHeadCells.add(nKey);
+            }
+          }
+        }
+      }
+
+      // Compute aggressive cut-off intercept point 2-3 steps ahead of rival snake
+      if (otherHead && (!otherShielded || other.shieldTicks <= 3)) {
+        const dist = Math.abs(otherHead.x - head.x) + Math.abs(otherHead.y - head.y);
+        let intercept = { x: otherHead.x, y: otherHead.y };
+        const leadSteps = dist <= 5 ? 2 : 3;
+        for (let s = 0; s < leadSteps; s++) {
+          const stepped = stepPoint(intercept, other.dir);
+          if (isInsideGrid(stepped, gs)) {
+            intercept = stepped;
+          } else {
+            break;
+          }
+        }
+        rivalTargets.push({
+          pt: intercept,
+          dist,
+          canKillHeadOn: !otherShielded && myLen > otherSegs.length,
+        });
+      }
+    }
+
+    // Build O(1) pellet map for instant slurp-radius scoring and find highest-value safe pellet target
+    const pelletCellValues = new Map<number, number>();
+    let bestPelletTarget: Point | null = null;
+    let bestPelletScore = -999999;
+
+    for (let i = 0; i < this.pellets.length; i++) {
+      const p = this.pellets[i];
+      if (p.x < 0 || p.x >= gs || p.y < 0 || p.y >= gs) continue;
+      const idx = p.y * gs + p.x;
+      if (blockedGrid[idx] === 1) continue;
+      pelletCellValues.set((p.x << 8) | p.y, p.value);
+
+      const dist = Math.abs(p.x - head.x) + Math.abs(p.y - head.y);
+      const edgePenalty =
+        p.x === 0 || p.x === gs - 1 || p.y === 0 || p.y === gs - 1 ? 0.55 : 1;
+      const pScore = ((p.value * edgePenalty) / (dist + 1.5)) * (1 + p.growth * 0.25);
+      if (pScore > bestPelletScore) {
+        bestPelletScore = pScore;
+        bestPelletTarget = p;
+      }
+    }
+
+    // Choose nearest strong cut-off prey
+    rivalTargets.sort((a, b) => a.dist - b.dist);
+    const primaryPrey = rivalTargets[0] || null;
+
+    const desiredSpace = Math.min(Math.max(36, myLen * 2), 140);
+    let bestDir = validDirs[0] || snake.dir;
+    let bestScore = -99999999;
+
+    for (const dir of validDirs) {
+      const nextPt = stepPoint(head, dir);
+      if (!isInsideGrid(nextPt, gs)) {
+        continue; // Never step off outer boundary
+      }
+
+      const nextIdx = nextPt.y * gs + nextPt.x;
+      const nextKey = (nextPt.x << 8) | nextPt.y;
+      let score = 0;
+
+      // 1. Absolute lethality & head-on contest evaluation
+      if (blockedGrid[nextIdx] === 1) {
+        score -= 1_000_000;
+      } else if (riskyHeadCells.has(nextKey)) {
+        score -= 18_000;
+      } else if (killHeadCells.has(nextKey)) {
+        score += 420; // Actively crush shorter rival head-on for +500 takedown!
+      }
+
+      // 2. Flood-fill territory reachability (prevents traps & enclosed loops)
+      const reachable = this.countReachableSpace(nextPt, blockedGrid, desiredSpace);
+      if (reachable < 8) {
+        score -= 90_000 + (8 - reachable) * 4000;
+      } else if (reachable < Math.min(28, myLen + 8)) {
+        score -= 6500 + (32 - reachable) * 180;
+      } else {
+        score += Math.min(desiredSpace, reachable) * 4.5;
+      }
+
+      // 3. 2-step & adjacent escape corridor count
+      let safeExits = 0;
+      for (const d2 of allDirs) {
+        if (isOppositeDirection(d2, dir)) continue;
+        const step2 = stepPoint(nextPt, d2);
+        if (!isInsideGrid(step2, gs)) continue;
+        if (blockedGrid[step2.y * gs + step2.x] === 0) {
+          safeExits++;
+        }
+      }
+      if (safeExits === 0) score -= 55_000;
+      else if (safeExits === 1) score -= 220;
+      else score += safeExits * 35;
+
+      // 4. Instant slurp-radius pellet vacuuming (head + 4 cardinal neighbors)
+      let instantPelletGain = 0;
+      const slurpCheck = [
+        [0, 0],
+        [1, 0],
+        [-1, 0],
+        [0, 1],
+        [0, -1],
+      ];
+      for (let o = 0; o < 5; o++) {
+        const px = nextPt.x + slurpCheck[o][0];
+        const py = nextPt.y + slurpCheck[o][1];
+        if (px < 0 || px >= gs || py < 0 || py >= gs) continue;
+        const val = pelletCellValues.get((px << 8) | py);
+        if (val) instantPelletGain += val;
+      }
+      if (instantPelletGain > 0 && reachable >= 14) {
+        score += Math.min(360, instantPelletGain * 0.9);
+      }
+
+      // 5. High-value pellet homing vs aggressive rival cut-off hunting
+      if (bestPelletTarget) {
+        const currDist = Math.abs(bestPelletTarget.x - head.x) + Math.abs(bestPelletTarget.y - head.y);
+        const nextDist =
+          Math.abs(bestPelletTarget.x - nextPt.x) + Math.abs(bestPelletTarget.y - nextPt.y);
+        const pelletUrgency = bestPelletScore > 25 ? 78 : 48;
+        if (nextDist < currDist) score += pelletUrgency;
+        else score -= 12;
+      }
+
+      if (primaryPrey && primaryPrey.dist <= 16) {
+        const currPreyDist =
+          Math.abs(primaryPrey.pt.x - head.x) + Math.abs(primaryPrey.pt.y - head.y);
+        const nextPreyDist =
+          Math.abs(primaryPrey.pt.x - nextPt.x) + Math.abs(primaryPrey.pt.y - nextPt.y);
+        const huntWeight =
+          isShieldInvulnerable || primaryPrey.canKillHeadOn
+            ? 88
+            : bestPelletTarget && bestPelletScore > 40
+              ? 28
+              : 54;
+        if (nextPreyDist < currPreyDist) score += huntWeight;
+      }
+
+      // 6. Outer-wall cushion & center-arena dominance when cruising
+      const wallDist = Math.min(nextPt.x, gs - 1 - nextPt.x, nextPt.y, gs - 1 - nextPt.y);
+      if (wallDist === 0) score -= 420;
+      else if (wallDist === 1) score -= 95;
+      else if (wallDist >= 3) score += 35;
+
+      // Smooth straight-line momentum to prevent erratic twitching
+      if (dir === snake.dir) {
+        score += 16;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestDir = dir;
+      }
+    }
+
     return bestDir;
   }
 
@@ -626,13 +915,20 @@ export class ArenaEngine {
           snake.dir = chosen;
         }
       } else if (snake.autoPilot) {
-        const chosen = this.computeAutopilotDirection(snake);
+        const isApexAdminRy =
+          snake.autoPilotTier === 'ADMINRY' ||
+          snake.name.trim().toUpperCase().startsWith('ADMINRY');
+        const chosen = isApexAdminRy
+          ? this.computeAdminRyAutopilotDirection(snake)
+          : this.computeAutopilotDirection(snake);
         if (!isOppositeDirection(chosen, snake.dir)) {
           snake.dir = chosen;
         }
       } else if (snake.nextDirs.length > 0) {
         const nextDir = snake.nextDirs.shift()!;
-        snake.dir = nextDir;
+        if (!isOppositeDirection(nextDir, snake.dir)) {
+          snake.dir = nextDir;
+        }
       }
 
       const nextHead = stepPoint(snake.segments[0], snake.dir);

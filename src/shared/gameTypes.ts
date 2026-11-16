@@ -1,6 +1,6 @@
 export const GRID_SIZE = 32;
-export const TICK_MS = 165; // ~6.06 ticks/sec for 10ms more reaction time per grid step
-export const SPAWN_PROTECTION_TICKS = 22; // ~3.6 seconds fail-safe spawn protection timer
+export const TICK_MS = 120; // ~8.33 ticks/sec for crisp, responsive grid movement
+export const SPAWN_PROTECTION_TICKS = 28; // ~3.36 seconds fail-safe spawn protection timer
 
 export type Direction = 'UP' | 'DOWN' | 'LEFT' | 'RIGHT';
 
@@ -109,6 +109,7 @@ export interface SnakeEntity {
   spawnTick: number;
   shieldTicks: number;
   autoPilot?: boolean;
+  autoPilotTier?: 'STANDARD' | 'ADMINRY';
   deathReason?: 'WALL_CRASH' | 'SELF_CRASH' | 'KILLED_BY_SNAKE' | 'HEAD_COLLISION';
   killedByName?: string;
   botStyle?: 'HUNTER' | 'SCAVENGER' | 'INTERCEPTOR' | 'FLANKER';
@@ -230,11 +231,26 @@ export interface PackedArenaSnapshot {
 export type ServerGridSize = 32 | 64;
 
 export type ClientToServerMessage =
-  | { type: 'join'; name: string; colorId: string; clientId: string; gridSize?: ServerGridSize }
+  | {
+      type: 'join';
+      name: string;
+      colorId: string;
+      clientId: string;
+      gridSize?: ServerGridSize;
+      autoPilot?: boolean;
+      autoPilotTier?: 'STANDARD' | 'ADMINRY';
+    }
   | { type: 'turn'; dir: Direction }
-  | { type: 'respawn'; name: string; colorId: string; gridSize?: ServerGridSize }
+  | {
+      type: 'respawn';
+      name: string;
+      colorId: string;
+      gridSize?: ServerGridSize;
+      autoPilot?: boolean;
+      autoPilotTier?: 'STANDARD' | 'ADMINRY';
+    }
   | { type: 'select_server'; gridSize: ServerGridSize }
-  | { type: 'autopilot'; enabled: boolean }
+  | { type: 'autopilot'; enabled: boolean; tier?: 'STANDARD' | 'ADMINRY' }
   | { type: 'admin_track'; trackId: string }
   | { type: 'kick_admin'; targetPlayerId: string; issuedByClientId: string }
   | { type: 'leave' };
