@@ -2,9 +2,16 @@ import {
   ArenaSnapshot,
   BigPellet,
   Direction,
+  ExtraLifeSaveEvent,
   KillEvent,
+  LOOT_BOX_ABILITY_POOL,
+  LootBoxItem,
+  LootBoxPickupEvent,
   PackedArenaSnapshot,
+  PackedExtraLifeSave,
   PackedKill,
+  PackedLootBox,
+  PackedLootPickup,
   PackedPellet,
   PackedSlurp,
   PackedSnake,
@@ -149,6 +156,9 @@ export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
     if (typeof s.lastTurnSeq === 'number') {
       packed.ts = s.lastTurnSeq;
     }
+    if (s.extraLives > 0) {
+      packed.el = s.extraLives;
+    }
     return packed;
   });
 
@@ -199,15 +209,45 @@ export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
     s.value,
   ]);
 
+  const lb: PackedLootBox[] = (snap.lootBoxes || []).map((box) => [
+    box.id,
+    box.x,
+    box.y,
+    Math.max(0, LOOT_BOX_ABILITY_POOL.indexOf(box.ability)),
+    box.ttlTicks,
+  ]);
+
+  const rlp: PackedLootPickup[] = (snap.recentLootPickups || []).map((e) => [
+    e.id,
+    e.tick,
+    e.snakeId,
+    e.snakeName,
+    e.x,
+    e.y,
+    Math.max(0, LOOT_BOX_ABILITY_POOL.indexOf(e.ability)),
+  ]);
+
+  const rels: PackedExtraLifeSave[] = (snap.recentExtraLifeSaves || []).map((e) => [
+    e.id,
+    e.tick,
+    e.snakeId,
+    e.snakeName,
+    e.x,
+    e.y,
+  ]);
+
   return {
     v: 2,
     t: snap.tick,
     gs: snap.gridSize,
     sn,
     pl,
+    ...(lb.length > 0 ? { lb } : {}),
     tl,
     rk,
     rs,
+    ...(rlp.length > 0 ? { rlp } : {}),
+    ...(rels.length > 0 ? { rels } : {}),
     op: snap.onlinePlayers,
   };
 }
@@ -238,6 +278,7 @@ export function unpackSnapshot(
       autoPilot: (ps.f & 4) !== 0,
       spawnTick: 0,
       shieldTicks: ps.sh,
+      extraLives: ps.el || 0,
       deathReason: ps.dr !== undefined ? DEATH_REASONS[ps.dr] : undefined,
       killedByName: ps.kb,
     };
@@ -292,14 +333,51 @@ export function unpackSnapshot(
     value: ps[8],
   }));
 
+  const lootBoxes: LootBoxItem[] = Array.isArray(raw.lb)
+    ? raw.lb.map((pb) => ({
+        id: pb[0],
+        x: pb[1],
+        y: pb[2],
+        ability: LOOT_BOX_ABILITY_POOL[pb[3]] || 'EXTRA_LIFE',
+        spawnTick: raw.t,
+        ttlTicks: pb[4],
+      }))
+    : [];
+
+  const recentLootPickups: LootBoxPickupEvent[] = Array.isArray(raw.rlp)
+    ? raw.rlp.map((pe) => ({
+        id: pe[0],
+        tick: pe[1],
+        snakeId: pe[2],
+        snakeName: pe[3],
+        x: pe[4],
+        y: pe[5],
+        ability: LOOT_BOX_ABILITY_POOL[pe[6]] || 'EXTRA_LIFE',
+      }))
+    : [];
+
+  const recentExtraLifeSaves: ExtraLifeSaveEvent[] = Array.isArray(raw.rels)
+    ? raw.rels.map((ps) => ({
+        id: ps[0],
+        tick: ps[1],
+        snakeId: ps[2],
+        snakeName: ps[3],
+        x: ps[4],
+        y: ps[5],
+      }))
+    : [];
+
   return {
     tick: raw.t,
     gridSize: raw.gs,
     snakes,
     pellets,
+    lootBoxes,
     telegraphs,
     recentKills,
     recentSlurps,
+    recentLootPickups,
+    recentExtraLifeSaves,
     onlinePlayers: raw.op,
   };
 }

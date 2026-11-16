@@ -2,8 +2,13 @@ import {
   ArenaSnapshot,
   BigPellet,
   Direction,
+  ExtraLifeSaveEvent,
   GRID_SIZE,
   KillEvent,
+  LOOT_BOX_ABILITY_POOL,
+  LootBoxAbility,
+  LootBoxItem,
+  LootBoxPickupEvent,
   Point,
   SlurpEvent,
   SNAKE_PALETTES,
@@ -58,13 +63,20 @@ export class ArenaEngine {
   public readonly gridSize: number;
   public snakes: Map<string, SnakeEntity> = new Map();
   public pellets: BigPellet[] = [];
+  public lootBoxes: LootBoxItem[] = [];
   public telegraphs: SpawnTelegraph[] = [];
   public recentKills: KillEvent[] = [];
   public recentSlurps: SlurpEvent[] = [];
+  public recentLootPickups: LootBoxPickupEvent[] = [];
+  public recentExtraLifeSaves: ExtraLifeSaveEvent[] = [];
   private botCounter = 0;
   private pelletCounter = 0;
+  private lootBoxCounter = 0;
   private killCounter = 0;
   private slurpCounter = 0;
+  private lootPickupCounter = 0;
+  private extraLifeSaveCounter = 0;
+  private nextLootBoxSpawnTick = 65 + Math.floor(Math.random() * 55);
   private targetBotCount = 2;
   private readonly bfsVisited = new Uint8Array(64 * 64);
   private readonly bfsQueue = new Int16Array(64 * 64);
@@ -229,6 +241,7 @@ export class ArenaEngine {
       isBot,
       spawnTick: this.tick,
       shieldTicks: SPAWN_PROTECTION_TICKS,
+      extraLives: 0,
       botStyle: styles[Math.floor(Math.random() * styles.length)],
     };
   }
@@ -286,6 +299,40 @@ export class ArenaEngine {
 
   public removePlayer(id: string) {
     this.snakes.delete(id);
+  }
+
+  private rollLootBoxAbility(): LootBoxAbility {
+    return LOOT_BOX_ABILITY_POOL[Math.floor(Math.random() * LOOT_BOX_ABILITY_POOL.length)];
+  }
+
+  private applyLootBoxAbility(snake: SnakeEntity, ability: LootBoxAbility) {
+    switch (ability) {
+      case 'EXTRA_LIFE':
+        snake.extraLives = (snake.extraLives || 0) + 1;
+        break;
+    }
+  }
+
+  private findSafeLootBoxCell(): Point | null {
+    const occupied = this.getOccupiedSet();
+    for (let i = 0; i < this.pellets.length; i++) {
+      const p = this.pellets[i];
+      occupied.add((p.x << 8) | p.y);
+    }
+    for (let i = 0; i < this.lootBoxes.length; i++) {
+      const b = this.lootBoxes[i];
+      occupied.add((b.x << 8) | b.y);
+    }
+    const margin = 2;
+    const span = Math.max(1, this.gridSize - margin * 2);
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const x = margin + Math.floor(Math.random() * span);
+      const y = margin + Math.floor(Math.random() * span);
+      if (!occupied.has((x << 8) | y)) {
+        return { x, y };
+      }
+    }
+    return null;
   }
 
   public setAutopilot(id: string, enabled: boolean, tier?: 'STANDARD' | 'ADMINRY') {
@@ -901,6 +948,26 @@ export class ArenaEngine {
       this.queueNearbyBotSpawn(humanAnchors, 5);
     }
 
+    // 2b. Occasionally spawn a collectible Loot Box on a safe interior cell
+    if (this.tick >= this.nextLootBoxSpawnTick) {
+      const maxBoxes = this.gridSize >= 64 ? 2 : 1;
+      if (this.lootBoxes.length < maxBoxes) {
+        const cell = this.findSafeLootBoxCell();
+        if (cell) {
+          this.lootBoxCounter++;
+          this.lootBoxes.push({
+            id: `loot_${this.lootBoxCounter}_${this.tick}`,
+            x: cell.x,
+            y: cell.y,
+            ability: this.rollLootBoxAbility(),
+            spawnTick: this.tick,
+            ttlTicks: 220,
+          });
+        }
+      }
+      this.nextLootBoxSpawnTick = this.tick + 115 + Math.floor(Math.random() * 80);
+    }
+
     // 3. Determine next direction & next head position for each alive snake
     const nextHeads = new Map<string, Point>();
 
@@ -993,6 +1060,35 @@ export class ArenaEngine {
       }
     }
 
+    // 4b. Collect Loot Boxes when a snake's head lands on a crate cell
+    if (this.lootBoxes.length > 0) {
+      const collectedBoxIds = new Set<string>();
+      for (const snake of aliveSnakes) {
+        const nextHead = nextHeads.get(snake.id)!;
+        for (let b = 0; b < this.lootBoxes.length; b++) {
+          const box = this.lootBoxes[b];
+          if (collectedBoxIds.has(box.id)) continue;
+          if (nextHead.x === box.x && nextHead.y === box.y) {
+            collectedBoxIds.add(box.id);
+            this.applyLootBoxAbility(snake, box.ability);
+            this.lootPickupCounter++;
+            this.recentLootPickups.push({
+              id: `lpick_${this.lootPickupCounter}_${this.tick}`,
+              tick: this.tick,
+              snakeId: snake.id,
+              snakeName: snake.name,
+              x: box.x,
+              y: box.y,
+              ability: box.ability,
+            });
+          }
+        }
+      }
+      if (collectedBoxIds.size > 0) {
+        this.lootBoxes = this.lootBoxes.filter((b) => !collectedBoxIds.has(b.id));
+      }
+    }
+
     // Move segments forward
     for (const snake of aliveSnakes) {
       const nextHead = nextHeads.get(snake.id)!;
@@ -1043,6 +1139,8 @@ export class ArenaEngine {
       }
     }
 
+    const savedByExtraLife = new Set<string>();
+
     for (const snake of aliveSnakes) {
       const head = snake.segments[0];
 
@@ -1077,13 +1175,17 @@ export class ArenaEngine {
 
         if (sameHeadCell || swappedHeads) {
           if (snake.segments.length <= other.segments.length) {
-            doomed.set(snake.id, { reason: 'HEAD_COLLISION', killer: other });
+            if (snake.extraLives > 0) {
+              savedByExtraLife.add(snake.id);
+            } else {
+              doomed.set(snake.id, { reason: 'HEAD_COLLISION', killer: other });
+            }
           }
           break;
         }
       }
 
-      if (doomed.has(snake.id)) continue;
+      if (doomed.has(snake.id) || savedByExtraLife.has(snake.id)) continue;
 
       // O(1) body trail collision check
       const hitOwner = bodyOwners.get((head.x << 8) | head.y);
@@ -1091,14 +1193,39 @@ export class ArenaEngine {
         if (Array.isArray(hitOwner)) {
           for (let h = 0; h < hitOwner.length; h++) {
             if (hitOwner[h].id !== snake.id) {
-              doomed.set(snake.id, { reason: 'KILLED_BY_SNAKE', killer: hitOwner[h] });
+              if (snake.extraLives > 0) {
+                savedByExtraLife.add(snake.id);
+              } else {
+                doomed.set(snake.id, { reason: 'KILLED_BY_SNAKE', killer: hitOwner[h] });
+              }
               break;
             }
           }
         } else if (hitOwner.id !== snake.id) {
-          doomed.set(snake.id, { reason: 'KILLED_BY_SNAKE', killer: hitOwner });
+          if (snake.extraLives > 0) {
+            savedByExtraLife.add(snake.id);
+          } else {
+            doomed.set(snake.id, { reason: 'KILLED_BY_SNAKE', killer: hitOwner });
+          }
         }
       }
+    }
+
+    // Consume Extra Life when phasing over another snake and grant default invincibility duration
+    for (const savedId of savedByExtraLife) {
+      const savedSnake = this.snakes.get(savedId);
+      if (!savedSnake || !savedSnake.alive || savedSnake.extraLives <= 0) continue;
+      savedSnake.extraLives -= 1;
+      savedSnake.shieldTicks = SPAWN_PROTECTION_TICKS + 1;
+      this.extraLifeSaveCounter++;
+      this.recentExtraLifeSaves.push({
+        id: `exlife_${this.extraLifeSaveCounter}_${this.tick}`,
+        tick: this.tick,
+        snakeId: savedSnake.id,
+        snakeName: savedSnake.name,
+        x: savedSnake.segments[0].x,
+        y: savedSnake.segments[0].y,
+      });
     }
 
     // Decrement fail-safe spawn protection timer for all surviving snakes
@@ -1163,14 +1290,21 @@ export class ArenaEngine {
       }
     }
 
-    // 7. Age pellets and prune old events (short window minimizes repeated payload bytes)
+    // 7. Age pellets & loot boxes and prune old events (short window minimizes repeated payload bytes)
     this.pellets = this.pellets.filter((p) => {
       p.ttlTicks--;
       return p.ttlTicks > 0;
     });
 
+    this.lootBoxes = this.lootBoxes.filter((box) => {
+      box.ttlTicks--;
+      return box.ttlTicks > 0;
+    });
+
     this.recentKills = this.recentKills.filter((k) => this.tick - k.tick <= 18);
     this.recentSlurps = this.recentSlurps.filter((s) => this.tick - s.tick <= 4);
+    this.recentLootPickups = this.recentLootPickups.filter((e) => this.tick - e.tick <= 4);
+    this.recentExtraLifeSaves = this.recentExtraLifeSaves.filter((e) => this.tick - e.tick <= 4);
 
     return this.getSnapshot();
   }
@@ -1183,15 +1317,19 @@ export class ArenaEngine {
         s.prevSegments && s.prevSegments[0] ? s.prevSegments[0] : s.segments[0];
       this.snakes.set(s.id, {
         ...s,
+        extraLives: s.extraLives || 0,
         segments: s.segments.map((pt) => ({ x: pt.x, y: pt.y })),
         prevSegments: prevHead ? [{ x: prevHead.x, y: prevHead.y }] : [],
         nextDirs: [...(s.nextDirs || [])],
       });
     }
     this.pellets = snap.pellets.map((p) => ({ ...p }));
+    this.lootBoxes = (snap.lootBoxes || []).map((b) => ({ ...b }));
     this.telegraphs = snap.telegraphs.map((t) => ({ ...t }));
     this.recentKills = snap.recentKills.map((k) => ({ ...k }));
     this.recentSlurps = snap.recentSlurps.map((s) => ({ ...s }));
+    this.recentLootPickups = (snap.recentLootPickups || []).map((e) => ({ ...e }));
+    this.recentExtraLifeSaves = (snap.recentExtraLifeSaves || []).map((e) => ({ ...e }));
   }
 
   public getSnapshot(): ArenaSnapshot {
@@ -1202,9 +1340,12 @@ export class ArenaEngine {
       gridSize: this.gridSize,
       snakes: snakesList,
       pellets: this.pellets,
+      lootBoxes: this.lootBoxes,
       telegraphs: this.telegraphs,
       recentKills: this.recentKills,
       recentSlurps: this.recentSlurps,
+      recentLootPickups: this.recentLootPickups,
+      recentExtraLifeSaves: this.recentExtraLifeSaves,
       onlinePlayers: Math.max(1, humanCount),
     };
   }

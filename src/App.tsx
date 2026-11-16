@@ -6,6 +6,7 @@ import {
   ClientToServerMessage,
   Direction,
   GRID_SIZE,
+  LOOT_BOX_REGISTRY,
   PackedArenaSnapshot,
   ServerGridSize,
   ServerToClientMessage,
@@ -140,6 +141,7 @@ export default function App() {
     headY: number;
     alive: boolean;
     shieldTicks: number;
+    extraLives: number;
     deathReason?: string;
     killedByName?: string;
     bigPelletsOnGrid: number;
@@ -175,6 +177,7 @@ export default function App() {
     headY: 16,
     alive: true,
     shieldTicks: 0,
+    extraLives: 0,
     bigPelletsOnGrid: 0,
     onlineCount: 1,
     humanPlayers: [],
@@ -231,6 +234,8 @@ export default function App() {
   const processedKillsRef = useRef<Set<string>>(new Set());
   const processedSlurpsRef = useRef<Set<string>>(new Set());
   const processedTelegraphsRef = useRef<Set<string>>(new Set());
+  const processedLootPickupsRef = useRef<Set<string>>(new Set());
+  const processedExtraLifeSavesRef = useRef<Set<string>>(new Set());
 
   // Visual juice pools
   const particlesRef = useRef<Particle[]>([]);
@@ -335,6 +340,62 @@ export default function App() {
               color: '#FDE047',
               alpha: 1,
               vy: -0.055,
+            });
+          }
+        }
+      }
+
+      // New Loot Box pickups
+      for (const pickup of snap.recentLootPickups || []) {
+        if (!processedLootPickupsRef.current.has(pickup.id)) {
+          processedLootPickupsRef.current.add(pickup.id);
+          const def = LOOT_BOX_REGISTRY[pickup.ability];
+          spawnBurst(pickup.x, pickup.y, def.badgeColor, 20);
+          shockwavesRef.current.push({
+            x: pickup.x + 0.5,
+            y: pickup.y + 0.5,
+            radius: 0.35,
+            maxRadius: 3.4,
+            color: def.badgeColor,
+            alpha: 0.9,
+          });
+          if (pickup.snakeId === myId && gameStateRef.current === 'PLAYING') {
+            soundEngine.playLootBoxPickup();
+            popupsRef.current.push({
+              x: pickup.x + 0.5,
+              y: pickup.y - 0.15,
+              text: def.shortLabel,
+              color: def.accentColor,
+              alpha: 1,
+              vy: -0.055,
+            });
+          }
+        }
+      }
+
+      // Extra Life phase-through saves
+      for (const saved of snap.recentExtraLifeSaves || []) {
+        if (!processedExtraLifeSavesRef.current.has(saved.id)) {
+          processedExtraLifeSavesRef.current.add(saved.id);
+          spawnBurst(saved.x, saved.y, '#38BDF8', 24);
+          shockwavesRef.current.push({
+            x: saved.x + 0.5,
+            y: saved.y + 0.5,
+            radius: 0.4,
+            maxRadius: 4.0,
+            color: '#38BDF8',
+            alpha: 0.95,
+          });
+          if (saved.snakeId === myId && gameStateRef.current === 'PLAYING') {
+            soundEngine.playExtraLifeSave();
+            shakeRef.current = 8;
+            popupsRef.current.push({
+              x: saved.x + 0.5,
+              y: saved.y - 0.25,
+              text: 'EXTRA LIFE · INVINCIBLE!',
+              color: '#7DD3FC',
+              alpha: 1,
+              vy: -0.06,
             });
           }
         }
@@ -525,7 +586,7 @@ export default function App() {
         return a.name.localeCompare(b.name);
       });
 
-      const hudSig = `${me?.alive ?? false}|${me?.score ?? 0}|${me?.kills ?? 0}|${me?.segments.length ?? 0}|${snap.pellets.length}|${snap.onlinePlayers}|${humanPlayers.length}|${feed[0]?.id ?? ''}|${(me?.shieldTicks ?? 0) > 0}`;
+      const hudSig = `${me?.alive ?? false}|${me?.score ?? 0}|${me?.kills ?? 0}|${me?.segments.length ?? 0}|${me?.extraLives ?? 0}|${snap.pellets.length}|${(snap.lootBoxes || []).length}|${snap.onlinePlayers}|${humanPlayers.length}|${feed[0]?.id ?? ''}|${(me?.shieldTicks ?? 0) > 0}`;
       if (hudSig !== lastHudSigRef.current || nowMs - lastHudReactSyncRef.current >= 250) {
         lastHudSigRef.current = hudSig;
         lastHudReactSyncRef.current = nowMs;
@@ -538,6 +599,7 @@ export default function App() {
           headY: me && me.segments[0] ? Math.max(0, Math.min(activeSize - 1, me.segments[0].y)) : prev.headY,
           alive: me ? me.alive : false,
           shieldTicks: me ? me.shieldTicks : 0,
+          extraLives: me ? me.extraLives || 0 : 0,
           deathReason: me?.deathReason || prev.deathReason,
           killedByName: me?.killedByName || prev.killedByName,
           bigPelletsOnGrid: snap.pellets.length,
@@ -2067,6 +2129,70 @@ export default function App() {
           );
         }
 
+        // 4b. Render Collectible Loot Boxes (extensible crate visuals per ability)
+        const lootBoxes = snap.lootBoxes || [];
+        for (let bIdx = 0; bIdx < lootBoxes.length; bIdx++) {
+          const box = lootBoxes[bIdx];
+          if (box.x < startX || box.x >= endX || box.y < startY || box.y >= endY) {
+            continue;
+          }
+          const def = LOOT_BOX_REGISTRY[box.ability];
+          const bx = box.x * cellPx;
+          const by = box.y * cellPx;
+          const bob = Math.sin(now * 0.008 + box.x + box.y) * (cellPx * 0.06);
+          const pulse = 0.72 + 0.28 * Math.sin(now * 0.012 + box.x * 2);
+
+          // Soft emerald/ability aura
+          ctx.globalAlpha = 0.26 * pulse;
+          ctx.fillStyle = def.badgeColor;
+          ctx.fillRect(
+            bx - cellPx * 0.2,
+            by - cellPx * 0.2 + bob,
+            cellPx * 1.4,
+            cellPx * 1.4
+          );
+
+          // Crate outer body
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = '#0B1320';
+          ctx.fillRect(bx + halfGap, by + halfGap + bob, socketSize, socketSize);
+
+          // Crisp colored crate border
+          ctx.strokeStyle = def.badgeColor;
+          ctx.lineWidth = Math.max(1.5, cellPx * 0.11);
+          ctx.strokeRect(bx + halfGap, by + halfGap + bob, socketSize, socketSize);
+
+          // Corner crate rivets
+          const rivet = Math.max(1.5, socketSize * 0.16);
+          ctx.fillStyle = def.accentColor;
+          ctx.fillRect(bx + halfGap + 1, by + halfGap + bob + 1, rivet, rivet);
+          ctx.fillRect(bx + halfGap + socketSize - rivet - 1, by + halfGap + bob + 1, rivet, rivet);
+          ctx.fillRect(bx + halfGap + 1, by + halfGap + bob + socketSize - rivet - 1, rivet, rivet);
+          ctx.fillRect(
+            bx + halfGap + socketSize - rivet - 1,
+            by + halfGap + bob + socketSize - rivet - 1,
+            rivet,
+            rivet
+          );
+
+          // Center '+' emblem for Extra Life / powerup crate
+          const midX = bx + cellPx * 0.5;
+          const midY = by + cellPx * 0.5 + bob;
+          const barThick = Math.max(2, socketSize * 0.18);
+          const barLen = socketSize * 0.52;
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(midX - barLen * 0.5, midY - barThick * 0.5, barLen, barThick);
+          ctx.fillRect(midX - barThick * 0.5, midY - barLen * 0.5, barThick, barLen);
+
+          // Mini overhead crate label
+          ctx.font = `700 ${Math.max(8, Math.floor(cellPx * 0.36))}px "IBM Plex Mono", monospace`;
+          ctx.textAlign = 'center';
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+          ctx.fillText(def.shortLabel, midX + 1, by + bob - 3);
+          ctx.fillStyle = def.accentColor;
+          ctx.fillText(def.shortLabel, midX, by + bob - 4);
+        }
+
         // 5. Render All Snakes as Lit Colored Pixels on the Grid
         // Optimized:
         // - Player's snake drawn last so it sits on top (using optimistic turn/step projection)
@@ -2218,15 +2344,20 @@ export default function App() {
             ctx.font = `${isMe ? '700' : '600'} ${Math.max(9, Math.floor(cellPx * 0.42))}px "IBM Plex Mono", monospace`;
             ctx.textAlign = 'center';
             const shieldSec = ((snake.shieldTicks * TICK_MS) / 1000).toFixed(1);
+            const lifeTag = (snake.extraLives || 0) > 0 ? ` [+${snake.extraLives} LIFE]` : '';
             const label = isShielded
-              ? `${isMe ? '★ ' : ''}${snake.name} [SAFE ${shieldSec}s]`
-              : isMe
-                ? `★ ${snake.name}`
-                : snake.name;
+              ? `${isMe ? '★ ' : ''}${snake.name} [SAFE ${shieldSec}s]${lifeTag}`
+              : `${isMe ? '★ ' : ''}${snake.name}${lifeTag}`;
             const textY = Math.max(11, hy);
             ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
             ctx.fillText(label, hx + 1, textY + 1);
-            ctx.fillStyle = isShielded ? '#7DD3FC' : isMe ? '#FFFFFF' : 'rgba(241, 245, 249, 0.85)';
+            ctx.fillStyle = isShielded
+              ? '#7DD3FC'
+              : (snake.extraLives || 0) > 0
+                ? '#6EE7B7'
+                : isMe
+                  ? '#FFFFFF'
+                  : 'rgba(241, 245, 249, 0.85)';
             ctx.fillText(label, hx, textY);
           }
         }
@@ -2377,6 +2508,14 @@ export default function App() {
                 <span aria-hidden="true">·</span>
                 <span className="text-sky-300 font-semibold">
                   SPAWN SAFE {((hudStats.shieldTicks * TICK_MS) / 1000).toFixed(1)}s
+                </span>
+              </>
+            )}
+            {hudStats.extraLives > 0 && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="text-emerald-300 font-semibold">
+                  EXTRA LIFE ×{hudStats.extraLives}
                 </span>
               </>
             )}

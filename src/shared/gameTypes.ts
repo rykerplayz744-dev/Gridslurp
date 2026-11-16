@@ -69,6 +69,60 @@ export const SNAKE_PALETTES: SnakeColor[] = [
   },
 ];
 
+export type LootBoxAbility = 'EXTRA_LIFE';
+
+export interface LootBoxDefinition {
+  ability: LootBoxAbility;
+  name: string;
+  shortLabel: string;
+  description: string;
+  badgeColor: string;
+  accentColor: string;
+  glowColor: string;
+}
+
+export const LOOT_BOX_REGISTRY: Record<LootBoxAbility, LootBoxDefinition> = {
+  EXTRA_LIFE: {
+    ability: 'EXTRA_LIFE',
+    name: 'Extra Life',
+    shortLabel: '+1 EXTRA LIFE',
+    description: 'Phase through one fatal player collision and trigger default spawn invincibility.',
+    badgeColor: '#10B981',
+    accentColor: '#FEF08A',
+    glowColor: 'rgba(16, 185, 129, 0.5)',
+  },
+};
+
+export const LOOT_BOX_ABILITY_POOL: LootBoxAbility[] = ['EXTRA_LIFE'];
+
+export interface LootBoxItem {
+  id: string;
+  x: number;
+  y: number;
+  ability: LootBoxAbility;
+  spawnTick: number;
+  ttlTicks: number;
+}
+
+export interface LootBoxPickupEvent {
+  id: string;
+  tick: number;
+  snakeId: string;
+  snakeName: string;
+  x: number;
+  y: number;
+  ability: LootBoxAbility;
+}
+
+export interface ExtraLifeSaveEvent {
+  id: string;
+  tick: number;
+  snakeId: string;
+  snakeName: string;
+  x: number;
+  y: number;
+}
+
 export interface BigPellet {
   id: string;
   x: number;
@@ -109,6 +163,7 @@ export interface SnakeEntity {
   isBot: boolean;
   spawnTick: number;
   shieldTicks: number;
+  extraLives: number;
   autoPilot?: boolean;
   autoPilotTier?: 'STANDARD' | 'ADMINRY';
   deathReason?: 'WALL_CRASH' | 'SELF_CRASH' | 'KILLED_BY_SNAKE' | 'HEAD_COLLISION';
@@ -147,9 +202,12 @@ export interface ArenaSnapshot {
   gridSize: number;
   snakes: SnakeEntity[];
   pellets: BigPellet[];
+  lootBoxes: LootBoxItem[];
   telegraphs: SpawnTelegraph[];
   recentKills: KillEvent[];
   recentSlurps: SlurpEvent[];
+  recentLootPickups: LootBoxPickupEvent[];
+  recentExtraLifeSaves: ExtraLifeSaveEvent[];
   onlinePlayers: number;
 }
 
@@ -170,6 +228,7 @@ export interface PackedSnake {
   g: string; // compact RLE/step-encoded segments string
   nd?: number[]; // queued nextDirs indices (0..3)
   ts?: number; // last acknowledged turn sequence
+  el?: number; // extraLives count when > 0
 }
 
 export type PackedPellet = [
@@ -219,15 +278,45 @@ export type PackedSlurp = [
   value: number,
 ];
 
+export type PackedLootBox = [
+  id: string,
+  x: number,
+  y: number,
+  abilityIdx: number,
+  ttlTicks: number,
+];
+
+export type PackedLootPickup = [
+  id: string,
+  tick: number,
+  snakeId: string,
+  snakeName: string,
+  x: number,
+  y: number,
+  abilityIdx: number,
+];
+
+export type PackedExtraLifeSave = [
+  id: string,
+  tick: number,
+  snakeId: string,
+  snakeName: string,
+  x: number,
+  y: number,
+];
+
 export interface PackedArenaSnapshot {
   v: 2;
   t: number; // tick
   gs: number; // gridSize
   sn: PackedSnake[];
   pl: PackedPellet[];
+  lb?: PackedLootBox[];
   tl: PackedTelegraph[];
   rk: PackedKill[];
   rs: PackedSlurp[];
+  rlp?: PackedLootPickup[];
+  rels?: PackedExtraLifeSave[];
   op: number; // onlinePlayers
 }
 

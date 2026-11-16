@@ -149,6 +149,48 @@ class SoundEngine {
     osc.start(now);
     osc.stop(now + 0.105);
   }
+
+  public playLootBoxPickup() {
+    const ctx = this.getContext();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const notes = [523.25, 659.25, 783.99, 1046.5];
+    notes.forEach((freq, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freq, now + idx * 0.045);
+      gain.gain.setValueAtTime(0.11, now + idx * 0.045);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.045 + 0.13);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + idx * 0.045);
+      osc.stop(now + idx * 0.045 + 0.14);
+    });
+  }
+
+  public playExtraLifeSave() {
+    const ctx = this.getContext();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const notes = [440, 659.25, 880, 1318.5];
+    notes.forEach((freq, idx) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, now + idx * 0.032);
+      gain.gain.setValueAtTime(0.14, now + idx * 0.032);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.032 + 0.18);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + idx * 0.032);
+      osc.stop(now + idx * 0.032 + 0.19);
+    });
+  }
 }
 
 export const soundEngine = new SoundEngine();
