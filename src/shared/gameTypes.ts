@@ -322,6 +322,19 @@ export interface PackedArenaSnapshot {
 
 export type ServerGridSize = 32 | 64;
 
+export interface LifeTradeOffer {
+  id: string;
+  fromId: string;
+  fromName: string;
+  toId: string;
+  toName: string;
+  giveType: 'LIFE' | 'SCORE';
+  giveAmount: number;
+  wantType: 'LIFE' | 'SCORE';
+  wantAmount: number;
+  createdAt: number;
+}
+
 export type ClientToServerMessage =
   | {
       type: 'join';
@@ -345,10 +358,25 @@ export type ClientToServerMessage =
   | { type: 'autopilot'; enabled: boolean; tier?: 'STANDARD' | 'ADMINRY' }
   | { type: 'admin_track'; trackId: string }
   | { type: 'kick_admin'; targetPlayerId: string; issuedByClientId: string }
+  | { type: 'give_life'; targetPlayerId: string }
+  | { type: 'trade_offer'; offer: LifeTradeOffer }
+  | { type: 'trade_response'; offerId: string; accepted: boolean; offer: LifeTradeOffer }
   | { type: 'leave' };
 
 export type ServerToClientMessage =
   | { type: 'welcome'; playerId: string; state: ArenaSnapshot | PackedArenaSnapshot }
   | { type: 'state'; state: ArenaSnapshot | PackedArenaSnapshot }
   | { type: 'admin_track'; trackId: string }
-  | { type: 'kick_admin'; targetPlayerId: string; issuedByClientId: string };
+  | { type: 'kick_admin'; targetPlayerId: string; issuedByClientId: string }
+  | { type: 'trade_offer'; offer: LifeTradeOffer }
+  | {
+      type: 'trade_result';
+      offerId: string;
+      fromId: string;
+      fromName: string;
+      toId: string;
+      toName: string;
+      ok: boolean;
+      accepted: boolean;
+      summary: string;
+    };

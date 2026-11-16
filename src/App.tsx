@@ -6,6 +6,7 @@ import {
   ClientToServerMessage,
   Direction,
   GRID_SIZE,
+  LifeTradeOffer,
   LOOT_BOX_REGISTRY,
   PackedArenaSnapshot,
   ServerGridSize,
@@ -112,6 +113,14 @@ export default function App() {
 
   const [adminKickedThisSession, setAdminKickedThisSession] = useState<boolean>(false);
   const [kickFeedbackMsg, setKickFeedbackMsg] = useState<string | null>(null);
+  const [showTradeModal, setShowTradeModal] = useState<boolean>(false);
+  const [incomingTrades, setIncomingTrades] = useState<LifeTradeOffer[]>([]);
+  const [tradeFeedback, setTradeFeedback] = useState<{ text: string; ok: boolean } | null>(null);
+  const [tradeTargetId, setTradeTargetId] = useState<string>('');
+  const [tradeGiveType, setTradeGiveType] = useState<'LIFE' | 'SCORE'>('LIFE');
+  const [tradeGiveScore, setTradeGiveScore] = useState<number>(500);
+  const [tradeWantType, setTradeWantType] = useState<'LIFE' | 'SCORE'>('SCORE');
+  const [tradeWantScore, setTradeWantScore] = useState<number>(500);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const isAdminMusicActiveRef = useRef<boolean>(false);
@@ -152,6 +161,8 @@ export default function App() {
       color: string;
       alive: boolean;
       autoPilot: boolean;
+      extraLives: number;
+      score: number;
     }>;
     leaderboard: Array<{
       id: string;
@@ -557,7 +568,15 @@ export default function App() {
 
       const humanMap = new Map<
         string,
-        { id: string; name: string; color: string; alive: boolean; autoPilot: boolean }
+        {
+          id: string;
+          name: string;
+          color: string;
+          alive: boolean;
+          autoPilot: boolean;
+          extraLives: number;
+          score: number;
+        }
       >();
       for (const s of snap.snakes) {
         if (s.isBot || s.id === myId) continue;
@@ -567,6 +586,8 @@ export default function App() {
           color: s.color.head,
           alive: s.alive,
           autoPilot: Boolean(s.autoPilot),
+          extraLives: s.extraLives || 0,
+          score: s.score,
         });
       }
       for (const [pid, info] of activePeersRef.current.entries()) {
@@ -577,6 +598,8 @@ export default function App() {
           color: '#94A3B8',
           alive: false,
           autoPilot: false,
+          extraLives: 0,
+          score: 0,
         });
       }
       const humanPlayers = Array.from(humanMap.values()).sort((a, b) => {
@@ -586,7 +609,8 @@ export default function App() {
         return a.name.localeCompare(b.name);
       });
 
-      const hudSig = `${me?.alive ?? false}|${me?.score ?? 0}|${me?.kills ?? 0}|${me?.segments.length ?? 0}|${me?.extraLives ?? 0}|${snap.pellets.length}|${(snap.lootBoxes || []).length}|${snap.onlinePlayers}|${humanPlayers.length}|${feed[0]?.id ?? ''}|${(me?.shieldTicks ?? 0) > 0}`;
+      const livesSig = humanPlayers.map((p) => `${p.id}:${p.extraLives}`).join(',');
+      const hudSig = `${me?.alive ?? false}|${me?.score ?? 0}|${me?.kills ?? 0}|${me?.segments.length ?? 0}|${me?.extraLives ?? 0}|${snap.pellets.length}|${(snap.lootBoxes || []).length}|${snap.onlinePlayers}|${humanPlayers.length}|${livesSig}|${feed[0]?.id ?? ''}|${(me?.shieldTicks ?? 0) > 0}`;
       if (hudSig !== lastHudSigRef.current || nowMs - lastHudReactSyncRef.current >= 250) {
         lastHudSigRef.current = hudSig;
         lastHudReactSyncRef.current = nowMs;
@@ -873,8 +897,81 @@ export default function App() {
           engine.queueTurn(targetId, cmd.dir, cmd.seq);
         } else if (cmd.type === 'autopilot') {
           engine.setAutopilot(targetId, Boolean(cmd.enabled), cmd.tier);
+        } else if (cmd.type === 'give_life') {
+          const res = engine.giveExtraLife(targetId, cmd.targetPlayerId);
+          const fromSnake = engine.snakes.get(targetId);
+          const toSnake = engine.snakes.get(cmd.targetPlayerId);
+          const summary = res.ok
+            ? `${fromSnake?.name || 'Player'} gave 1 Extra Life to ${toSnake?.name || 'Player'}!`
+            : res.reason || 'Transfer failed.';
+          publishMeshPacket({
+            type: 'mesh_trade_result',
+            senderId: myId,
+            offerId: `give_${Date.now()}`,
+            fromId: targetId,
+            toId: cmd.targetPlayerId,
+            ok: res.ok,
+            accepted: true,
+            summary,
+          });
+          if (cmd.targetPlayerId === myId && res.ok) {
+            soundEngine.playLootBoxPickup();
+            setTradeFeedback({ text: summary, ok: true });
+          }
+        } else if (cmd.type === 'trade_offer') {
+          if (cmd.offer && cmd.offer.toId === myId) {
+            setIncomingTrades((prev) =>
+              prev.some((o) => o.id === cmd.offer.id) ? prev : [...prev.slice(-3), cmd.offer]
+            );
+          }
+        } else if (cmd.type === 'trade_response') {
+          const offer = cmd.offer;
+          let ok = true;
+          let summary = `${offer.toName} declined the life trade.`;
+          if (cmd.accepted) {
+            const res = engine.executeLifeTrade(offer);
+            ok = res.ok;
+            const giveLabel =
+              offer.giveType === 'LIFE' ? `${offer.giveAmount} Life` : `${offer.giveAmount} PTS`;
+            const wantLabel =
+              offer.wantType === 'LIFE' ? `${offer.wantAmount} Life` : `${offer.wantAmount} PTS`;
+            summary = res.ok
+              ? `Trade complete: ${offer.fromName} (${giveLabel}) ⇄ ${offer.toName} (${wantLabel})`
+              : res.reason || 'Trade failed.';
+          }
+          publishMeshPacket({
+            type: 'mesh_trade_result',
+            senderId: myId,
+            offerId: cmd.offerId,
+            fromId: offer.fromId,
+            toId: offer.toId,
+            ok,
+            accepted: cmd.accepted,
+            summary,
+          });
+          if (offer.fromId === myId || offer.toId === myId) {
+            if (ok && cmd.accepted) soundEngine.playLootBoxPickup();
+            setTradeFeedback({ text: summary, ok });
+          }
         } else if (cmd.type === 'leave') {
           engine.removePlayer(targetId);
+        }
+      } else if (data.type === 'mesh_cmd' && data.cmd) {
+        const cmd = data.cmd as ClientToServerMessage & { clientId?: string };
+        if (cmd.type === 'trade_offer' && cmd.offer && cmd.offer.toId === myId) {
+          setIncomingTrades((prev) =>
+            prev.some((o) => o.id === cmd.offer.id) ? prev : [...prev.slice(-3), cmd.offer]
+          );
+        }
+      } else if (data.type === 'mesh_trade_result') {
+        const fromId = String(data.fromId || '');
+        const toId = String(data.toId || '');
+        if (fromId === myId || toId === myId) {
+          const ok = Boolean(data.ok);
+          const accepted = Boolean(data.accepted);
+          if (ok && accepted) soundEngine.playLootBoxPickup();
+          setTradeFeedback({ text: String(data.summary || ''), ok });
+          setIncomingTrades((prev) => prev.filter((o) => o.id !== data.offerId));
         }
       }
     };
@@ -1123,6 +1220,18 @@ export default function App() {
             playNextAdminTrackRef.current(msg.trackId);
           } else if (msg.type === 'kick_admin') {
             handleIncomingAdminKickRef.current(msg.targetPlayerId, msg.issuedByClientId);
+          } else if (msg.type === 'trade_offer') {
+            if (msg.offer.toId === playerIdRef.current) {
+              setIncomingTrades((prev) =>
+                prev.some((o) => o.id === msg.offer.id) ? prev : [...prev.slice(-3), msg.offer]
+              );
+            }
+          } else if (msg.type === 'trade_result') {
+            if (msg.ok && msg.accepted) {
+              soundEngine.playLootBoxPickup();
+            }
+            setIncomingTrades((prev) => prev.filter((o) => o.id !== msg.offerId));
+            setTradeFeedback({ text: msg.summary, ok: msg.ok });
           }
         } catch {
           // ignore parse error
@@ -1217,6 +1326,80 @@ export default function App() {
             }
           } else if (msg.targetPlayerId && msg.targetPlayerId !== msg.issuedByClientId) {
             engine.setAutopilot(msg.targetPlayerId, false);
+          }
+        } else if (msg.type === 'give_life') {
+          const res = engine.giveExtraLife(pid, msg.targetPlayerId);
+          const fromSnake = engine.snakes.get(pid);
+          const toSnake = engine.snakes.get(msg.targetPlayerId);
+          const summary = res.ok
+            ? `${fromSnake?.name || 'Player'} gave 1 Extra Life to ${toSnake?.name || 'Player'}!`
+            : res.reason || 'Transfer failed.';
+          if (res.ok) soundEngine.playLootBoxPickup();
+          setTradeFeedback({ text: summary, ok: res.ok });
+          const resultPacket = {
+            type: 'mesh_trade_result',
+            senderId: pid,
+            offerId: `give_${Date.now()}`,
+            fromId: pid,
+            toId: msg.targetPlayerId,
+            ok: res.ok,
+            accepted: true,
+            summary,
+          };
+          if (mqttRef.current && mqttRef.current.connected) {
+            try {
+              mqttRef.current.publish(getMeshTopic(serverGridSize), JSON.stringify(resultPacket), {
+                qos: 0,
+              });
+            } catch {
+              // ignore
+            }
+          }
+          try {
+            broadcastChannelRef.current?.postMessage(resultPacket);
+          } catch {
+            // ignore
+          }
+        } else if (msg.type === 'trade_response') {
+          const offer = msg.offer;
+          let ok = true;
+          let summary = `${offer.toName} declined the life trade.`;
+          if (msg.accepted) {
+            const res = engine.executeLifeTrade(offer);
+            ok = res.ok;
+            const giveLabel =
+              offer.giveType === 'LIFE' ? `${offer.giveAmount} Life` : `${offer.giveAmount} PTS`;
+            const wantLabel =
+              offer.wantType === 'LIFE' ? `${offer.wantAmount} Life` : `${offer.wantAmount} PTS`;
+            summary = res.ok
+              ? `Trade complete: ${offer.fromName} (${giveLabel}) ⇄ ${offer.toName} (${wantLabel})`
+              : res.reason || 'Trade failed.';
+          }
+          if (ok && msg.accepted) soundEngine.playLootBoxPickup();
+          setTradeFeedback({ text: summary, ok });
+          const resultPacket = {
+            type: 'mesh_trade_result',
+            senderId: pid,
+            offerId: msg.offerId,
+            fromId: offer.fromId,
+            toId: offer.toId,
+            ok,
+            accepted: msg.accepted,
+            summary,
+          };
+          if (mqttRef.current && mqttRef.current.connected) {
+            try {
+              mqttRef.current.publish(getMeshTopic(serverGridSize), JSON.stringify(resultPacket), {
+                qos: 0,
+              });
+            } catch {
+              // ignore
+            }
+          }
+          try {
+            broadcastChannelRef.current?.postMessage(resultPacket);
+          } catch {
+            // ignore
           }
         } else if (msg.type === 'leave') {
           engine.removePlayer(pid);
@@ -1502,6 +1685,79 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [kickFeedbackMsg]);
 
+  useEffect(() => {
+    if (!tradeFeedback) return;
+    const timer = setTimeout(() => setTradeFeedback(null), 3800);
+    return () => clearTimeout(timer);
+  }, [tradeFeedback]);
+
+  useEffect(() => {
+    if (gameState !== 'PLAYING') {
+      setShowTradeModal(false);
+    }
+  }, [gameState]);
+
+  const handleGiveExtraLife = useCallback(
+    (targetId: string, targetName: string) => {
+      if (hudStats.extraLives < 1) {
+        setTradeFeedback({ text: 'You need at least 1 Extra Life to give.', ok: false });
+        return;
+      }
+      sendCommand({ type: 'give_life', targetPlayerId: targetId });
+      setTradeFeedback({ text: `Sending 1 Extra Life to ${targetName}...`, ok: true });
+    },
+    [hudStats.extraLives, sendCommand]
+  );
+
+  const handleSendTradeOffer = useCallback(
+    (
+      targetId: string,
+      targetName: string,
+      giveType: 'LIFE' | 'SCORE',
+      giveAmount: number,
+      wantType: 'LIFE' | 'SCORE',
+      wantAmount: number
+    ) => {
+      if (!targetId) return;
+      if (giveType === 'LIFE' && hudStats.extraLives < giveAmount) {
+        setTradeFeedback({ text: `You need at least ${giveAmount} Extra Life.`, ok: false });
+        return;
+      }
+      if (giveType === 'SCORE' && hudStats.score < giveAmount) {
+        setTradeFeedback({ text: `You need at least ${giveAmount} Score.`, ok: false });
+        return;
+      }
+      const offer: LifeTradeOffer = {
+        id: `trade_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        fromId: playerIdRef.current,
+        fromName: playerName.trim().toUpperCase().slice(0, 24) || 'VIPER_01',
+        toId: targetId,
+        toName: targetName,
+        giveType,
+        giveAmount,
+        wantType,
+        wantAmount,
+        createdAt: Date.now(),
+      };
+      sendCommand({ type: 'trade_offer', offer });
+      setTradeFeedback({ text: `Trade offer sent to ${targetName}!`, ok: true });
+    },
+    [hudStats.extraLives, hudStats.score, playerName, sendCommand]
+  );
+
+  const handleRespondToTrade = useCallback(
+    (offer: LifeTradeOffer, accepted: boolean) => {
+      sendCommand({
+        type: 'trade_response',
+        offerId: offer.id,
+        accepted,
+        offer,
+      });
+      setIncomingTrades((prev) => prev.filter((o) => o.id !== offer.id));
+    },
+    [sendCommand]
+  );
+
   const openAdminModal = useCallback(() => {
     if (!isAdminName) return;
     setShowAdminModal(true);
@@ -1775,11 +2031,21 @@ export default function App() {
           closeAdminModal(false);
           return;
         }
+        if (showTradeModal) {
+          setShowTradeModal(false);
+          return;
+        }
         setGameState((prev) => (prev === 'PLAYING' ? 'PAUSED' : 'PLAYING'));
         return;
       }
 
-      if (showAdminModal) return;
+      if ((e.key === 't' || e.key === 'T') && gameState === 'PLAYING' && !showAdminModal) {
+        e.preventDefault();
+        setShowTradeModal((prev) => !prev);
+        return;
+      }
+
+      if (showAdminModal || showTradeModal) return;
 
       if (gameState !== 'PLAYING') return;
 
@@ -1824,6 +2090,7 @@ export default function App() {
     handleToggleZoom,
     issueDirectionalTurn,
     showAdminModal,
+    showTradeModal,
   ]);
 
   // 60FPS Hardware-Accelerated Pixel Matrix Canvas Loop
@@ -2553,6 +2820,28 @@ export default function App() {
 
         {/* Right Controls */}
         <div className="flex items-center gap-2 shrink-0">
+          {gameState === 'PLAYING' && (
+            <button
+              type="button"
+              onClick={() => setShowTradeModal((prev) => !prev)}
+              className={`relative px-2.5 py-1 text-xs font-semibold rounded border transition-colors whitespace-nowrap cursor-pointer flex items-center gap-1.5 ${
+                showTradeModal || incomingTrades.length > 0
+                  ? 'bg-emerald-500/25 border-emerald-400 text-emerald-200'
+                  : 'bg-slate-800/80 hover:bg-slate-700/80 text-emerald-300 border-emerald-500/40'
+              }`}
+              title="Give or trade Extra Lives with other players (Shortcut: T)"
+            >
+              <span>Trade Lives [T]</span>
+              {hudStats.extraLives > 0 && (
+                <span className="px-1 rounded bg-emerald-400/20 text-emerald-200 font-mono-tabular text-[10px]">
+                  ×{hudStats.extraLives}
+                </span>
+              )}
+              {incomingTrades.length > 0 && (
+                <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+              )}
+            </button>
+          )}
           {isAdminName && (
             <button
               type="button"
@@ -3911,6 +4200,375 @@ export default function App() {
                     })()}
                   </div>
                 </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* INCOMING LIFE TRADE TOAST BANNER (Non-blocking while driving) */}
+        {gameState === 'PLAYING' && !showTradeModal && incomingTrades.length > 0 && (
+          <div className="fixed bottom-11 left-4 z-25 max-w-xs w-full p-3.5 rounded-xl bg-[#0D131F]/95 border border-emerald-400/70 shadow-2xl space-y-2.5">
+            {(() => {
+              const offer = incomingTrades[0];
+              const giveLabel =
+                offer.giveType === 'LIFE'
+                  ? `${offer.giveAmount} Extra Life`
+                  : `${offer.giveAmount} Score`;
+              const wantLabel =
+                offer.wantType === 'LIFE'
+                  ? `${offer.wantAmount} Extra Life`
+                  : `${offer.wantAmount} Score`;
+              return (
+                <>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-mono-tabular font-bold text-emerald-300">
+                      INCOMING LIFE TRADE
+                    </span>
+                    {incomingTrades.length > 1 && (
+                      <span className="text-[10px] font-mono-tabular text-amber-300">
+                        +{incomingTrades.length - 1} more
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-200 leading-snug">
+                    <strong className="text-white">{offer.fromName}</strong> offers{' '}
+                    <span className="text-emerald-300 font-semibold">{giveLabel}</span> for your{' '}
+                    <span className="text-amber-300 font-semibold">{wantLabel}</span>.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleRespondToTrade(offer, true)}
+                      className="flex-1 py-1.5 px-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-mono-tabular font-bold text-xs cursor-pointer transition-colors"
+                    >
+                      Accept
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleRespondToTrade(offer, false)}
+                      className="py-1.5 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono-tabular text-xs cursor-pointer transition-colors"
+                    >
+                      Decline
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* TRADE FEEDBACK TOAST */}
+        {tradeFeedback && !showTradeModal && (
+          <div
+            className={`fixed top-16 left-1/2 -translate-x-1/2 z-25 px-4 py-2 rounded-lg border font-mono-tabular text-xs font-semibold shadow-xl pointer-events-none ${
+              tradeFeedback.ok
+                ? 'bg-[#0B1512]/95 border-emerald-400/70 text-emerald-200'
+                : 'bg-[#170D11]/95 border-rose-400/70 text-rose-200'
+            }`}
+          >
+            {tradeFeedback.text}
+          </div>
+        )}
+
+        {/* TRADE LIVES MODAL */}
+        {showTradeModal && gameState === 'PLAYING' && (
+          <div className="absolute inset-0 z-40 bg-[#080B10]/85 flex items-center justify-center p-4">
+            <div className="w-full max-w-xl max-h-[88vh] flex flex-col rounded-xl bg-[#0D131F] border border-emerald-500/50 shadow-2xl overflow-hidden">
+              <div className="px-6 py-4 bg-[#090D16] border-b border-slate-800 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-[11px] font-mono-tabular text-emerald-400 font-semibold">
+                    PLAYER TRADING POST · EXTRA LIVES & SCORE
+                  </div>
+                  <h2 className="font-display text-xl font-bold text-white">TRADE LIVES</h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowTradeModal(false)}
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold cursor-pointer"
+                >
+                  Close [Esc]
+                </button>
+              </div>
+
+              <div className="p-5 overflow-y-auto space-y-4 text-xs">
+                {/* Your Wallet Summary */}
+                <div className="grid grid-cols-2 gap-3 font-mono-tabular">
+                  <div className="p-3 rounded-lg bg-[#080B10] border border-emerald-500/30 flex items-center justify-between">
+                    <span className="text-slate-400">YOUR EXTRA LIVES</span>
+                    <span className="text-base font-bold text-emerald-300">
+                      ×{hudStats.extraLives}
+                    </span>
+                  </div>
+                  <div className="p-3 rounded-lg bg-[#080B10] border border-amber-500/30 flex items-center justify-between">
+                    <span className="text-slate-400">YOUR SCORE</span>
+                    <span className="text-base font-bold text-amber-300">{hudStats.score}</span>
+                  </div>
+                </div>
+
+                {tradeFeedback && (
+                  <div
+                    className={`px-3.5 py-2 rounded-lg border font-mono-tabular text-[11px] font-semibold ${
+                      tradeFeedback.ok
+                        ? 'bg-emerald-500/15 border-emerald-400/50 text-emerald-200'
+                        : 'bg-rose-500/15 border-rose-400/50 text-rose-200'
+                    }`}
+                  >
+                    {tradeFeedback.text}
+                  </div>
+                )}
+
+                {/* Pending Incoming Offers */}
+                {incomingTrades.length > 0 && (
+                  <div className="p-3.5 rounded-lg bg-[#080B10] border border-emerald-400/50 space-y-2.5">
+                    <div className="font-display font-semibold text-emerald-300 tracking-wide">
+                      INCOMING OFFERS ({incomingTrades.length})
+                    </div>
+                    <div className="space-y-2">
+                      {incomingTrades.map((offer) => {
+                        const giveLabel =
+                          offer.giveType === 'LIFE'
+                            ? `${offer.giveAmount} Extra Life`
+                            : `${offer.giveAmount} Score`;
+                        const wantLabel =
+                          offer.wantType === 'LIFE'
+                            ? `${offer.wantAmount} Extra Life`
+                            : `${offer.wantAmount} Score`;
+                        return (
+                          <div
+                            key={offer.id}
+                            className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded bg-[#0D131F] border border-slate-800"
+                          >
+                            <div className="text-slate-200">
+                              <strong>{offer.fromName}</strong> offers{' '}
+                              <span className="text-emerald-300 font-semibold">{giveLabel}</span> ⇄{' '}
+                              <span className="text-amber-300 font-semibold">{wantLabel}</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleRespondToTrade(offer, true)}
+                                className="px-3 py-1 rounded bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-mono-tabular font-bold text-[11px] cursor-pointer"
+                              >
+                                Accept
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleRespondToTrade(offer, false)}
+                                className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 font-mono-tabular text-[11px] cursor-pointer"
+                              >
+                                Decline
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Connected Alive Human Players */}
+                {(() => {
+                  const aliveHumans = hudStats.humanPlayers.filter((p) => p.alive);
+                  const activeTarget =
+                    aliveHumans.find((p) => p.id === tradeTargetId) || aliveHumans[0] || null;
+                  return (
+                    <>
+                      <div className="p-3.5 rounded-lg bg-[#080B10] border border-slate-800 space-y-2.5">
+                        <div className="font-display font-semibold text-slate-200 tracking-wide">
+                          ALIVE PLAYERS IN ARENA ({aliveHumans.length})
+                        </div>
+                        {aliveHumans.length === 0 ? (
+                          <p className="text-slate-500 py-1">
+                            No other alive human players in this arena right now. Invite a friend
+                            or wait for another player to spawn!
+                          </p>
+                        ) : (
+                          <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                            {aliveHumans.map((p) => {
+                              const isSelected = activeTarget?.id === p.id;
+                              return (
+                                <div
+                                  key={p.id}
+                                  className={`flex flex-wrap items-center justify-between gap-2 px-3 py-2 rounded border transition-colors ${
+                                    isSelected
+                                      ? 'bg-emerald-500/10 border-emerald-500/50'
+                                      : 'bg-[#0D131F] border-slate-800'
+                                  }`}
+                                >
+                                  <button
+                                    type="button"
+                                    onClick={() => setTradeTargetId(p.id)}
+                                    className="flex items-center gap-2 min-w-0 text-left cursor-pointer"
+                                  >
+                                    <span
+                                      className="w-2.5 h-2.5 rounded-xs shrink-0"
+                                      style={{ backgroundColor: p.color }}
+                                    />
+                                    <span className="font-mono-tabular font-semibold text-slate-100 truncate">
+                                      {p.name}
+                                    </span>
+                                    <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 font-mono-tabular text-[10px]">
+                                      {p.extraLives} {p.extraLives === 1 ? 'LIFE' : 'LIVES'}
+                                    </span>
+                                    <span className="text-amber-300 font-mono-tabular text-[10px]">
+                                      {p.score} PTS
+                                    </span>
+                                  </button>
+
+                                  <div className="flex items-center gap-1.5 shrink-0">
+                                    <button
+                                      type="button"
+                                      disabled={hudStats.extraLives < 1}
+                                      onClick={() => handleGiveExtraLife(p.id, p.name)}
+                                      className={`px-2.5 py-1 rounded font-mono-tabular font-semibold text-[11px] transition-colors ${
+                                        hudStats.extraLives >= 1
+                                          ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 cursor-pointer'
+                                          : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                                      }`}
+                                      title="Immediately transfer 1 Extra Life to this player"
+                                    >
+                                      Give 1 Life
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setTradeTargetId(p.id)}
+                                      className={`px-2.5 py-1 rounded border font-mono-tabular text-[11px] cursor-pointer ${
+                                        isSelected
+                                          ? 'bg-amber-500/20 border-amber-400 text-amber-200'
+                                          : 'bg-slate-800 hover:bg-slate-700 border-slate-700 text-slate-300'
+                                      }`}
+                                    >
+                                      Propose Trade
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Custom Trade Proposal Builder */}
+                      {activeTarget && (
+                        <div className="p-4 rounded-lg bg-[#080B10] border border-amber-500/40 space-y-3">
+                          <div className="flex items-center justify-between">
+                            <span className="font-display font-semibold text-amber-300 tracking-wide">
+                              TRADE OFFER TO {activeTarget.name}
+                            </span>
+                            <span className="text-[11px] font-mono-tabular text-slate-400">
+                              Instant atomic swap on accept
+                            </span>
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div className="p-3 rounded bg-[#0D131F] border border-slate-800 space-y-2">
+                              <div className="text-[11px] font-mono-tabular text-slate-400">
+                                YOU OFFER
+                              </div>
+                              <div className="grid grid-cols-2 gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => setTradeGiveType('LIFE')}
+                                  className={`py-1.5 px-2 rounded border font-mono-tabular text-[11px] font-semibold cursor-pointer ${
+                                    tradeGiveType === 'LIFE'
+                                      ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200'
+                                      : 'bg-[#080B10] border-slate-700 text-slate-400'
+                                  }`}
+                                >
+                                  1 Extra Life
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setTradeGiveType('SCORE')}
+                                  className={`py-1.5 px-2 rounded border font-mono-tabular text-[11px] font-semibold cursor-pointer ${
+                                    tradeGiveType === 'SCORE'
+                                      ? 'bg-amber-500/20 border-amber-400 text-amber-200'
+                                      : 'bg-[#080B10] border-slate-700 text-slate-400'
+                                  }`}
+                                >
+                                  Score Points
+                                </button>
+                              </div>
+                              {tradeGiveType === 'SCORE' && (
+                                <select
+                                  value={tradeGiveScore}
+                                  onChange={(e) => setTradeGiveScore(Number(e.target.value))}
+                                  className="w-full px-2.5 py-1.5 rounded bg-[#080B10] border border-slate-700 text-amber-300 font-mono-tabular text-xs"
+                                >
+                                  <option value={250}>250 PTS</option>
+                                  <option value={500}>500 PTS</option>
+                                  <option value={1000}>1,000 PTS</option>
+                                  <option value={2000}>2,000 PTS</option>
+                                </select>
+                              )}
+                            </div>
+
+                            <div className="p-3 rounded bg-[#0D131F] border border-slate-800 space-y-2">
+                              <div className="text-[11px] font-mono-tabular text-slate-400">
+                                YOU ASK FOR
+                              </div>
+                              <div className="grid grid-cols-2 gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => setTradeWantType('LIFE')}
+                                  className={`py-1.5 px-2 rounded border font-mono-tabular text-[11px] font-semibold cursor-pointer ${
+                                    tradeWantType === 'LIFE'
+                                      ? 'bg-emerald-500/20 border-emerald-400 text-emerald-200'
+                                      : 'bg-[#080B10] border-slate-700 text-slate-400'
+                                  }`}
+                                >
+                                  1 Extra Life
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setTradeWantType('SCORE')}
+                                  className={`py-1.5 px-2 rounded border font-mono-tabular text-[11px] font-semibold cursor-pointer ${
+                                    tradeWantType === 'SCORE'
+                                      ? 'bg-amber-500/20 border-amber-400 text-amber-200'
+                                      : 'bg-[#080B10] border-slate-700 text-slate-400'
+                                  }`}
+                                >
+                                  Score Points
+                                </button>
+                              </div>
+                              {tradeWantType === 'SCORE' && (
+                                <select
+                                  value={tradeWantScore}
+                                  onChange={(e) => setTradeWantScore(Number(e.target.value))}
+                                  className="w-full px-2.5 py-1.5 rounded bg-[#080B10] border border-slate-700 text-amber-300 font-mono-tabular text-xs"
+                                >
+                                  <option value={250}>250 PTS</option>
+                                  <option value={500}>500 PTS</option>
+                                  <option value={1000}>1,000 PTS</option>
+                                  <option value={2000}>2,000 PTS</option>
+                                </select>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="flex items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleSendTradeOffer(
+                                  activeTarget.id,
+                                  activeTarget.name,
+                                  tradeGiveType,
+                                  tradeGiveType === 'LIFE' ? 1 : tradeGiveScore,
+                                  tradeWantType,
+                                  tradeWantType === 'LIFE' ? 1 : tradeWantScore
+                                )
+                              }
+                              className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-mono-tabular font-bold text-xs cursor-pointer transition-colors"
+                            >
+                              Send Trade Offer
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
               </div>
             </div>
           </div>

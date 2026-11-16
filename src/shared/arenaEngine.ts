@@ -5,6 +5,7 @@ import {
   ExtraLifeSaveEvent,
   GRID_SIZE,
   KillEvent,
+  LifeTradeOffer,
   LOOT_BOX_ABILITY_POOL,
   LootBoxAbility,
   LootBoxItem,
@@ -333,6 +334,64 @@ export class ArenaEngine {
       }
     }
     return null;
+  }
+
+  public giveExtraLife(fromId: string, toId: string): { ok: boolean; reason?: string } {
+    const from = this.snakes.get(fromId);
+    const to = this.snakes.get(toId);
+    if (!from || !from.alive) return { ok: false, reason: 'Your snake must be alive.' };
+    if (!to || !to.alive) return { ok: false, reason: 'Target player is not alive.' };
+    if (from.id === to.id) return { ok: false, reason: 'Cannot trade with yourself.' };
+    if ((from.extraLives || 0) < 1) return { ok: false, reason: 'No extra life available to give.' };
+
+    from.extraLives -= 1;
+    to.extraLives = (to.extraLives || 0) + 1;
+    return { ok: true };
+  }
+
+  public executeLifeTrade(offer: LifeTradeOffer): { ok: boolean; reason?: string } {
+    const from = this.snakes.get(offer.fromId);
+    const to = this.snakes.get(offer.toId);
+    if (!from || !from.alive || !to || !to.alive) {
+      return { ok: false, reason: 'Both players must be alive in the arena.' };
+    }
+    if (from.id === to.id) return { ok: false, reason: 'Cannot trade with yourself.' };
+    const giveAmt = Math.max(0, Math.floor(offer.giveAmount));
+    const wantAmt = Math.max(0, Math.floor(offer.wantAmount));
+    if (giveAmt <= 0 || wantAmt <= 0) {
+      return { ok: false, reason: 'Invalid trade amounts.' };
+    }
+
+    if (offer.giveType === 'LIFE' && (from.extraLives || 0) < giveAmt) {
+      return { ok: false, reason: `${from.name} no longer has ${giveAmt} extra life.` };
+    }
+    if (offer.giveType === 'SCORE' && from.score < giveAmt) {
+      return { ok: false, reason: `${from.name} no longer has ${giveAmt} score.` };
+    }
+    if (offer.wantType === 'LIFE' && (to.extraLives || 0) < wantAmt) {
+      return { ok: false, reason: `${to.name} no longer has ${wantAmt} extra life.` };
+    }
+    if (offer.wantType === 'SCORE' && to.score < wantAmt) {
+      return { ok: false, reason: `${to.name} no longer has ${wantAmt} score.` };
+    }
+
+    if (offer.giveType === 'LIFE') {
+      from.extraLives -= giveAmt;
+      to.extraLives = (to.extraLives || 0) + giveAmt;
+    } else {
+      from.score -= giveAmt;
+      to.score += giveAmt;
+    }
+
+    if (offer.wantType === 'LIFE') {
+      to.extraLives -= wantAmt;
+      from.extraLives = (from.extraLives || 0) + wantAmt;
+    } else {
+      to.score -= wantAmt;
+      from.score += wantAmt;
+    }
+
+    return { ok: true };
   }
 
   public setAutopilot(id: string, enabled: boolean, tier?: 'STANDARD' | 'ADMINRY') {

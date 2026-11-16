@@ -209,6 +209,107 @@ async function startServer() {
               client.send(payload);
             }
           }
+        } else if (msg.type === 'give_life') {
+          const arena = arenas.get(activeGridSize)!;
+          const res = arena.giveExtraLife(assignedPlayerId, msg.targetPlayerId);
+          const fromSnake = arena.snakes.get(assignedPlayerId);
+          const toSnake = arena.snakes.get(msg.targetPlayerId);
+          const resultPayload = JSON.stringify({
+            type: 'trade_result',
+            offerId: `give_${Date.now()}`,
+            fromId: assignedPlayerId,
+            fromName: fromSnake?.name || 'PLAYER',
+            toId: msg.targetPlayerId,
+            toName: toSnake?.name || 'PLAYER',
+            ok: res.ok,
+            accepted: true,
+            summary: res.ok
+              ? `${fromSnake?.name || 'Player'} gave 1 Extra Life to ${toSnake?.name || 'Player'}!`
+              : res.reason || 'Transfer failed.',
+          } satisfies ServerToClientMessage);
+          const statePayload = res.ok
+            ? JSON.stringify({
+                type: 'state',
+                state: packSnapshot(arena.getSnapshot()),
+              } satisfies ServerToClientMessage)
+            : null;
+          for (const [client, info] of clientPlayers.entries()) {
+            if (
+              client.readyState === WebSocket.OPEN &&
+              info.gridSize === activeGridSize &&
+              (info.id === assignedPlayerId || info.id === msg.targetPlayerId)
+            ) {
+              if (statePayload) client.send(statePayload);
+              client.send(resultPayload);
+            }
+          }
+        } else if (msg.type === 'trade_offer') {
+          const arena = arenas.get(activeGridSize)!;
+          const fromSnake = arena.snakes.get(assignedPlayerId);
+          const sanitizedOffer = {
+            ...msg.offer,
+            fromId: assignedPlayerId,
+            fromName: fromSnake?.name || msg.offer.fromName,
+          };
+          const payload = JSON.stringify({
+            type: 'trade_offer',
+            offer: sanitizedOffer,
+          } satisfies ServerToClientMessage);
+          for (const [client, info] of clientPlayers.entries()) {
+            if (
+              client.readyState === WebSocket.OPEN &&
+              info.gridSize === activeGridSize &&
+              info.id === sanitizedOffer.toId
+            ) {
+              client.send(payload);
+            }
+          }
+        } else if (msg.type === 'trade_response') {
+          const offer = msg.offer;
+          if (offer && offer.toId === assignedPlayerId) {
+            const arena = arenas.get(activeGridSize)!;
+            let ok = true;
+            let summary = `${offer.toName} declined the life trade.`;
+            if (msg.accepted) {
+              const res = arena.executeLifeTrade(offer);
+              ok = res.ok;
+              const giveLabel =
+                offer.giveType === 'LIFE' ? `${offer.giveAmount} Life` : `${offer.giveAmount} PTS`;
+              const wantLabel =
+                offer.wantType === 'LIFE' ? `${offer.wantAmount} Life` : `${offer.wantAmount} PTS`;
+              summary = res.ok
+                ? `Trade complete: ${offer.fromName} (${giveLabel}) ⇄ ${offer.toName} (${wantLabel})`
+                : res.reason || 'Trade failed.';
+            }
+            const resultPayload = JSON.stringify({
+              type: 'trade_result',
+              offerId: msg.offerId,
+              fromId: offer.fromId,
+              fromName: offer.fromName,
+              toId: offer.toId,
+              toName: offer.toName,
+              ok,
+              accepted: msg.accepted,
+              summary,
+            } satisfies ServerToClientMessage);
+            const statePayload =
+              msg.accepted && ok
+                ? JSON.stringify({
+                    type: 'state',
+                    state: packSnapshot(arena.getSnapshot()),
+                  } satisfies ServerToClientMessage)
+                : null;
+            for (const [client, info] of clientPlayers.entries()) {
+              if (
+                client.readyState === WebSocket.OPEN &&
+                info.gridSize === activeGridSize &&
+                (info.id === offer.fromId || info.id === offer.toId)
+              ) {
+                if (statePayload) client.send(statePayload);
+                client.send(resultPayload);
+              }
+            }
+          }
         } else if (msg.type === 'leave') {
           if (!isPlayerIdOwnedElsewhere(assignedPlayerId, activeGridSize, ws)) {
             arenas.get(activeGridSize)!.removePlayer(assignedPlayerId);
