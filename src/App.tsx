@@ -213,12 +213,14 @@ export default function App() {
         playing: boolean;
         name: string;
         colorId: string;
+        hidden: boolean;
       }
     >
   >(new Map());
   const meshCoordRef = useRef<{
     isCoordinator: boolean;
     activeCoordId: string | null;
+    activeCoordHidden: boolean;
     coordEpoch: number;
     lastAcceptedEpoch: number;
     lastAcceptedTick: number;
@@ -228,6 +230,7 @@ export default function App() {
   }>({
     isCoordinator: false,
     activeCoordId: null,
+    activeCoordHidden: false,
     coordEpoch: 0,
     lastAcceptedEpoch: 0,
     lastAcceptedTick: -1,
@@ -673,6 +676,8 @@ export default function App() {
   useEffect(() => {
     let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
     let tickTimeout: ReturnType<typeof setTimeout> | null = null;
+    let tickWorker: Worker | null = null;
+    let tickWorkerUrl: string | null = null;
     let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
     let isUnmounted = false;
     const meshTopic = getMeshTopic(serverGridSize);
@@ -683,13 +688,17 @@ export default function App() {
     meshCoordRef.current = {
       isCoordinator: false,
       activeCoordId: null,
+      activeCoordHidden: false,
       coordEpoch: 0,
       lastAcceptedEpoch: 0,
       lastAcceptedTick: -1,
       lastCoordMsgAt: 0,
       needsHydrateBeforeStep: false,
-      readyToLeadAt: performance.now() + 1250,
+      readyToLeadAt: performance.now() + 900,
     };
+
+    const isSelfHidden = (): boolean =>
+      typeof document !== 'undefined' ? Boolean(document.hidden) : false;
 
     const publishMeshPacket = (packet: Record<string, unknown>) => {
       const serialized = JSON.stringify(packet);
@@ -714,19 +723,36 @@ export default function App() {
       // Wait for initial discovery window so we never collide with an active room host
       if (now < mc.readyToLeadAt) return false;
 
-      // Never hijack while an active coordinator has sent state recently (< 4500ms)
-      if (mc.activeCoordId && now - mc.lastCoordMsgAt < 4500) {
+      const amHidden = isSelfHidden();
+      const coordSilentMs = now - mc.lastCoordMsgAt;
+      // Treat any coordinator that is backgrounded while we are foregrounded (or silent > 420ms, i.e. 1Hz-throttled) as degraded
+      const coordHealthy =
+        Boolean(mc.activeCoordId) &&
+        coordSilentMs <= Math.max(420, TICK_MS * 3) &&
+        (!mc.activeCoordHidden || amHidden);
+
+      if (coordHealthy) {
         return false;
       }
 
-      // Deterministic clock-independent tie-break: smallest alive peer ID steps up
+      // Deterministic tie-break: visible foreground peers strictly outrank hidden background peers,
+      // then smallest alive peer ID steps up
       const myId = playerIdRef.current;
+      let anyVisiblePeer = false;
       for (const [pid, info] of activePeersRef.current.entries()) {
         if (pid === myId) continue;
         if (now - info.lastSeen > 5000) continue;
-        if (pid < myId) {
+        if (!info.hidden) {
+          anyVisiblePeer = true;
+          if (amHidden) return false;
+          if (pid < myId) return false;
+        } else if (amHidden && !anyVisiblePeer && pid < myId) {
           return false;
         }
+      }
+      // If we are hidden and still see a non-expired coordinator within 4.5s, don't fight it
+      if (amHidden && mc.activeCoordId && coordSilentMs < 4500) {
+        return false;
       }
       return true;
     };
@@ -781,11 +807,14 @@ export default function App() {
 
       const now = performance.now();
       const existingPeer = activePeersRef.current.get(senderId);
+      const remoteHidden =
+        typeof data.hidden === 'boolean' ? data.hidden : existingPeer?.hidden ?? false;
       activePeersRef.current.set(senderId, {
         lastSeen: now,
         playing: typeof data.playing === 'boolean' ? data.playing : existingPeer?.playing ?? false,
         name: typeof data.name === 'string' ? data.name : existingPeer?.name ?? 'PLAYER',
         colorId: typeof data.colorId === 'string' ? data.colorId : existingPeer?.colorId ?? 'cyan',
+        hidden: remoteHidden,
       });
 
       const mc = meshCoordRef.current;
@@ -794,15 +823,17 @@ export default function App() {
         const remoteEpoch = Number(data.epoch) || 1;
         const remoteSnap = unpackSnapshot(data.state as ArenaSnapshot | PackedArenaSnapshot);
 
-        // If we thought we were coordinator, yield cleanly to higher epoch, higher tick, or lower ID
+        // If we thought we were coordinator, yield cleanly to visible peers when hidden, higher epoch, higher tick, or lower ID
         if (mc.isCoordinator) {
           const ourTick = localEngineRef.current.tick;
+          const amHidden = isSelfHidden();
           const remoteWins =
+            (amHidden && !remoteHidden && remoteEpoch >= mc.coordEpoch) ||
             remoteEpoch > mc.coordEpoch ||
             (remoteEpoch === mc.coordEpoch && remoteSnap.tick > ourTick + 1) ||
             (remoteEpoch === mc.coordEpoch &&
               Math.abs(remoteSnap.tick - ourTick) <= 1 &&
-              senderId < myId);
+              (amHidden === remoteHidden ? senderId < myId : !remoteHidden));
           if (!remoteWins) {
             return;
           }
@@ -817,17 +848,19 @@ export default function App() {
           return;
         }
 
-        // Ignore rogue weaker sender while active coordinator is healthy
+        // Ignore rogue weaker sender while active coordinator is healthy & visible
         if (
           mc.activeCoordId &&
           senderId !== mc.activeCoordId &&
           remoteEpoch === mc.lastAcceptedEpoch &&
-          now - mc.lastCoordMsgAt < 3500
+          now - mc.lastCoordMsgAt < Math.max(420, TICK_MS * 3) &&
+          !mc.activeCoordHidden
         ) {
           return;
         }
 
         mc.activeCoordId = senderId;
+        mc.activeCoordHidden = remoteHidden;
         mc.coordEpoch = remoteEpoch;
         mc.lastAcceptedEpoch = remoteEpoch;
         mc.lastAcceptedTick = remoteSnap.tick;
@@ -855,10 +888,12 @@ export default function App() {
           }
           mc.isCoordinator = true;
           mc.activeCoordId = myId;
-          mc.coordEpoch = mc.lastAcceptedEpoch + 1;
+          mc.activeCoordHidden = isSelfHidden();
+          mc.coordEpoch = Math.max(mc.coordEpoch, mc.lastAcceptedEpoch) + 1;
           mc.lastCoordMsgAt = now;
         } else {
           mc.activeCoordId = typeof data.nextCoordId === 'string' ? data.nextCoordId : null;
+          mc.activeCoordHidden = false;
           mc.lastCoordMsgAt = now;
         }
       } else if (data.type === 'mesh_cmd' && data.cmd && localEngineRef.current) {
@@ -1063,11 +1098,18 @@ export default function App() {
       if (!mc.isCoordinator || !localEngineRef.current) return;
       const now = performance.now();
       let nextCoordId: string | null = null;
+      let nextCoordIsVisible = false;
       for (const [pid, info] of activePeersRef.current.entries()) {
         if (pid === playerIdRef.current) continue;
         if (now - info.lastSeen > 5000) continue;
-        if (!nextCoordId || pid < nextCoordId) {
+        const peerVisible = !info.hidden;
+        if (
+          !nextCoordId ||
+          (peerVisible && !nextCoordIsVisible) ||
+          (peerVisible === nextCoordIsVisible && pid < nextCoordId)
+        ) {
           nextCoordId = pid;
+          nextCoordIsVisible = peerVisible;
         }
       }
       if (nextCoordId) {
@@ -1078,6 +1120,8 @@ export default function App() {
           epoch: mc.coordEpoch,
           state: packSnapshot(snapshotRef.current || localEngineRef.current.getSnapshot()),
         });
+        mc.activeCoordId = nextCoordId;
+        mc.activeCoordHidden = !nextCoordIsVisible;
       }
       mc.isCoordinator = false;
     };
@@ -1142,6 +1186,7 @@ export default function App() {
               playing: myJoinInfoRef.current.playing,
               name: myJoinInfoRef.current.name,
               colorId: myJoinInfoRef.current.colorId,
+              hidden: isSelfHidden(),
             });
           });
 
@@ -1176,6 +1221,7 @@ export default function App() {
             playing: myJoinInfoRef.current.playing,
             name: myJoinInfoRef.current.name,
             colorId: myJoinInfoRef.current.colorId,
+            hidden: isSelfHidden(),
           });
         }
 
@@ -1188,20 +1234,25 @@ export default function App() {
             }
           }
         }
-      }, 1500);
+      }, 900);
 
       // Drift-compensated Authoritative Room Coordinator step loop
-      let nextTickAt = performance.now() + TICK_MS;
-      const runMeshTick = () => {
+      let lastTickExecutedAt = 0;
+      const executeMeshTick = () => {
         if (isUnmounted) return;
         const now = performance.now();
+        if (now - lastTickExecutedAt < TICK_MS * 0.65) {
+          return;
+        }
+        lastTickExecutedAt = now;
         const mc = meshCoordRef.current;
 
         if (canBecomeCoordinator(now)) {
           if (!mc.isCoordinator) {
             mc.isCoordinator = true;
             mc.activeCoordId = playerIdRef.current;
-            mc.coordEpoch = Math.max(1, mc.lastAcceptedEpoch + 1);
+            mc.activeCoordHidden = isSelfHidden();
+            mc.coordEpoch = Math.max(1, mc.coordEpoch + 1, mc.lastAcceptedEpoch + 1);
             if (mc.needsHydrateBeforeStep && snapshotRef.current) {
               engine.hydrateFromSnapshot(snapshotRef.current);
               mc.needsHydrateBeforeStep = false;
@@ -1230,6 +1281,7 @@ export default function App() {
           mc.lastAcceptedEpoch = mc.coordEpoch;
           mc.lastAcceptedTick = snap.tick;
           mc.lastCoordMsgAt = now;
+          mc.activeCoordHidden = isSelfHidden();
 
           snapshotRef.current = snap;
           lastSnapshotTimeRef.current = now;
@@ -1239,20 +1291,87 @@ export default function App() {
             type: 'mesh_state',
             senderId: playerIdRef.current,
             epoch: mc.coordEpoch,
+            hidden: mc.activeCoordHidden,
             state: packSnapshot(snap),
           });
         }
-
-        nextTickAt += TICK_MS;
-        if (nextTickAt < now - TICK_MS) {
-          nextTickAt = now + TICK_MS;
-        }
-        tickTimeout = setTimeout(runMeshTick, Math.max(1, nextTickAt - performance.now()));
       };
-      tickTimeout = setTimeout(runMeshTick, TICK_MS);
+
+      // Use a dedicated Web Worker timer so browser background/occlusion throttling never clamps ticks to 1/sec
+      let workerStarted = false;
+      try {
+        const workerSrc = `
+          let running = false;
+          let timer = null;
+          let nextAt = 0;
+          let stepMs = ${TICK_MS};
+          function loop() {
+            if (!running) return;
+            const now = performance.now();
+            self.postMessage('tick');
+            nextAt += stepMs;
+            if (nextAt < now - stepMs) nextAt = now + stepMs;
+            timer = setTimeout(loop, Math.max(1, nextAt - performance.now()));
+          }
+          self.onmessage = function(e) {
+            if (e.data === 'stop') {
+              running = false;
+              if (timer !== null) { clearTimeout(timer); timer = null; }
+            } else if (typeof e.data === 'number') {
+              stepMs = e.data;
+              running = true;
+              if (timer !== null) clearTimeout(timer);
+              nextAt = performance.now() + stepMs;
+              timer = setTimeout(loop, stepMs);
+            }
+          };
+        `;
+        const blob = new Blob([workerSrc], { type: 'application/javascript' });
+        tickWorkerUrl = URL.createObjectURL(blob);
+        tickWorker = new Worker(tickWorkerUrl);
+        tickWorker.onmessage = () => {
+          executeMeshTick();
+        };
+        tickWorker.postMessage(TICK_MS);
+        workerStarted = true;
+      } catch {
+        workerStarted = false;
+      }
+
+      if (!workerStarted) {
+        let nextTickAt = performance.now() + TICK_MS;
+        const runMeshTickFallback = () => {
+          if (isUnmounted) return;
+          executeMeshTick();
+          const now = performance.now();
+          nextTickAt += TICK_MS;
+          if (nextTickAt < now - TICK_MS) {
+            nextTickAt = now + TICK_MS;
+          }
+          tickTimeout = setTimeout(runMeshTickFallback, Math.max(1, nextTickAt - performance.now()));
+        };
+        tickTimeout = setTimeout(runMeshTickFallback, TICK_MS);
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (!localEngineRef.current) return;
+      if (typeof document !== 'undefined' && document.hidden) {
+        sendCoordinatorHandoff();
+      } else {
+        publishMeshPacket({
+          type: 'mesh_heartbeat',
+          senderId: playerIdRef.current,
+          playing: myJoinInfoRef.current.playing,
+          name: myJoinInfoRef.current.name,
+          colorId: myJoinInfoRef.current.colorId,
+          hidden: false,
+        });
+      }
     };
 
     window.addEventListener('pagehide', sendCoordinatorHandoff);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     let activeTickSeenOnWs = -1;
 
@@ -1345,9 +1464,25 @@ export default function App() {
     return () => {
       isUnmounted = true;
       window.removeEventListener('pagehide', sendCoordinatorHandoff);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       sendCoordinatorHandoff();
       if (fallbackTimer) clearTimeout(fallbackTimer);
       if (tickTimeout) clearTimeout(tickTimeout);
+      if (tickWorker) {
+        try {
+          tickWorker.postMessage('stop');
+          tickWorker.terminate();
+        } catch {
+          // ignore
+        }
+      }
+      if (tickWorkerUrl) {
+        try {
+          URL.revokeObjectURL(tickWorkerUrl);
+        } catch {
+          // ignore
+        }
+      }
       if (heartbeatInterval) clearInterval(heartbeatInterval);
       if (wsRef.current) {
         try {
