@@ -140,7 +140,7 @@ async function startServer() {
             state: packSnapshot(arena.getSnapshot()),
           });
         } else if (msg.type === 'turn') {
-          arenas.get(activeGridSize)!.queueTurn(assignedPlayerId, msg.dir);
+          arenas.get(activeGridSize)!.queueTurn(assignedPlayerId, msg.dir, msg.seq);
         } else if (msg.type === 'autopilot') {
           arenas
             .get(activeGridSize)!

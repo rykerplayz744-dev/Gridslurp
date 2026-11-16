@@ -143,6 +143,12 @@ export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
     if (s.killedByName) {
       packed.kb = s.killedByName;
     }
+    if (s.nextDirs && s.nextDirs.length > 0) {
+      packed.nd = s.nextDirs.map((d) => Math.max(0, DIRS.indexOf(d)));
+    }
+    if (typeof s.lastTurnSeq === 'number') {
+      packed.ts = s.lastTurnSeq;
+    }
     return packed;
   });
 
@@ -222,7 +228,8 @@ export function unpackSnapshot(
       segments,
       prevSegments: [{ x: ps.px, y: ps.py }],
       dir: DIRS[ps.d] || 'RIGHT',
-      nextDirs: [],
+      nextDirs: Array.isArray(ps.nd) ? ps.nd.map((idx) => DIRS[idx] || 'RIGHT') : [],
+      lastTurnSeq: ps.ts,
       score: ps.s,
       kills: ps.k,
       pelletsSlurped: ps.p,

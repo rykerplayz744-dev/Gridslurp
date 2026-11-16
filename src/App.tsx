@@ -1,11 +1,6 @@
 import mqtt, { MqttClient } from 'mqtt';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  ArenaEngine,
-  isInsideGrid,
-  isOppositeDirection,
-  stepPoint,
-} from './shared/arenaEngine';
+import { ArenaEngine } from './shared/arenaEngine';
 import {
   ArenaSnapshot,
   ClientToServerMessage,
@@ -248,7 +243,8 @@ export default function App() {
   const spectatedSnakeIdRef = useRef<string | null>(null);
   const zoomIn16Ref = useRef<boolean>(zoomIn16);
   const camRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
-  const predictedTurnsRef = useRef<Array<{ dir: Direction; sentAt: number; baseTick: number }>>([]);
+  const predictedTurnsRef = useRef<Array<{ dir: Direction; seq: number; sentAt: number }>>([]);
+  const turnSeqRef = useRef<number>(0);
   const lastHudReactSyncRef = useRef<number>(0);
   const lastHudSigRef = useRef<string>('');
 
@@ -481,15 +477,16 @@ export default function App() {
         triggerAutoPilotRespawnRef.current();
       }
 
-      // Reconcile optimistic client turn queue with authoritative snapshot
+      // Reconcile in-flight client turn queue using authoritative server sequence acknowledgments
       if (!me || !me.alive || me.autoPilot) {
         predictedTurnsRef.current = [];
       } else if (predictedTurnsRef.current.length > 0) {
         while (predictedTurnsRef.current.length > 0) {
           const front = predictedTurnsRef.current[0];
-          const confirmedByDir = snap.tick > front.baseTick && front.dir === me.dir;
-          const staleTurn = snap.tick > front.baseTick + 2 || nowMs - front.sentAt > 450;
-          if (confirmedByDir || staleTurn) {
+          const ackedBySeq =
+            typeof me.lastTurnSeq === 'number' && front.seq <= me.lastTurnSeq;
+          const staleTurn = nowMs - front.sentAt > 1500;
+          if (ackedBySeq || staleTurn) {
             predictedTurnsRef.current.shift();
           } else {
             break;
@@ -811,7 +808,7 @@ export default function App() {
             cmd.autoPilotTier
           );
         } else if (cmd.type === 'turn') {
-          engine.queueTurn(targetId, cmd.dir);
+          engine.queueTurn(targetId, cmd.dir, cmd.seq);
         } else if (cmd.type === 'autopilot') {
           engine.setAutopilot(targetId, Boolean(cmd.enabled), cmd.tier);
         } else if (cmd.type === 'leave') {
@@ -1146,7 +1143,7 @@ export default function App() {
           );
           snapshotRef.current = engine.getSnapshot();
         } else if (msg.type === 'turn') {
-          engine.queueTurn(pid, msg.dir);
+          engine.queueTurn(pid, msg.dir, msg.seq);
         } else if (msg.type === 'autopilot') {
           engine.setAutopilot(pid, Boolean(msg.enabled), msg.tier);
         } else if (msg.type === 'kick_admin') {
@@ -1471,6 +1468,7 @@ export default function App() {
     lastSentAutoPilotRef.current = false;
     autoPilotActiveRef.current = false;
     setAutoPilotActive(false);
+    predictedTurnsRef.current = [];
     sendCommand({
       type: 'join',
       name: cleanName,
@@ -1536,33 +1534,30 @@ export default function App() {
       const snap = snapshotRef.current;
       const me = snap?.snakes.find((s) => s.id === playerIdRef.current && s.alive);
       const pending = predictedTurnsRef.current;
+      const plannedQueue: Direction[] = [
+        ...(me?.nextDirs ?? []),
+        ...pending.map((p) => p.dir),
+      ];
       const lastPlannedDir =
-        pending.length > 0
-          ? pending[pending.length - 1].dir
-          : me?.nextDirs && me.nextDirs.length > 0
-            ? me.nextDirs[me.nextDirs.length - 1]
-            : me?.dir;
+        plannedQueue.length > 0 ? plannedQueue[plannedQueue.length - 1] : me?.dir;
 
-      if (
-        lastPlannedDir &&
-        (requestedDir === lastPlannedDir || isOppositeDirection(requestedDir, lastPlannedDir))
-      ) {
+      if (lastPlannedDir && requestedDir === lastPlannedDir) {
         return;
       }
 
-      const turnEntry = {
-        dir: requestedDir,
-        sentAt: performance.now(),
-        baseTick: snap?.tick ?? 0,
-      };
-      if (pending.length < 2) {
-        pending.push(turnEntry);
-      } else {
-        pending[1] = turnEntry;
+      if (plannedQueue.length >= 4) {
+        return;
       }
 
+      const seq = ++turnSeqRef.current;
+      pending.push({
+        dir: requestedDir,
+        seq,
+        sentAt: performance.now(),
+      });
+
       soundEngine.playTurnBlip();
-      sendCommand({ type: 'turn', dir: requestedDir });
+      sendCommand({ type: 'turn', dir: requestedDir, seq });
     },
     [sendCommand, stopAutoPilot]
   );
@@ -1828,49 +1823,16 @@ export default function App() {
       const rawMe = snap?.snakes.find((s) => s.id === myId && s.alive);
       let projectedMe = rawMe;
 
-      // Immediate client-side turn & optimistic sub-tick projection so key presses respond in <16ms
+      // Show crisp queued head orientation immediately without unconfirmed segment jumps that snap back
       if (rawMe && gameStateRef.current === 'PLAYING' && !rawMe.autoPilot && !autoPilotActiveRef.current) {
         const pending = predictedTurnsRef.current;
-        const elapsedSinceSnap = Math.max(0, now - lastSnapshotTimeRef.current);
-        const immediateDir =
-          pending.length > 0 && !isOppositeDirection(pending[0].dir, rawMe.dir)
-            ? pending[0].dir
-            : rawMe.dir;
+        const plannedQueue: Direction[] = [
+          ...(rawMe.nextDirs ?? []),
+          ...pending.map((p) => p.dir),
+        ];
+        const immediateDir = plannedQueue.length > 0 ? plannedQueue[0] : rawMe.dir;
 
-        const stepsAhead =
-          elapsedSinceSnap >= TICK_MS * 0.85
-            ? Math.min(2, Math.floor((elapsedSinceSnap + TICK_MS * 0.15) / TICK_MS))
-            : 0;
-
-        if (stepsAhead > 0) {
-          let simSegs = rawMe.segments.map((pt) => ({ x: pt.x, y: pt.y }));
-          let simPrevHead = rawMe.prevSegments?.[0] ? { ...rawMe.prevSegments[0] } : { ...simSegs[0] };
-          let simDir = rawMe.dir;
-          const turnQueue = pending.map((t) => t.dir);
-          for (let s = 0; s < stepsAhead; s++) {
-            const nextTurn = turnQueue.shift();
-            if (nextTurn && !isOppositeDirection(nextTurn, simDir)) {
-              simDir = nextTurn;
-            }
-            const nextHead = stepPoint(simSegs[0], simDir);
-            if (!isInsideGrid(nextHead, activeGridSize)) {
-              break;
-            }
-            simPrevHead = { ...simSegs[0] };
-            simSegs.unshift(nextHead);
-            simSegs.pop();
-          }
-          const finalDir =
-            turnQueue.length > 0 && !isOppositeDirection(turnQueue[0], simDir)
-              ? turnQueue[0]
-              : simDir;
-          projectedMe = {
-            ...rawMe,
-            segments: simSegs,
-            prevSegments: [simPrevHead],
-            dir: finalDir,
-          };
-        } else if (immediateDir !== rawMe.dir) {
+        if (immediateDir !== rawMe.dir) {
           projectedMe = {
             ...rawMe,
             dir: immediateDir,
@@ -1916,9 +1878,9 @@ export default function App() {
           }
         }
 
-        // Sub-tick interpolation factor (0.0 -> 1.0 over TICK_MS) eliminates grid-step jolts
+        // Sub-tick interpolation factor (0.0 -> 1.0 over TICK_MS) eliminates grid-step jolts without wrap-around snaps
         const elapsedFromSnap = Math.max(0, now - lastSnapshotTimeRef.current);
-        const tickAlpha = Math.min(1, (elapsedFromSnap % TICK_MS) / TICK_MS);
+        const tickAlpha = Math.min(1, elapsedFromSnap / TICK_MS);
 
         let focusX = activeGridSize * 0.5;
         let focusY = activeGridSize * 0.5;

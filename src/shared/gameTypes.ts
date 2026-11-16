@@ -1,6 +1,6 @@
 export const GRID_SIZE = 32;
-export const TICK_MS = 120; // ~8.33 ticks/sec for crisp, responsive grid movement
-export const SPAWN_PROTECTION_TICKS = 28; // ~3.36 seconds fail-safe spawn protection timer
+export const TICK_MS = 135; // ~7.41 ticks/sec for responsive, controllable grid movement
+export const SPAWN_PROTECTION_TICKS = 28; // ~3.78 seconds fail-safe spawn protection timer
 
 export type Direction = 'UP' | 'DOWN' | 'LEFT' | 'RIGHT';
 
@@ -100,7 +100,8 @@ export interface SnakeEntity {
   segments: Point[]; // segments[0] is head
   prevSegments: Point[]; // for smooth sub-tick visual interpolation
   dir: Direction;
-  nextDirs: Direction[]; // 2-step turn buffer
+  nextDirs: Direction[]; // up to 4-step turn buffer
+  lastTurnSeq?: number; // latest client turn sequence acknowledged by server
   score: number;
   kills: number;
   pelletsSlurped: number;
@@ -167,6 +168,8 @@ export interface PackedSnake {
   px: number; // prevHead.x
   py: number; // prevHead.y
   g: string; // compact RLE/step-encoded segments string
+  nd?: number[]; // queued nextDirs indices (0..3)
+  ts?: number; // last acknowledged turn sequence
 }
 
 export type PackedPellet = [
@@ -240,7 +243,7 @@ export type ClientToServerMessage =
       autoPilot?: boolean;
       autoPilotTier?: 'STANDARD' | 'ADMINRY';
     }
-  | { type: 'turn'; dir: Direction }
+  | { type: 'turn'; dir: Direction; seq?: number }
   | {
       type: 'respawn';
       name: string;

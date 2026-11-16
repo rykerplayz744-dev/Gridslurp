@@ -300,9 +300,13 @@ export class ArenaEngine {
     }
   }
 
-  public queueTurn(id: string, requestedDir: Direction) {
+  public queueTurn(id: string, requestedDir: Direction, seq?: number) {
     const snake = this.snakes.get(id);
     if (!snake || !snake.alive) return;
+
+    if (typeof seq === 'number') {
+      snake.lastTurnSeq = seq;
+    }
 
     if (snake.autoPilot) {
       snake.autoPilot = false;
@@ -313,17 +317,12 @@ export class ArenaEngine {
     const lastScheduledDir =
       snake.nextDirs.length > 0 ? snake.nextDirs[snake.nextDirs.length - 1] : snake.dir;
 
-    if (
-      requestedDir === lastScheduledDir ||
-      isOppositeDirection(requestedDir, lastScheduledDir)
-    ) {
+    if (requestedDir === lastScheduledDir) {
       return;
     }
 
-    if (snake.nextDirs.length < 2) {
+    if (snake.nextDirs.length < 4) {
       snake.nextDirs.push(requestedDir);
-    } else {
-      snake.nextDirs[1] = requestedDir;
     }
   }
 
@@ -925,10 +924,7 @@ export class ArenaEngine {
           snake.dir = chosen;
         }
       } else if (snake.nextDirs.length > 0) {
-        const nextDir = snake.nextDirs.shift()!;
-        if (!isOppositeDirection(nextDir, snake.dir)) {
-          snake.dir = nextDir;
-        }
+        snake.dir = snake.nextDirs.shift()!;
       }
 
       const nextHead = stepPoint(snake.segments[0], snake.dir);
