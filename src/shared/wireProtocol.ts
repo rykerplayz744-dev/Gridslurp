@@ -163,6 +163,9 @@ export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
     if (s.extraLives > 0) {
       packed.el = s.extraLives;
     }
+    if (s.faceId) {
+      packed.fId = s.faceId;
+    }
     return packed;
   });
 
@@ -277,6 +280,7 @@ export function unpackSnapshot(
       id: ps.i,
       name: ps.n,
       color: resolveColorFromCode(ps.c),
+      faceId: ps.fId || undefined,
       segments,
       prevSegments: [{ x: ps.px, y: ps.py }],
       dir: DIRS[ps.d] || 'RIGHT',

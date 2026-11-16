@@ -197,7 +197,8 @@ async function startServer() {
             msg.name,
             msg.colorId,
             Boolean(msg.autoPilot),
-            msg.autoPilotTier
+            msg.autoPilotTier,
+            msg.faceId
           );
           sendMsg({
             type: 'welcome',
@@ -210,6 +211,8 @@ async function startServer() {
           arenas
             .get(activeGridSize)
             ?.setAutopilot(assignedPlayerId, Boolean(msg.enabled), msg.tier);
+        } else if (msg.type === 'set_face') {
+          arenas.get(activeGridSize)?.setPlayerFace(assignedPlayerId, msg.faceId);
         } else if (msg.type === 'respawn') {
           if (msg.gridSize === 64 || msg.gridSize === 32) {
             if (msg.gridSize !== activeGridSize) {
@@ -228,7 +231,8 @@ async function startServer() {
             msg.name,
             msg.colorId,
             Boolean(msg.autoPilot),
-            msg.autoPilotTier
+            msg.autoPilotTier,
+            msg.faceId
           );
           sendMsg({
             type: 'state',

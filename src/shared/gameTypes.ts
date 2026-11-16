@@ -151,6 +151,7 @@ export interface SnakeEntity {
   id: string;
   name: string;
   color: SnakeColor;
+  faceId?: string;
   segments: Point[]; // segments[0] is head
   prevSegments: Point[]; // for smooth sub-tick visual interpolation
   dir: Direction;
@@ -229,6 +230,7 @@ export interface PackedSnake {
   nd?: number[]; // queued nextDirs indices (0..3)
   ts?: number; // last acknowledged turn sequence
   el?: number; // extraLives count when > 0
+  fId?: string; // custom PNG face id from src/faces/
 }
 
 export type PackedPellet = [
@@ -341,6 +343,7 @@ export type ClientToServerMessage =
       type: 'join';
       name: string;
       colorId: string;
+      faceId?: string;
       clientId: string;
       gridSize?: ServerGridSize;
       autoPilot?: boolean;
@@ -351,10 +354,12 @@ export type ClientToServerMessage =
       type: 'respawn';
       name: string;
       colorId: string;
+      faceId?: string;
       gridSize?: ServerGridSize;
       autoPilot?: boolean;
       autoPilotTier?: 'STANDARD' | 'ADMINRY';
     }
+  | { type: 'set_face'; faceId?: string }
   | { type: 'select_server'; gridSize: ServerGridSize }
   | { type: 'autopilot'; enabled: boolean; tier?: 'STANDARD' | 'ADMINRY' }
   | { type: 'admin_track'; trackId: string }

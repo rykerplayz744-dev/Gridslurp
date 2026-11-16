@@ -16,6 +16,13 @@ import {
 } from './shared/gameTypes';
 import { packSnapshot, unpackSnapshot } from './shared/wireProtocol';
 import {
+  DISCOVERED_SNAKE_FACES,
+  getFaceById,
+  getFaceImage,
+  loadSelectedFaceId,
+  saveSelectedFaceId,
+} from './utils/faceManager';
+import {
   ADMIN_AUDIO_TRACKS,
   DISCOVERED_AUDIO_TRACKS,
   loadPlaylistStore,
@@ -83,6 +90,7 @@ export default function App() {
   });
   const [playerName, setPlayerName] = useState<string>('VIPER_01');
   const [selectedColorId, setSelectedColorId] = useState<string>('emerald');
+  const [selectedFaceId, setSelectedFaceId] = useState<string>(() => loadSelectedFaceId());
   const [muted, setMuted] = useState<boolean>(soundEngine.muted);
   const [, setConnectionMode] = useState<'ws' | 'local-sync'>('ws');
   const [showAdminModal, setShowAdminModal] = useState<boolean>(false);
@@ -139,6 +147,7 @@ export default function App() {
   const isSuperAdminRyRef = useRef<boolean>(isSuperAdminRy);
   const playerNameRef = useRef<string>(playerName);
   const selectedColorIdRef = useRef<string>(selectedColorId);
+  const selectedFaceIdRef = useRef<string>(selectedFaceId);
   const lastAutoRespawnAtRef = useRef<number>(0);
   const triggerAutoPilotRespawnRef = useRef<() => void>(() => {});
 
@@ -239,9 +248,10 @@ export default function App() {
     readyToLeadAt: 0,
   });
   const lastAutoJoinSentAtRef = useRef<number>(0);
-  const myJoinInfoRef = useRef<{ name: string; colorId: string; playing: boolean }>({
+  const myJoinInfoRef = useRef<{ name: string; colorId: string; faceId?: string; playing: boolean }>({
     name: 'VIPER_01',
     colorId: 'emerald',
+    faceId: undefined,
     playing: false,
   });
 
@@ -793,6 +803,7 @@ export default function App() {
             clientId: myId,
             name: myJoinInfoRef.current.name,
             colorId: myJoinInfoRef.current.colorId,
+            faceId: myJoinInfoRef.current.faceId,
             gridSize: serverGridSize,
           },
         });
@@ -934,7 +945,8 @@ export default function App() {
               cmd.name,
               cmd.colorId,
               Boolean(cmd.autoPilot),
-              cmd.autoPilotTier
+              cmd.autoPilotTier,
+              cmd.faceId
             );
           }
         } else if (cmd.type === 'respawn') {
@@ -943,8 +955,11 @@ export default function App() {
             cmd.name,
             cmd.colorId,
             Boolean(cmd.autoPilot),
-            cmd.autoPilotTier
+            cmd.autoPilotTier,
+            cmd.faceId
           );
+        } else if (cmd.type === 'set_face') {
+          engine.setPlayerFace(targetId, cmd.faceId);
         } else if (cmd.type === 'turn') {
           engine.queueTurn(targetId, cmd.dir, cmd.seq);
         } else if (cmd.type === 'autopilot') {
@@ -1266,7 +1281,10 @@ export default function App() {
               engine.spawnPlayer(
                 playerIdRef.current,
                 myJoinInfoRef.current.name,
-                myJoinInfoRef.current.colorId
+                myJoinInfoRef.current.colorId,
+                false,
+                undefined,
+                myJoinInfoRef.current.faceId
               );
             }
           }
@@ -1516,8 +1534,11 @@ export default function App() {
         myJoinInfoRef.current = {
           name: msg.name,
           colorId: msg.colorId,
+          faceId: msg.faceId,
           playing: true,
         };
+      } else if (msg.type === 'set_face') {
+        myJoinInfoRef.current.faceId = msg.faceId;
       } else if (msg.type === 'leave') {
         myJoinInfoRef.current.playing = false;
       }
@@ -1538,8 +1559,12 @@ export default function App() {
             msg.name,
             msg.colorId,
             Boolean(msg.autoPilot),
-            msg.autoPilotTier
+            msg.autoPilotTier,
+            msg.faceId
           );
+          snapshotRef.current = engine.getSnapshot();
+        } else if (msg.type === 'set_face') {
+          engine.setPlayerFace(pid, msg.faceId);
           snapshotRef.current = engine.getSnapshot();
         } else if (msg.type === 'turn') {
           engine.queueTurn(pid, msg.dir, msg.seq);
@@ -2144,8 +2169,25 @@ export default function App() {
     [gameState, isAdminName, stopAutoPilot]
   );
 
+  const handleSelectFace = useCallback(
+    (faceId: string) => {
+      const normalized = faceId && faceId !== 'default' ? faceId : 'default';
+      setSelectedFaceId(normalized);
+      selectedFaceIdRef.current = normalized;
+      saveSelectedFaceId(normalized);
+      if (gameStateRef.current === 'PLAYING') {
+        sendCommand({
+          type: 'set_face',
+          faceId: normalized !== 'default' ? normalized : undefined,
+        });
+      }
+    },
+    [sendCommand]
+  );
+
   const handleStartOrRespawn = useCallback(() => {
     const cleanName = playerName.trim().toUpperCase().slice(0, 24) || 'VIPER_01';
+    const cleanFaceId = selectedFaceId !== 'default' ? selectedFaceId : undefined;
     lastAutoJoinSentAtRef.current = performance.now();
     lastSentAutoPilotRef.current = false;
     autoPilotActiveRef.current = false;
@@ -2155,12 +2197,13 @@ export default function App() {
       type: 'join',
       name: cleanName,
       colorId: selectedColorId,
+      faceId: cleanFaceId,
       clientId: playerIdRef.current,
       gridSize: serverGridSize,
     });
     setIsSpectating(false);
     setGameState('PLAYING');
-  }, [playerName, selectedColorId, serverGridSize, sendCommand]);
+  }, [playerName, selectedColorId, selectedFaceId, serverGridSize, sendCommand]);
 
   const handleToggleMute = useCallback(() => {
     const nextMuted = soundEngine.toggleMute();
@@ -2288,7 +2331,8 @@ export default function App() {
     isSuperAdminRyRef.current = isSuperAdminRy;
     playerNameRef.current = playerName;
     selectedColorIdRef.current = selectedColorId;
-  }, [isAdminName, isSuperAdminRy, playerName, selectedColorId]);
+    selectedFaceIdRef.current = selectedFaceId;
+  }, [isAdminName, isSuperAdminRy, playerName, selectedColorId, selectedFaceId]);
 
   useEffect(() => {
     triggerAutoPilotRespawnRef.current = () => {
@@ -2299,6 +2343,10 @@ export default function App() {
 
       const cleanName = playerNameRef.current.trim().toUpperCase().slice(0, 24) || 'VIPER_01';
       const tier: 'STANDARD' | 'ADMINRY' = isSuperAdminRyRef.current ? 'ADMINRY' : 'STANDARD';
+      const cleanFaceId =
+        selectedFaceIdRef.current && selectedFaceIdRef.current !== 'default'
+          ? selectedFaceIdRef.current
+          : undefined;
 
       predictedTurnsRef.current = [];
       gameStateRef.current = 'PLAYING';
@@ -2311,6 +2359,7 @@ export default function App() {
         type: 'respawn',
         name: cleanName,
         colorId: selectedColorIdRef.current,
+        faceId: cleanFaceId,
         gridSize: serverGridSize,
         autoPilot: true,
         autoPilotTier: tier,
@@ -3074,6 +3123,46 @@ export default function App() {
             ctx.fillStyle = snake.color.head;
             ctx.fillRect(headSx, headSy, socketSize, socketSize);
 
+            const customFaceImg = snake.faceId ? getFaceImage(snake.faceId) : null;
+            if (customFaceImg) {
+              const prevSmoothing = ctx.imageSmoothingEnabled;
+              ctx.imageSmoothingEnabled = customFaceImg.naturalWidth > 64;
+              ctx.drawImage(customFaceImg, headSx, headSy, socketSize, socketSize);
+              ctx.imageSmoothingEnabled = prevSmoothing;
+            } else {
+              // Directional pixel eyes on the head cell
+              ctx.fillStyle = '#080B10';
+              const eyeSize = Math.max(2, socketSize * 0.22);
+              let e1x = headSx + socketSize * 0.22;
+              let e1y = headSy + socketSize * 0.22;
+              let e2x = headSx + socketSize * 0.62;
+              let e2y = headSy + socketSize * 0.22;
+
+              if (snake.dir === 'DOWN') {
+                e1y = headSy + socketSize * 0.62;
+                e2y = headSy + socketSize * 0.62;
+              } else if (snake.dir === 'LEFT') {
+                e1x = headSx + socketSize * 0.2;
+                e1y = headSy + socketSize * 0.22;
+                e2x = headSx + socketSize * 0.2;
+                e2y = headSy + socketSize * 0.62;
+              } else if (snake.dir === 'RIGHT') {
+                e1x = headSx + socketSize * 0.64;
+                e1y = headSy + socketSize * 0.22;
+                e2x = headSx + socketSize * 0.64;
+                e2y = headSy + socketSize * 0.62;
+              }
+              ctx.fillRect(e1x, e1y, eyeSize, eyeSize);
+              ctx.fillRect(e2x, e2y, eyeSize, eyeSize);
+
+              if (isMe) {
+                ctx.fillStyle = '#FFFFFF';
+                const glint = Math.max(1, eyeSize * 0.42);
+                ctx.fillRect(e1x + eyeSize * 0.15, e1y + eyeSize * 0.15, glint, glint);
+                ctx.fillRect(e2x + eyeSize * 0.15, e2y + eyeSize * 0.15, glint, glint);
+              }
+            }
+
             if (isMe) {
               ctx.strokeStyle = '#FFFFFF';
               ctx.lineWidth = headBorderW;
@@ -3082,38 +3171,6 @@ export default function App() {
               ctx.strokeStyle = '#E0F2FE';
               ctx.lineWidth = 1.5;
               ctx.strokeRect(headSx + 1, headSy + 1, socketSize - 2, socketSize - 2);
-            }
-
-            // Directional pixel eyes on the head cell
-            ctx.fillStyle = '#080B10';
-            const eyeSize = Math.max(2, socketSize * 0.22);
-            let e1x = headSx + socketSize * 0.22;
-            let e1y = headSy + socketSize * 0.22;
-            let e2x = headSx + socketSize * 0.62;
-            let e2y = headSy + socketSize * 0.22;
-
-            if (snake.dir === 'DOWN') {
-              e1y = headSy + socketSize * 0.62;
-              e2y = headSy + socketSize * 0.62;
-            } else if (snake.dir === 'LEFT') {
-              e1x = headSx + socketSize * 0.2;
-              e1y = headSy + socketSize * 0.22;
-              e2x = headSx + socketSize * 0.2;
-              e2y = headSy + socketSize * 0.62;
-            } else if (snake.dir === 'RIGHT') {
-              e1x = headSx + socketSize * 0.64;
-              e1y = headSy + socketSize * 0.22;
-              e2x = headSx + socketSize * 0.64;
-              e2y = headSy + socketSize * 0.62;
-            }
-            ctx.fillRect(e1x, e1y, eyeSize, eyeSize);
-            ctx.fillRect(e2x, e2y, eyeSize, eyeSize);
-
-            if (isMe) {
-              ctx.fillStyle = '#FFFFFF';
-              const glint = Math.max(1, eyeSize * 0.42);
-              ctx.fillRect(e1x + eyeSize * 0.15, e1y + eyeSize * 0.15, glint, glint);
-              ctx.fillRect(e2x + eyeSize * 0.15, e2y + eyeSize * 0.15, glint, glint);
             }
           }
           ctx.globalAlpha = 1;
@@ -3711,7 +3768,7 @@ export default function App() {
         {/* TITLE SCREEN OVERLAY */}
         {gameState === 'TITLE_MENU' && !isSpectating && (
           <div className="absolute inset-0 z-30 bg-[#080B10]/80 flex items-center justify-center p-4">
-            <div className="w-full max-w-xl rounded-xl bg-[#0D131F] border border-slate-700/80 shadow-2xl p-6 sm:p-8 space-y-6">
+            <div className="w-full max-w-xl max-h-[92vh] overflow-y-auto face-tray-scroll rounded-xl bg-[#0D131F] border border-slate-700/80 shadow-2xl p-5 sm:p-7 space-y-5">
               {/* Bespoke Inline SVG Title Lockup */}
               <div className="space-y-2">
                 <div className="flex items-center gap-3">
@@ -3801,9 +3858,52 @@ export default function App() {
                 </div>
 
                 <div>
-                  <span className="block text-xs font-medium text-slate-300 mb-2">
-                    PIXEL PHOSPHOR CHANNEL
-                  </span>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="block text-xs font-medium text-slate-300">
+                      SNAKE BODY COLOR
+                    </span>
+                    {(() => {
+                      const previewBody =
+                        SNAKE_PALETTES.find((p) => p.id === selectedColorId) || SNAKE_PALETTES[0];
+                      const previewFace = getFaceById(selectedFaceId);
+                      return (
+                        <div className="flex items-center gap-1.5 text-[11px] font-mono-tabular text-slate-400">
+                          <span>MIX:</span>
+                          <div className="flex items-center gap-0.5 p-1 rounded bg-[#080B10] border border-slate-800">
+                            <span
+                              className="w-3.5 h-3.5 rounded-xs"
+                              style={{ backgroundColor: previewBody.tail }}
+                            />
+                            <span
+                              className="w-3.5 h-3.5 rounded-xs"
+                              style={{ backgroundColor: previewBody.body }}
+                            />
+                            <span
+                              className="w-3.5 h-3.5 rounded-xs"
+                              style={{ backgroundColor: previewBody.body }}
+                            />
+                            <span
+                              className="relative w-4 h-4 rounded-xs overflow-hidden flex items-center justify-center border border-white/80"
+                              style={{ backgroundColor: previewBody.head }}
+                            >
+                              {previewFace ? (
+                                <img
+                                  src={previewFace.url}
+                                  alt={previewFace.label}
+                                  className="w-full h-full object-contain [image-rendering:pixelated]"
+                                />
+                              ) : (
+                                <span className="flex flex-col gap-0.5 translate-x-0.5">
+                                  <span className="w-1 h-1 bg-[#080B10] block" />
+                                  <span className="w-1 h-1 bg-[#080B10] block" />
+                                </span>
+                              )}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
                   <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
                     {SNAKE_PALETTES.map((pal) => {
                       const active = selectedColorId === pal.id;
@@ -3839,6 +3939,80 @@ export default function App() {
                       );
                     })}
                   </div>
+                </div>
+
+                {/* Scrollable PNG Face Picker (auto-discovers *.png from src/faces/) */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="block text-xs font-medium text-slate-300">
+                      SNAKE FACE · <span className="font-mono-tabular text-emerald-400">src/faces/*.png</span>
+                    </span>
+                    <span className="text-[11px] font-mono-tabular text-slate-400">
+                      {DISCOVERED_SNAKE_FACES.length} PNG{DISCOVERED_SNAKE_FACES.length === 1 ? '' : 's'} · SCROLL
+                    </span>
+                  </div>
+                  {(() => {
+                    const activeBodyPalette =
+                      SNAKE_PALETTES.find((p) => p.id === selectedColorId) || SNAKE_PALETTES[0];
+                    return (
+                      <div className="grid grid-cols-4 sm:grid-cols-5 gap-2 h-24 overflow-y-scroll pr-1.5 p-2 rounded-lg bg-[#080B10] border border-slate-800 face-tray-scroll">
+                        <button
+                          type="button"
+                          onClick={() => handleSelectFace('default')}
+                          className={`flex flex-col items-center justify-center gap-1 p-1.5 rounded-md border transition-all cursor-pointer ${
+                            selectedFaceId === 'default'
+                              ? 'bg-slate-800/90 border-white text-white shadow-sm'
+                              : 'bg-[#0D131F] border-slate-800 text-slate-400 hover:border-slate-600'
+                          }`}
+                          title="Default pixel eyes"
+                        >
+                          <div
+                            className="w-7 h-7 rounded-xs flex items-center justify-center border border-black/30"
+                            style={{ backgroundColor: activeBodyPalette.head }}
+                          >
+                            <div className="flex flex-col gap-1 translate-x-1">
+                              <span className="w-1.5 h-1.5 bg-[#080B10] block" />
+                              <span className="w-1.5 h-1.5 bg-[#080B10] block" />
+                            </div>
+                          </div>
+                          <span className="text-[10px] truncate w-full text-center font-mono-tabular">
+                            Classic
+                          </span>
+                        </button>
+
+                        {DISCOVERED_SNAKE_FACES.map((face) => {
+                          const active = selectedFaceId === face.id;
+                          return (
+                            <button
+                              key={face.id}
+                              type="button"
+                              onClick={() => handleSelectFace(face.id)}
+                              className={`flex flex-col items-center justify-center gap-1 p-1.5 rounded-md border transition-all cursor-pointer ${
+                                active
+                                  ? 'bg-slate-800/90 border-white text-white shadow-sm'
+                                  : 'bg-[#0D131F] border-slate-800 text-slate-400 hover:border-slate-600'
+                              }`}
+                              title={`${face.filename} (src/faces/${face.id})`}
+                            >
+                              <div
+                                className="w-7 h-7 rounded-xs overflow-hidden flex items-center justify-center border border-black/30"
+                                style={{ backgroundColor: activeBodyPalette.head }}
+                              >
+                                <img
+                                  src={face.url}
+                                  alt={face.label}
+                                  className="w-full h-full object-contain [image-rendering:pixelated]"
+                                />
+                              </div>
+                              <span className="text-[10px] truncate w-full text-center font-mono-tabular">
+                                {face.label}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div>

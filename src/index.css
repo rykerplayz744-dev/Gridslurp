@@ -25,3 +25,28 @@
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
 }
+
+.face-tray-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #334155 #06090E;
+}
+
+.face-tray-scroll::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+.face-tray-scroll::-webkit-scrollbar-track {
+  background: #06090E;
+  border-radius: 9999px;
+}
+
+.face-tray-scroll::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 9999px;
+  border: 1px solid #06090E;
+}
+
+.face-tray-scroll::-webkit-scrollbar-thumb:hover {
+  background: #10B981;
+}

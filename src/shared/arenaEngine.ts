@@ -201,7 +201,8 @@ export class ArenaEngine {
     name: string,
     color: SnakeColor,
     spawn: { x: number; y: number; dir: Direction },
-    isBot: boolean
+    isBot: boolean,
+    faceId?: string
   ): SnakeEntity {
     const oppDir: Direction =
       spawn.dir === 'UP'
@@ -227,10 +228,16 @@ export class ArenaEngine {
       'FLANKER',
     ];
 
+    const cleanFaceId =
+      typeof faceId === 'string' && faceId.trim() && faceId !== 'default'
+        ? faceId.trim().slice(0, 64)
+        : undefined;
+
     return {
       id,
       name,
       color,
+      faceId: cleanFaceId,
       segments,
       prevSegments: [{ ...segments[0] }],
       dir: spawn.dir,
@@ -252,12 +259,13 @@ export class ArenaEngine {
     name: string,
     colorId: string,
     autoPilot?: boolean,
-    autoPilotTier?: 'STANDARD' | 'ADMINRY'
+    autoPilotTier?: 'STANDARD' | 'ADMINRY',
+    faceId?: string
   ): SnakeEntity {
     const cleanName = (name || 'PLAYER_1').trim().slice(0, 24).toUpperCase() || 'PLAYER_1';
     const color = this.getColorById(colorId);
     const spawn = this.findNearbySafeSpawn();
-    const snake = this.createSnakeEntity(id, cleanName, color, spawn, false);
+    const snake = this.createSnakeEntity(id, cleanName, color, spawn, false, faceId);
     if (autoPilot) {
       snake.autoPilot = true;
       snake.autoPilotTier =
@@ -265,6 +273,15 @@ export class ArenaEngine {
     }
     this.snakes.set(id, snake);
     return snake;
+  }
+
+  public setPlayerFace(id: string, faceId?: string) {
+    const snake = this.snakes.get(id);
+    if (!snake) return;
+    snake.faceId =
+      typeof faceId === 'string' && faceId.trim() && faceId !== 'default'
+        ? faceId.trim().slice(0, 64)
+        : undefined;
   }
 
   public spawnBotImmediate(anchors?: Point[]): SnakeEntity {
