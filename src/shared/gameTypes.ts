@@ -358,6 +358,11 @@ export type ClientToServerMessage =
   | { type: 'autopilot'; enabled: boolean; tier?: 'STANDARD' | 'ADMINRY' }
   | { type: 'admin_track'; trackId: string }
   | { type: 'kick_admin'; targetPlayerId: string; issuedByClientId: string }
+  | {
+      type: 'adminry_pellet_flood';
+      action: 'FLOOD_SCREEN' | 'CLEAR';
+      issuedByName?: string;
+    }
   | { type: 'give_life'; targetPlayerId: string }
   | { type: 'trade_offer'; offer: LifeTradeOffer }
   | { type: 'trade_response'; offerId: string; accepted: boolean; offer: LifeTradeOffer }
@@ -368,6 +373,12 @@ export type ServerToClientMessage =
   | { type: 'state'; state: ArenaSnapshot | PackedArenaSnapshot }
   | { type: 'admin_track'; trackId: string }
   | { type: 'kick_admin'; targetPlayerId: string; issuedByClientId: string }
+  | {
+      type: 'pellet_flood_notice';
+      action: 'FLOOD_SCREEN' | 'CLEAR';
+      count: number;
+      byName: string;
+    }
   | { type: 'trade_offer'; offer: LifeTradeOffer }
   | {
       type: 'trade_result';

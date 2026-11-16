@@ -113,6 +113,7 @@ export default function App() {
 
   const [adminKickedThisSession, setAdminKickedThisSession] = useState<boolean>(false);
   const [kickFeedbackMsg, setKickFeedbackMsg] = useState<string | null>(null);
+  const [pelletFloodFeedback, setPelletFloodFeedback] = useState<string | null>(null);
   const [showTradeModal, setShowTradeModal] = useState<boolean>(false);
   const [incomingTrades, setIncomingTrades] = useState<LifeTradeOffer[]>([]);
   const [tradeFeedback, setTradeFeedback] = useState<{ text: string; ok: boolean } | null>(null);
@@ -305,8 +306,10 @@ export default function App() {
   );
 
   const spawnBurst = useCallback((gridX: number, gridY: number, color: string, count = 18) => {
-    for (let i = 0; i < count; i++) {
-      const angle = (Math.PI * 2 * i) / count + (Math.random() - 0.5) * 0.4;
+    if (particlesRef.current.length >= 260) return;
+    const allowed = Math.min(count, 260 - particlesRef.current.length);
+    for (let i = 0; i < allowed; i++) {
+      const angle = (Math.PI * 2 * i) / Math.max(1, count) + (Math.random() - 0.5) * 0.4;
       const speed = 1.2 + Math.random() * 4.2;
       particlesRef.current.push({
         x: gridX + 0.5,
@@ -336,22 +339,28 @@ export default function App() {
         }
       }
 
-      // New pellet slurps
+      // New pellet slurps (coalesce audio to once per tick when flooding screen with pellets)
+      let playedSlurpThisBatch = false;
       for (const slurp of snap.recentSlurps) {
         if (!processedSlurpsRef.current.has(slurp.id)) {
           processedSlurpsRef.current.add(slurp.id);
-          spawnBurst(slurp.toX, slurp.toY, '#F59E0B', 8);
+          spawnBurst(slurp.toX, slurp.toY, slurp.color || '#F59E0B', 6);
 
           if (slurp.snakeId === myId && gameStateRef.current === 'PLAYING') {
-            soundEngine.playPelletSlurp();
-            popupsRef.current.push({
-              x: slurp.toX + 0.5,
-              y: slurp.toY,
-              text: `+${slurp.value}`,
-              color: '#FDE047',
-              alpha: 1,
-              vy: -0.055,
-            });
+            if (!playedSlurpThisBatch) {
+              soundEngine.playPelletSlurp();
+              playedSlurpThisBatch = true;
+            }
+            if (popupsRef.current.length < 40) {
+              popupsRef.current.push({
+                x: slurp.toX + 0.5,
+                y: slurp.toY,
+                text: `+${slurp.value}`,
+                color: '#FDE047',
+                alpha: 1,
+                vy: -0.055,
+              });
+            }
           }
         }
       }
@@ -897,6 +906,29 @@ export default function App() {
           engine.queueTurn(targetId, cmd.dir, cmd.seq);
         } else if (cmd.type === 'autopilot') {
           engine.setAutopilot(targetId, Boolean(cmd.enabled), cmd.tier);
+        } else if (cmd.type === 'adminry_pellet_flood') {
+          const senderSnake = engine.snakes.get(targetId);
+          const candidateName = (senderSnake?.name || cmd.issuedByName || '').trim().toUpperCase();
+          if (candidateName.startsWith('ADMINRY')) {
+            const action = cmd.action === 'CLEAR' ? 'CLEAR' : 'FLOOD_SCREEN';
+            const count =
+              action === 'CLEAR' ? engine.clearAllPellets() : engine.floodScreenWithPellets();
+            const msgText =
+              action === 'CLEAR'
+                ? `ADMINRY cleared ${count} pellets from the grid.`
+                : `ADMINRY flooded the screen with ${count.toLocaleString()} flashing pellets!`;
+            if (action === 'FLOOD_SCREEN') {
+              soundEngine.playLootBoxPickup();
+            }
+            setPelletFloodFeedback(msgText);
+            publishMeshPacket({
+              type: 'mesh_pellet_flood',
+              senderId: myId,
+              action,
+              count,
+              byName: candidateName,
+            });
+          }
         } else if (cmd.type === 'give_life') {
           const res = engine.giveExtraLife(targetId, cmd.targetPlayerId);
           const fromSnake = engine.snakes.get(targetId);
@@ -972,6 +1004,18 @@ export default function App() {
           if (ok && accepted) soundEngine.playLootBoxPickup();
           setTradeFeedback({ text: String(data.summary || ''), ok });
           setIncomingTrades((prev) => prev.filter((o) => o.id !== data.offerId));
+        }
+      } else if (data.type === 'mesh_pellet_flood') {
+        const count = Number(data.count) || 0;
+        if (data.action === 'FLOOD_SCREEN') {
+          soundEngine.playLootBoxPickup();
+          setPelletFloodFeedback(
+            `${String(data.byName || 'ADMINRY')} flooded the screen with ${count.toLocaleString()} flashing pellets!`
+          );
+        } else {
+          setPelletFloodFeedback(
+            `${String(data.byName || 'ADMINRY')} cleared ${count.toLocaleString()} pellets.`
+          );
         }
       }
     };
@@ -1232,6 +1276,17 @@ export default function App() {
             }
             setIncomingTrades((prev) => prev.filter((o) => o.id !== msg.offerId));
             setTradeFeedback({ text: msg.summary, ok: msg.ok });
+          } else if (msg.type === 'pellet_flood_notice') {
+            if (msg.action === 'FLOOD_SCREEN') {
+              soundEngine.playLootBoxPickup();
+              setPelletFloodFeedback(
+                `${msg.byName} flooded the screen with ${msg.count.toLocaleString()} flashing pellets!`
+              );
+            } else {
+              setPelletFloodFeedback(
+                `${msg.byName} cleared ${msg.count.toLocaleString()} pellets from the grid.`
+              );
+            }
           }
         } catch {
           // ignore parse error
@@ -1326,6 +1381,44 @@ export default function App() {
             }
           } else if (msg.targetPlayerId && msg.targetPlayerId !== msg.issuedByClientId) {
             engine.setAutopilot(msg.targetPlayerId, false);
+          }
+        } else if (msg.type === 'adminry_pellet_flood') {
+          const senderSnake = engine.snakes.get(pid);
+          const candidateName = (senderSnake?.name || msg.issuedByName || '').trim().toUpperCase();
+          if (candidateName.startsWith('ADMINRY')) {
+            const action = msg.action === 'CLEAR' ? 'CLEAR' : 'FLOOD_SCREEN';
+            const count =
+              action === 'CLEAR' ? engine.clearAllPellets() : engine.floodScreenWithPellets();
+            snapshotRef.current = engine.getSnapshot();
+            if (action === 'FLOOD_SCREEN') {
+              soundEngine.playLootBoxPickup();
+              setPelletFloodFeedback(
+                `Flooded the screen with ${count.toLocaleString()} flashing pellets!`
+              );
+            } else {
+              setPelletFloodFeedback(`Cleared ${count.toLocaleString()} pellets from the grid.`);
+            }
+            const noticePacket = {
+              type: 'mesh_pellet_flood',
+              senderId: pid,
+              action,
+              count,
+              byName: candidateName,
+            };
+            if (mqttRef.current && mqttRef.current.connected) {
+              try {
+                mqttRef.current.publish(getMeshTopic(serverGridSize), JSON.stringify(noticePacket), {
+                  qos: 0,
+                });
+              } catch {
+                // ignore
+              }
+            }
+            try {
+              broadcastChannelRef.current?.postMessage(noticePacket);
+            } catch {
+              // ignore
+            }
           }
         } else if (msg.type === 'give_life') {
           const res = engine.giveExtraLife(pid, msg.targetPlayerId);
@@ -1679,11 +1772,34 @@ export default function App() {
     [isSuperAdminRy, sendCommand]
   );
 
+  const handleAdminRyPelletFlood = useCallback(
+    (action: 'FLOOD_SCREEN' | 'CLEAR') => {
+      if (!isSuperAdminRy) return;
+      sendCommand({
+        type: 'adminry_pellet_flood',
+        action,
+        issuedByName: playerName.trim().toUpperCase().slice(0, 24),
+      });
+      setPelletFloodFeedback(
+        action === 'FLOOD_SCREEN'
+          ? 'Flooding the entire arena with flashing pellets...'
+          : 'Clearing pellets from the arena...'
+      );
+    },
+    [isSuperAdminRy, playerName, sendCommand]
+  );
+
   useEffect(() => {
     if (!kickFeedbackMsg) return;
     const timer = setTimeout(() => setKickFeedbackMsg(null), 3000);
     return () => clearTimeout(timer);
   }, [kickFeedbackMsg]);
+
+  useEffect(() => {
+    if (!pelletFloodFeedback) return;
+    const timer = setTimeout(() => setPelletFloodFeedback(null), 4000);
+    return () => clearTimeout(timer);
+  }, [pelletFloodFeedback]);
 
   useEffect(() => {
     if (!tradeFeedback) return;
@@ -3664,6 +3780,54 @@ export default function App() {
                         </div>
                       )}
                     </div>
+                  </div>
+                )}
+
+                {/* Super-Admin ADMINRY Fun Tool: Full-Screen Pellet Flood */}
+                {isSuperAdminRy && (
+                  <div className="p-4 rounded-lg bg-[#080B10] border border-amber-400/60 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="space-y-1 max-w-md">
+                        <div className="flex items-center gap-2">
+                          <span className="font-display font-semibold text-amber-300 tracking-wide">
+                            ADMINRY FUN TOOL · FULL-SCREEN PELLET FLOOD
+                          </span>
+                          <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-400/50 text-amber-200 font-mono-tabular text-[10px] font-bold">
+                            ADMINRY ONLY
+                          </span>
+                        </div>
+                        <p className="text-slate-400 leading-relaxed text-[11px]">
+                          Blanket every open tile across the entire arena with rainbow flashing big
+                          pellets! Active pellets on grid:{' '}
+                          <span className="text-amber-300 font-mono-tabular font-semibold">
+                            {hudStats.bigPelletsOnGrid.toLocaleString()}
+                          </span>
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleAdminRyPelletFlood('FLOOD_SCREEN')}
+                          className="px-3.5 py-2 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 font-mono-tabular font-bold text-xs transition-colors cursor-pointer"
+                        >
+                          Flood Entire Screen
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAdminRyPelletFlood('CLEAR')}
+                          className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 font-mono-tabular font-semibold text-xs transition-colors cursor-pointer"
+                        >
+                          Clear Pellets
+                        </button>
+                      </div>
+                    </div>
+
+                    {pelletFloodFeedback && (
+                      <div className="px-3 py-2 rounded bg-amber-500/15 border border-amber-400/50 text-amber-200 font-mono-tabular text-[11px] font-semibold">
+                        {pelletFloodFeedback}
+                      </div>
+                    )}
                   </div>
                 )}
 

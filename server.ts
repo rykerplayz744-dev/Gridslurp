@@ -209,6 +209,35 @@ async function startServer() {
               client.send(payload);
             }
           }
+        } else if (msg.type === 'adminry_pellet_flood') {
+          const arena = arenas.get(activeGridSize)!;
+          const senderSnake = arena.snakes.get(assignedPlayerId);
+          const candidateName = (senderSnake?.name || msg.issuedByName || '').trim().toUpperCase();
+          if (candidateName.startsWith('ADMINRY')) {
+            const action = msg.action === 'CLEAR' ? 'CLEAR' : 'FLOOD_SCREEN';
+            const count =
+              action === 'CLEAR' ? arena.clearAllPellets() : arena.floodScreenWithPellets();
+            const statePayload = JSON.stringify({
+              type: 'state',
+              state: packSnapshot(arena.getSnapshot()),
+            } satisfies ServerToClientMessage);
+            const noticePayload = JSON.stringify({
+              type: 'pellet_flood_notice',
+              action,
+              count,
+              byName: candidateName,
+            } satisfies ServerToClientMessage);
+            for (const [client, info] of clientPlayers.entries()) {
+              if (
+                client.readyState === WebSocket.OPEN &&
+                client.bufferedAmount < 524288 &&
+                info.gridSize === activeGridSize
+              ) {
+                client.send(statePayload);
+                client.send(noticePayload);
+              }
+            }
+          }
         } else if (msg.type === 'give_life') {
           const arena = arenas.get(activeGridSize)!;
           const res = arena.giveExtraLife(assignedPlayerId, msg.targetPlayerId);
@@ -382,8 +411,8 @@ async function startServer() {
 
     for (const [client, info] of clientPlayers.entries()) {
       if (client.readyState !== WebSocket.OPEN) continue;
-      // Backpressure guard: avoid queueing seconds of stale frames on stalled sockets
-      if (client.bufferedAmount > 65536) continue;
+      // Backpressure guard: allow full-grid 64x64 pellet flood frames while protecting stalled sockets
+      if (client.bufferedAmount > 524288) continue;
       const payload = info.gridSize === 64 ? payload64 : payload32;
       if (payload) {
         client.send(payload);

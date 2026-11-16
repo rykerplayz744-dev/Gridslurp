@@ -394,6 +394,66 @@ export class ArenaEngine {
     return { ok: true };
   }
 
+  public floodScreenWithPellets(): number {
+    const gs = this.gridSize;
+    const occupied = new Uint8Array(gs * gs);
+
+    for (const snake of this.snakes.values()) {
+      if (!snake.alive) continue;
+      for (let i = 0; i < snake.segments.length; i++) {
+        const seg = snake.segments[i];
+        if (seg.x >= 0 && seg.x < gs && seg.y >= 0 && seg.y < gs) {
+          occupied[seg.y * gs + seg.x] = 1;
+        }
+      }
+    }
+
+    for (let i = 0; i < this.pellets.length; i++) {
+      const p = this.pellets[i];
+      if (p.x >= 0 && p.x < gs && p.y >= 0 && p.y < gs) {
+        occupied[p.y * gs + p.x] = 1;
+      }
+    }
+
+    for (let i = 0; i < this.lootBoxes.length; i++) {
+      const b = this.lootBoxes[i];
+      if (b.x >= 0 && b.x < gs && b.y >= 0 && b.y < gs) {
+        occupied[b.y * gs + b.x] = 1;
+      }
+    }
+
+    let spawned = 0;
+    const paletteCount = SNAKE_PALETTES.length;
+    for (let y = 0; y < gs; y++) {
+      const rowOffset = y * gs;
+      for (let x = 0; x < gs; x++) {
+        if (occupied[rowOffset + x]) continue;
+        this.pelletCounter++;
+        spawned++;
+        const palette = SNAKE_PALETTES[(x + y) % paletteCount];
+        this.pellets.push({
+          id: `f${this.pelletCounter}`,
+          x,
+          y,
+          value: 100,
+          growth: 1,
+          color: palette.head,
+          spawnTick: this.tick,
+          ttlTicks: 165,
+          fromSnakeName: 'ADMINRY',
+        });
+      }
+    }
+
+    return spawned;
+  }
+
+  public clearAllPellets(): number {
+    const removed = this.pellets.length;
+    this.pellets = [];
+    return removed;
+  }
+
   public setAutopilot(id: string, enabled: boolean, tier?: 'STANDARD' | 'ADMINRY') {
     const snake = this.snakes.get(id);
     if (!snake || !snake.alive) return;
