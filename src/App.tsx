@@ -22,6 +22,7 @@ import {
   loadSelectedFaceId,
   saveSelectedFaceId,
 } from './utils/faceManager';
+import { detectSoftwareRenderer, getSafe2DContext } from './utils/graphicsSafety';
 import {
   ADMIN_AUDIO_TRACKS,
   DISCOVERED_AUDIO_TRACKS,
@@ -2506,19 +2507,27 @@ export default function App() {
     showTradeModal,
   ]);
 
-  // 60FPS Hardware-Accelerated Pixel Matrix Canvas Loop
+  // Pixel Matrix Canvas Loop (automatically adapts for software/no-GPU Linux rendering)
   useEffect(() => {
     let rafId = 0;
     let lastFrameTime = performance.now();
+    let lastPaintedAt = 0;
     let camInitialized = false;
+    const isSoftwareGpu = detectSoftwareRenderer();
     // Reusable 64x64 spatial bitmap so stacked/overlapping segments on the same cell are drawn only once
     const visitedCells = new Uint8Array(64 * 64);
 
-    // Offscreen static LED matrix cache for full-grid view (replaces 1,024-4,096 fillRects/frame with 1 drawImage)
-    const bgCacheCanvas = document.createElement('canvas');
+    // Offscreen static LED matrix cache for full-grid view (matched backend with main canvas)
+    let bgCacheCanvas: HTMLCanvasElement | null = null;
+    try {
+      bgCacheCanvas = document.createElement('canvas');
+    } catch {
+      bgCacheCanvas = null;
+    }
     let bgCacheKey = '';
+    let bgCacheUsable = Boolean(bgCacheCanvas);
 
-    // Reusable per-frame geometry buckets (zero heap allocation in 60fps loop)
+    // Reusable per-frame geometry buckets (zero heap allocation in loop)
     const pelletBuckets = new Map<string, number[]>();
     const pelletWhiteCores: number[] = [];
     const pelletHaloCoords: number[] = [];
@@ -2529,14 +2538,66 @@ export default function App() {
     const bodyRimXs: number[] = [];
     const bodyRimYs: number[] = [];
 
+    const drawStaticBoardBackground = (
+      targetCtx: CanvasRenderingContext2D,
+      activeGridSize: number,
+      boardPx: number,
+      cellPx: number,
+      halfGap: number,
+      socketSize: number,
+      lastIdx: number,
+      worldPx: number
+    ) => {
+      targetCtx.fillStyle = '#070A0F';
+      targetCtx.fillRect(0, 0, boardPx, boardPx);
+
+      targetCtx.fillStyle = '#0E1522';
+      for (let y = 1; y < lastIdx; y++) {
+        const py = y * cellPx + halfGap;
+        for (let x = 1; x < lastIdx; x++) {
+          targetCtx.fillRect(x * cellPx + halfGap, py, socketSize, socketSize);
+        }
+      }
+
+      targetCtx.fillStyle = '#131826';
+      for (let x = 0; x < activeGridSize; x++) {
+        const px = x * cellPx + halfGap;
+        targetCtx.fillRect(px, halfGap, socketSize, socketSize);
+        targetCtx.fillRect(px, lastIdx * cellPx + halfGap, socketSize, socketSize);
+      }
+      for (let y = 1; y < lastIdx; y++) {
+        const py = y * cellPx + halfGap;
+        targetCtx.fillRect(halfGap, py, socketSize, socketSize);
+        targetCtx.fillRect(lastIdx * cellPx + halfGap, py, socketSize, socketSize);
+      }
+
+      targetCtx.strokeStyle = 'rgba(148, 163, 184, 0.08)';
+      targetCtx.lineWidth = 1;
+      targetCtx.beginPath();
+      for (let i = 8; i < activeGridSize; i += 8) {
+        const pos = i * cellPx;
+        targetCtx.moveTo(pos, 0);
+        targetCtx.lineTo(pos, worldPx);
+        targetCtx.moveTo(0, pos);
+        targetCtx.lineTo(worldPx, pos);
+      }
+      targetCtx.stroke();
+    };
+
     const renderFrame = (now: number) => {
       rafId = requestAnimationFrame(renderFrame);
+
+      // On software/no-GPU setups, throttle canvas draws to ~30fps so CPU rasterization never stalls the compositor
+      if (isSoftwareGpu && now - lastPaintedAt < 32) {
+        return;
+      }
+
       const dtSec = Math.min(0.1, Math.max(0.001, (now - lastFrameTime) / 1000));
       lastFrameTime = now;
 
       const canvas = canvasRef.current;
       if (!canvas) return;
-      const ctx = canvas.getContext('2d');
+      const ctx = getSafe2DContext(canvas, isSoftwareGpu);
       if (!ctx) return;
 
       // Hitstop freeze for heavy collision impact feel
@@ -2544,18 +2605,21 @@ export default function App() {
         return;
       }
 
-      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const dpr = isSoftwareGpu ? 1 : Math.min(2, window.devicePixelRatio || 1);
       const displaySize = canvas.clientWidth;
-      if (displaySize === 0) return;
+      if (displaySize <= 0) return;
+      lastPaintedAt = now;
 
-      const targetPx = Math.round(displaySize * dpr);
+      const targetPx = Math.max(1, Math.min(isSoftwareGpu ? 1024 : 2400, Math.round(displaySize * dpr)));
       if (canvas.width !== targetPx || canvas.height !== targetPx) {
         canvas.width = targetPx;
         canvas.height = targetPx;
       }
+      const effectiveScale = targetPx / displaySize;
 
       ctx.save();
-      ctx.scale(dpr, dpr);
+      try {
+        ctx.scale(effectiveScale, effectiveScale);
 
       // Apply decaying screen shake
       if (shakeRef.current > 0.2) {
@@ -2700,53 +2764,56 @@ export default function App() {
 
       // 1 & 2. Render LED Pixel Backplane + Matrix Sockets
       if (!isZoomed) {
-        const nextBgKey = `${activeGridSize}|${targetPx}`;
-        if (nextBgKey !== bgCacheKey) {
-          bgCacheKey = nextBgKey;
-          bgCacheCanvas.width = targetPx;
-          bgCacheCanvas.height = targetPx;
-          const bctx = bgCacheCanvas.getContext('2d');
-          if (bctx) {
-            bctx.save();
-            bctx.scale(dpr, dpr);
-            bctx.fillStyle = '#070A0F';
-            bctx.fillRect(0, 0, boardPx, boardPx);
-
-            bctx.fillStyle = '#0E1522';
-            for (let y = 1; y < lastIdx; y++) {
-              const py = y * cellPx + halfGap;
-              for (let x = 1; x < lastIdx; x++) {
-                bctx.fillRect(x * cellPx + halfGap, py, socketSize, socketSize);
+        let drewCachedBg = false;
+        if (bgCacheUsable && bgCacheCanvas) {
+          const nextBgKey = `${activeGridSize}|${targetPx}`;
+          if (nextBgKey !== bgCacheKey) {
+            bgCacheKey = nextBgKey;
+            bgCacheCanvas.width = targetPx;
+            bgCacheCanvas.height = targetPx;
+            const bctx = getSafe2DContext(bgCacheCanvas, isSoftwareGpu);
+            if (bctx) {
+              bctx.save();
+              try {
+                bctx.scale(effectiveScale, effectiveScale);
+                drawStaticBoardBackground(
+                  bctx,
+                  activeGridSize,
+                  boardPx,
+                  cellPx,
+                  halfGap,
+                  socketSize,
+                  lastIdx,
+                  worldPx
+                );
+              } finally {
+                bctx.restore();
               }
+            } else {
+              bgCacheUsable = false;
             }
-
-            bctx.fillStyle = '#131826';
-            for (let x = 0; x < activeGridSize; x++) {
-              const px = x * cellPx + halfGap;
-              bctx.fillRect(px, halfGap, socketSize, socketSize);
-              bctx.fillRect(px, lastIdx * cellPx + halfGap, socketSize, socketSize);
+          }
+          if (bgCacheUsable) {
+            try {
+              ctx.drawImage(bgCacheCanvas, 0, 0, boardPx, boardPx);
+              drewCachedBg = true;
+            } catch {
+              bgCacheUsable = false;
             }
-            for (let y = 1; y < lastIdx; y++) {
-              const py = y * cellPx + halfGap;
-              bctx.fillRect(halfGap, py, socketSize, socketSize);
-              bctx.fillRect(lastIdx * cellPx + halfGap, py, socketSize, socketSize);
-            }
-
-            bctx.strokeStyle = 'rgba(148, 163, 184, 0.08)';
-            bctx.lineWidth = 1;
-            bctx.beginPath();
-            for (let i = 8; i < activeGridSize; i += 8) {
-              const pos = i * cellPx;
-              bctx.moveTo(pos, 0);
-              bctx.lineTo(pos, worldPx);
-              bctx.moveTo(0, pos);
-              bctx.lineTo(worldPx, pos);
-            }
-            bctx.stroke();
-            bctx.restore();
           }
         }
-        ctx.drawImage(bgCacheCanvas, 0, 0, boardPx, boardPx);
+        if (!drewCachedBg) {
+          drawStaticBoardBackground(
+            ctx,
+            activeGridSize,
+            boardPx,
+            cellPx,
+            halfGap,
+            socketSize,
+            lastIdx,
+            worldPx
+          );
+        }
         ctx.save();
       } else {
         ctx.fillStyle = '#070A0F';
@@ -3124,12 +3191,19 @@ export default function App() {
             ctx.fillRect(headSx, headSy, socketSize, socketSize);
 
             const customFaceImg = snake.faceId ? getFaceImage(snake.faceId) : null;
+            let drewCustomFace = false;
             if (customFaceImg) {
-              const prevSmoothing = ctx.imageSmoothingEnabled;
-              ctx.imageSmoothingEnabled = customFaceImg.naturalWidth > 64;
-              ctx.drawImage(customFaceImg, headSx, headSy, socketSize, socketSize);
-              ctx.imageSmoothingEnabled = prevSmoothing;
-            } else {
+              try {
+                const prevSmoothing = ctx.imageSmoothingEnabled;
+                ctx.imageSmoothingEnabled = customFaceImg.naturalWidth > 64;
+                ctx.drawImage(customFaceImg, headSx, headSy, socketSize, socketSize);
+                ctx.imageSmoothingEnabled = prevSmoothing;
+                drewCustomFace = true;
+              } catch {
+                drewCustomFace = false;
+              }
+            }
+            if (!drewCustomFace) {
               // Directional pixel eyes on the head cell
               ctx.fillStyle = '#080B10';
               const eyeSize = Math.max(2, socketSize * 0.22);
@@ -3258,7 +3332,7 @@ export default function App() {
       }
       particlesRef.current = nextParticles;
 
-      // 9. Render Floating Score / Takedown Popups
+      // 9. Render Floating Score / Takedown Popups (1px dark pixel shadow avoids costly software shadowBlur)
       const nextPopups: FloatingPopup[] = [];
       for (const pop of popupsRef.current) {
         pop.y += pop.vy;
@@ -3267,10 +3341,10 @@ export default function App() {
           ctx.save();
           ctx.font = `700 ${Math.max(11, Math.floor(cellPx * 0.52))}px "IBM Plex Mono", monospace`;
           ctx.textAlign = 'center';
-          ctx.fillStyle = pop.color;
           ctx.globalAlpha = pop.alpha;
-          ctx.shadowColor = '#000000';
-          ctx.shadowBlur = 4;
+          ctx.fillStyle = '#000000';
+          ctx.fillText(pop.text, pop.x * cellPx + 1, pop.y * cellPx + 1);
+          ctx.fillStyle = pop.color;
           ctx.fillText(pop.text, pop.x * cellPx, pop.y * cellPx);
           ctx.restore();
           nextPopups.push(pop);
@@ -3278,8 +3352,18 @@ export default function App() {
       }
       popupsRef.current = nextPopups;
 
-      ctx.restore();
-      ctx.restore();
+        ctx.restore();
+      } catch {
+        // Prevent single-frame driver/canvas errors from stalling animation or leaking transform state
+        try {
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.globalAlpha = 1;
+        } catch {
+          // ignore
+        }
+      } finally {
+        ctx.restore();
+      }
     };
 
     rafId = requestAnimationFrame(renderFrame);
@@ -3302,7 +3386,7 @@ export default function App() {
   })();
 
   return (
-    <div className="relative w-screen h-screen bg-[#080B10] text-[#F1F5F9] flex flex-col justify-between overflow-hidden select-none">
+    <div className="relative w-full h-full min-h-screen bg-[#080B10] text-[#F1F5F9] flex flex-col justify-between overflow-hidden select-none">
       {/* Top Perimeter HUD Bar (World-Matched, Low-Occlusion) */}
       <header className="w-full h-12 px-5 bg-[#0B0F17]/95 border-b border-slate-800/80 flex items-center justify-between gap-6 z-20 shrink-0">
         <div className="flex items-center gap-4 shrink-0">
@@ -3486,7 +3570,7 @@ export default function App() {
           {/* Center 1:1 32x32 Pixel Matrix Board */}
           <div className="relative flex items-center justify-center h-full aspect-square max-h-[calc(100vh-6.2rem)] max-w-[calc(100vw-2rem)]">
             {/* Coordinate Frame Bezel */}
-            <div className="relative w-full h-full p-2.5 rounded-lg bg-[#0C121D] border border-rose-500/40 shadow-[0_0_50px_rgba(0,0,0,0.85)] flex items-center justify-center">
+            <div className="relative w-full h-full p-2.5 rounded-lg bg-[#0C121D] border border-rose-500/40 shadow-lg flex items-center justify-center">
               {/* Corner Matrix Coordinate Labels */}
               <span className="absolute top-0.5 left-2 text-[10px] font-mono-tabular text-rose-400/80 pointer-events-none">
                 00,00
@@ -3636,7 +3720,7 @@ export default function App() {
             className="fixed bottom-5 right-5 z-20 select-none touch-none"
             aria-label="Mobile Directional Controls"
           >
-            <div className="p-2.5 rounded-2xl bg-[#0B111D]/85 border border-slate-700/80 backdrop-blur-md shadow-[0_8px_32px_rgba(0,0,0,0.65)]">
+            <div className="p-2.5 rounded-2xl bg-[#0B111D]/95 border border-slate-700/80 shadow-lg">
               <div className="grid grid-cols-3 gap-2 w-40 h-40 sm:w-44 sm:h-44">
                 <div />
                 <button
@@ -3712,7 +3796,7 @@ export default function App() {
 
         {/* SPECTATOR MODE FLOATING HUD BAR (WHEN MAIN MENU IS HIDDEN) */}
         {gameState === 'TITLE_MENU' && isSpectating && (
-          <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-wrap items-center justify-center gap-3 px-4 py-2.5 rounded-xl bg-[#0D131F]/95 border border-cyan-500/40 shadow-[0_8px_32px_rgba(0,0,0,0.75)] backdrop-blur-md">
+          <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-20 flex flex-wrap items-center justify-center gap-3 px-4 py-2.5 rounded-xl bg-[#0D131F]/98 border border-cyan-500/40 shadow-lg">
             <div className="flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
               <span className="font-display font-bold text-xs tracking-wider text-cyan-300">
