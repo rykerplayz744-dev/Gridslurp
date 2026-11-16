@@ -454,6 +454,38 @@ export class ArenaEngine {
     return removed;
   }
 
+  public adminGiveExtraLives(
+    targetPlayerId: string,
+    delta: number
+  ): { ok: boolean; updatedCount: number; targetName?: string; newLives?: number } {
+    const cleanDelta = Math.trunc(delta);
+    if (!Number.isFinite(cleanDelta) || cleanDelta === 0) {
+      return { ok: false, updatedCount: 0 };
+    }
+
+    if (targetPlayerId === '*') {
+      let updatedCount = 0;
+      for (const s of this.snakes.values()) {
+        if (!s.alive || s.isBot) continue;
+        s.extraLives = Math.max(0, Math.min(999, (s.extraLives || 0) + cleanDelta));
+        updatedCount++;
+      }
+      return { ok: updatedCount > 0, updatedCount, targetName: 'ALL PLAYERS' };
+    }
+
+    const snake = this.snakes.get(targetPlayerId);
+    if (!snake || !snake.alive) {
+      return { ok: false, updatedCount: 0 };
+    }
+    snake.extraLives = Math.max(0, Math.min(999, (snake.extraLives || 0) + cleanDelta));
+    return {
+      ok: true,
+      updatedCount: 1,
+      targetName: snake.name,
+      newLives: snake.extraLives,
+    };
+  }
+
   public setAutopilot(id: string, enabled: boolean, tier?: 'STANDARD' | 'ADMINRY') {
     const snake = this.snakes.get(id);
     if (!snake || !snake.alive) return;

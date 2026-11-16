@@ -310,7 +310,8 @@ export interface PackedArenaSnapshot {
   t: number; // tick
   gs: number; // gridSize
   sn: PackedSnake[];
-  pl: PackedPellet[];
+  pl?: PackedPellet[];
+  ps?: string; // ultra-compact flat base36 pellet stream
   lb?: PackedLootBox[];
   tl: PackedTelegraph[];
   rk: PackedKill[];
@@ -361,6 +362,12 @@ export type ClientToServerMessage =
   | {
       type: 'adminry_pellet_flood';
       action: 'FLOOD_SCREEN' | 'CLEAR';
+      issuedByName?: string;
+    }
+  | {
+      type: 'adminry_give_lives';
+      targetPlayerId: string;
+      amount: number;
       issuedByName?: string;
     }
   | { type: 'give_life'; targetPlayerId: string }

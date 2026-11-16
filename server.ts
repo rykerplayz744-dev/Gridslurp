@@ -6,6 +6,7 @@ import { createServer as createViteServer } from 'vite';
 import { WebSocket, WebSocketServer } from 'ws';
 import { ArenaEngine } from './src/shared/arenaEngine';
 import {
+  ArenaSnapshot,
   ClientToServerMessage,
   ServerGridSize,
   ServerToClientMessage,
@@ -33,16 +34,63 @@ async function startServer() {
     perMessageDeflate: false,
   });
 
-  // Maintain both the 32x32 Server (2 AI snakes) and the 64x64 Server (4 AI snakes) simultaneously
-  const arenas = new Map<ServerGridSize, ArenaEngine>([
-    [32, new ArenaEngine(2, 32)],
-    [64, new ArenaEngine(4, 64)],
-  ]);
+  // Lazy-loaded arenas: a server (32x32 or 64x64) is only loaded while at least one player is in it
+  const arenas = new Map<ServerGridSize, ArenaEngine>();
 
   const clientPlayers = new Map<
     WebSocket,
     { id: string; gridSize: ServerGridSize; isAlive: boolean }
   >();
+
+  let tickTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const createEmptySnapshot = (gridSize: ServerGridSize): ArenaSnapshot => ({
+    tick: 0,
+    gridSize,
+    snakes: [],
+    pellets: [],
+    lootBoxes: [],
+    telegraphs: [],
+    recentKills: [],
+    recentSlurps: [],
+    recentLootPickups: [],
+    recentExtraLifeSaves: [],
+    onlinePlayers: 0,
+  });
+
+  const getOrCreateArena = (gridSize: ServerGridSize): ArenaEngine => {
+    let arena = arenas.get(gridSize);
+    if (!arena) {
+      arena = new ArenaEngine(gridSize === 64 ? 4 : 2, gridSize);
+      arenas.set(gridSize, arena);
+    }
+    return arena;
+  };
+
+  const countClientsOnServer = (gridSize: ServerGridSize): number => {
+    let count = 0;
+    for (const [client, info] of clientPlayers.entries()) {
+      if (
+        (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) &&
+        info.gridSize === gridSize
+      ) {
+        count++;
+      }
+    }
+    return count;
+  };
+
+  const pruneEmptyArenas = () => {
+    for (const gridSize of Array.from(arenas.keys())) {
+      if (countClientsOnServer(gridSize) === 0) {
+        arenas.delete(gridSize);
+      }
+    }
+    if (arenas.size === 0 && clientPlayers.size === 0 && tickTimer) {
+      clearTimeout(tickTimer);
+      tickTimer = null;
+    }
+  };
 
   const isPlayerIdOwnedElsewhere = (playerId: string, gridSize: ServerGridSize, skipWs: WebSocket) => {
     for (const [sock, info] of clientPlayers.entries()) {
@@ -53,27 +101,35 @@ async function startServer() {
     return false;
   };
 
+  let scheduleTickLoop = () => {};
+
   app.get('/api/arena', (req, res) => {
-    const requestedSize = Number(req.query.size) === 64 ? 64 : 32;
-    const arena = arenas.get(requestedSize)!;
+    const requestedSize: ServerGridSize = Number(req.query.size) === 64 ? 64 : 32;
+    const arena = arenas.get(requestedSize);
     res.json({
       status: 'ok',
       mode: 'authoritative-ws',
-      snapshot: arena.getSnapshot(),
+      loaded: Boolean(arena),
+      snapshot: arena ? arena.getSnapshot() : createEmptySnapshot(requestedSize),
     });
   });
 
   app.post('/api/arena', (req, res) => {
-    const requestedSize = Number(req.body?.gridSize) === 64 ? 64 : 32;
-    const arena = arenas.get(requestedSize)!;
-    res.json({ ok: true, snapshot: arena.getSnapshot() });
+    const requestedSize: ServerGridSize = Number(req.body?.gridSize) === 64 ? 64 : 32;
+    const arena = arenas.get(requestedSize);
+    res.json({
+      ok: true,
+      loaded: Boolean(arena),
+      snapshot: arena ? arena.getSnapshot() : createEmptySnapshot(requestedSize),
+    });
   });
 
   wss.on('connection', (ws: WebSocket, req) => {
     req.socket?.setNoDelay(true);
 
+    const parsedUrl = new URL(req.url || '/ws', 'http://localhost');
     let assignedPlayerId = `plr_${Math.random().toString(36).slice(2, 9)}`;
-    let activeGridSize: ServerGridSize = 32;
+    let activeGridSize: ServerGridSize = parsedUrl.searchParams.get('size') === '64' ? 64 : 32;
     clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize, isAlive: true });
 
     const sendMsg = (msg: ServerToClientMessage) => {
@@ -87,11 +143,15 @@ async function startServer() {
       if (entry) entry.isAlive = true;
     });
 
-    // Send initial welcome + packed 32x32 arena state immediately
+    // Lazy-load only the requested server and start the tick loop if idle
+    const initialArena = getOrCreateArena(activeGridSize);
+    scheduleTickLoop();
+
+    // Send initial welcome + packed arena state immediately
     sendMsg({
       type: 'welcome',
       playerId: assignedPlayerId,
-      state: packSnapshot(arenas.get(activeGridSize)!.getSnapshot()),
+      state: packSnapshot(initialArena.getSnapshot()),
     });
 
     ws.on('message', (raw) => {
@@ -105,10 +165,13 @@ async function startServer() {
             }
             activeGridSize = newSize;
             clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize, isAlive: true });
+            pruneEmptyArenas();
           }
+          const arena = getOrCreateArena(activeGridSize);
+          scheduleTickLoop();
           sendMsg({
             type: 'state',
-            state: packSnapshot(arenas.get(activeGridSize)!.getSnapshot()),
+            state: packSnapshot(arena.getSnapshot()),
           });
         } else if (msg.type === 'join') {
           const prevId = assignedPlayerId;
@@ -125,8 +188,10 @@ async function startServer() {
           }
           activeGridSize = nextSize;
           clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize, isAlive: true });
+          pruneEmptyArenas();
 
-          const arena = arenas.get(activeGridSize)!;
+          const arena = getOrCreateArena(activeGridSize);
+          scheduleTickLoop();
           arena.spawnPlayer(
             assignedPlayerId,
             msg.name,
@@ -140,11 +205,11 @@ async function startServer() {
             state: packSnapshot(arena.getSnapshot()),
           });
         } else if (msg.type === 'turn') {
-          arenas.get(activeGridSize)!.queueTurn(assignedPlayerId, msg.dir, msg.seq);
+          arenas.get(activeGridSize)?.queueTurn(assignedPlayerId, msg.dir, msg.seq);
         } else if (msg.type === 'autopilot') {
           arenas
-            .get(activeGridSize)!
-            .setAutopilot(assignedPlayerId, Boolean(msg.enabled), msg.tier);
+            .get(activeGridSize)
+            ?.setAutopilot(assignedPlayerId, Boolean(msg.enabled), msg.tier);
         } else if (msg.type === 'respawn') {
           if (msg.gridSize === 64 || msg.gridSize === 32) {
             if (msg.gridSize !== activeGridSize) {
@@ -153,9 +218,11 @@ async function startServer() {
               }
               activeGridSize = msg.gridSize;
               clientPlayers.set(ws, { id: assignedPlayerId, gridSize: activeGridSize, isAlive: true });
+              pruneEmptyArenas();
             }
           }
-          const arena = arenas.get(activeGridSize)!;
+          const arena = getOrCreateArena(activeGridSize);
+          scheduleTickLoop();
           arena.spawnPlayer(
             assignedPlayerId,
             msg.name,
@@ -185,7 +252,7 @@ async function startServer() {
           const targetId = typeof msg.targetPlayerId === 'string' ? msg.targetPlayerId : '*';
           const issuedBy =
             typeof msg.issuedByClientId === 'string' ? msg.issuedByClientId : assignedPlayerId;
-          const arena = arenas.get(activeGridSize)!;
+          const arena = getOrCreateArena(activeGridSize);
           if (targetId === '*') {
             for (const s of arena.snakes.values()) {
               if (!s.isBot && s.id !== issuedBy) {
@@ -210,7 +277,7 @@ async function startServer() {
             }
           }
         } else if (msg.type === 'adminry_pellet_flood') {
-          const arena = arenas.get(activeGridSize)!;
+          const arena = getOrCreateArena(activeGridSize);
           const senderSnake = arena.snakes.get(assignedPlayerId);
           const candidateName = (senderSnake?.name || msg.issuedByName || '').trim().toUpperCase();
           if (candidateName.startsWith('ADMINRY')) {
@@ -238,8 +305,57 @@ async function startServer() {
               }
             }
           }
+        } else if (msg.type === 'adminry_give_lives') {
+          const arena = getOrCreateArena(activeGridSize);
+          const senderSnake = arena.snakes.get(assignedPlayerId);
+          const candidateName = (senderSnake?.name || msg.issuedByName || '').trim().toUpperCase();
+          if (candidateName.startsWith('ADMINRY')) {
+            const rawTarget = typeof msg.targetPlayerId === 'string' ? msg.targetPlayerId : 'ME';
+            const resolvedTarget = rawTarget === 'ME' ? assignedPlayerId : rawTarget;
+            const amount = Math.max(-999, Math.min(99, Math.trunc(Number(msg.amount) || 0)));
+            const res = arena.adminGiveExtraLives(resolvedTarget, amount);
+            if (res.ok) {
+              const statePayload = JSON.stringify({
+                type: 'state',
+                state: packSnapshot(arena.getSnapshot()),
+              } satisfies ServerToClientMessage);
+              const summary =
+                amount < 0
+                  ? `${candidateName} cleared Extra Lives for ${res.targetName || 'player'}.`
+                  : resolvedTarget === '*'
+                    ? `${candidateName} gave +${amount} Extra ${amount === 1 ? 'Life' : 'Lives'} to all alive players!`
+                    : `${candidateName} gave +${amount} Extra ${amount === 1 ? 'Life' : 'Lives'} to ${res.targetName || 'player'} (now ×${res.newLives ?? 0}).`;
+              const resultPayload = JSON.stringify({
+                type: 'trade_result',
+                offerId: `dbg_${Date.now()}`,
+                fromId: assignedPlayerId,
+                fromName: candidateName,
+                toId: resolvedTarget,
+                toName: res.targetName || 'PLAYER',
+                ok: true,
+                accepted: amount > 0,
+                summary,
+              } satisfies ServerToClientMessage);
+              for (const [client, info] of clientPlayers.entries()) {
+                if (
+                  client.readyState === WebSocket.OPEN &&
+                  client.bufferedAmount < 524288 &&
+                  info.gridSize === activeGridSize
+                ) {
+                  client.send(statePayload);
+                  if (
+                    info.id === assignedPlayerId ||
+                    resolvedTarget === '*' ||
+                    info.id === resolvedTarget
+                  ) {
+                    client.send(resultPayload);
+                  }
+                }
+              }
+            }
+          }
         } else if (msg.type === 'give_life') {
-          const arena = arenas.get(activeGridSize)!;
+          const arena = getOrCreateArena(activeGridSize);
           const res = arena.giveExtraLife(assignedPlayerId, msg.targetPlayerId);
           const fromSnake = arena.snakes.get(assignedPlayerId);
           const toSnake = arena.snakes.get(msg.targetPlayerId);
@@ -273,7 +389,7 @@ async function startServer() {
             }
           }
         } else if (msg.type === 'trade_offer') {
-          const arena = arenas.get(activeGridSize)!;
+          const arena = getOrCreateArena(activeGridSize);
           const fromSnake = arena.snakes.get(assignedPlayerId);
           const sanitizedOffer = {
             ...msg.offer,
@@ -296,7 +412,7 @@ async function startServer() {
         } else if (msg.type === 'trade_response') {
           const offer = msg.offer;
           if (offer && offer.toId === assignedPlayerId) {
-            const arena = arenas.get(activeGridSize)!;
+            const arena = getOrCreateArena(activeGridSize);
             let ok = true;
             let summary = `${offer.toName} declined the life trade.`;
             if (msg.accepted) {
@@ -341,8 +457,9 @@ async function startServer() {
           }
         } else if (msg.type === 'leave') {
           if (!isPlayerIdOwnedElsewhere(assignedPlayerId, activeGridSize, ws)) {
-            arenas.get(activeGridSize)!.removePlayer(assignedPlayerId);
+            arenas.get(activeGridSize)?.removePlayer(assignedPlayerId);
           }
+          pruneEmptyArenas();
         }
       } catch {
         // Ignore malformed packets
@@ -355,11 +472,13 @@ async function startServer() {
       if (info && !isPlayerIdOwnedElsewhere(info.id, info.gridSize, ws)) {
         arenas.get(info.gridSize)?.removePlayer(info.id);
       }
+      pruneEmptyArenas();
     });
   });
 
   // Periodic keepalive ping to evict half-open dead sockets immediately
   setInterval(() => {
+    let evicted = false;
     for (const [client, info] of clientPlayers.entries()) {
       if (!info.isAlive) {
         clientPlayers.delete(client);
@@ -367,6 +486,7 @@ async function startServer() {
           arenas.get(info.gridSize)?.removePlayer(info.id);
         }
         client.terminate();
+        evicted = true;
         continue;
       }
       info.isAlive = false;
@@ -374,11 +494,15 @@ async function startServer() {
         client.ping();
       }
     }
+    if (evicted) {
+      pruneEmptyArenas();
+    }
   }, 8000);
 
-  // Drift-compensated authoritative game loop (steps and packs ONLY arenas with active clients)
+  // Drift-compensated authoritative game loop (steps and loads ONLY servers with active players)
   let nextTickAt = performance.now() + TICK_MS;
   const runTickLoop = () => {
+    tickTimer = null;
     const now = performance.now();
     let count32 = 0;
     let count64 = 0;
@@ -389,9 +513,12 @@ async function startServer() {
       else count32++;
     }
 
+    pruneEmptyArenas();
+
     let payload32: string | null = null;
-    if (count32 > 0) {
-      const snap32 = arenas.get(32)!.step();
+    const arena32 = arenas.get(32);
+    if (count32 > 0 && arena32) {
+      const snap32 = arena32.step();
       snap32.onlinePlayers = Math.max(snap32.onlinePlayers, count32);
       payload32 = JSON.stringify({
         type: 'state',
@@ -400,8 +527,9 @@ async function startServer() {
     }
 
     let payload64: string | null = null;
-    if (count64 > 0) {
-      const snap64 = arenas.get(64)!.step();
+    const arena64 = arenas.get(64);
+    if (count64 > 0 && arena64) {
+      const snap64 = arena64.step();
       snap64.onlinePlayers = Math.max(snap64.onlinePlayers, count64);
       payload64 = JSON.stringify({
         type: 'state',
@@ -419,13 +547,21 @@ async function startServer() {
       }
     }
 
-    nextTickAt += TICK_MS;
-    if (nextTickAt < now - TICK_MS) {
-      nextTickAt = now + TICK_MS;
+    if (arenas.size > 0 || clientPlayers.size > 0) {
+      nextTickAt += TICK_MS;
+      if (nextTickAt < now - TICK_MS) {
+        nextTickAt = now + TICK_MS;
+      }
+      tickTimer = setTimeout(runTickLoop, Math.max(1, nextTickAt - performance.now()));
     }
-    setTimeout(runTickLoop, Math.max(1, nextTickAt - performance.now()));
   };
-  setTimeout(runTickLoop, TICK_MS);
+
+  scheduleTickLoop = () => {
+    if (!tickTimer) {
+      nextTickAt = performance.now() + TICK_MS;
+      tickTimer = setTimeout(runTickLoop, TICK_MS);
+    }
+  };
 
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({

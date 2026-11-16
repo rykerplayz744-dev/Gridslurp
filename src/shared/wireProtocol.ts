@@ -33,6 +33,10 @@ const PALETTE_INDEX_BY_ID = new Map<string, number>(
   SNAKE_PALETTES.map((p, idx) => [p.id, idx])
 );
 
+const PALETTE_INDEX_BY_HEAD = new Map<string, number>(
+  SNAKE_PALETTES.map((p, idx) => [p.head, idx])
+);
+
 function resolveColorFromCode(code: number | string): SnakeColor {
   if (typeof code === 'number' && SNAKE_PALETTES[code]) {
     return SNAKE_PALETTES[code];
@@ -162,15 +166,23 @@ export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
     return packed;
   });
 
-  const pl: PackedPellet[] = snap.pellets.map((p) => [
-    p.id,
-    p.x,
-    p.y,
-    p.value,
-    p.growth,
-    p.color,
-    p.ttlTicks,
-  ]);
+  let ps = '';
+  if (snap.pellets.length > 0) {
+    const parts: string[] = new Array(snap.pellets.length);
+    for (let i = 0; i < snap.pellets.length; i++) {
+      const p = snap.pellets[i];
+      const cell = ((p.x << 6) | p.y).toString(36);
+      const colIdx = PALETTE_INDEX_BY_HEAD.get(p.color);
+      const colStr = colIdx !== undefined ? String(colIdx) : p.color;
+      const ttlStr = p.ttlTicks.toString(36);
+      if (p.value === 100 && p.growth === 1) {
+        parts[i] = `${cell}.${colStr}.${ttlStr}`;
+      } else {
+        parts[i] = `${cell}.${p.value.toString(36)}.${p.growth.toString(36)}.${colStr}.${ttlStr}`;
+      }
+    }
+    ps = parts.join('|');
+  }
 
   const tl: PackedTelegraph[] = snap.telegraphs.map((t) => [
     t.id,
@@ -241,7 +253,7 @@ export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
     t: snap.tick,
     gs: snap.gridSize,
     sn,
-    pl,
+    ...(ps ? { ps } : {}),
     ...(lb.length > 0 ? { lb } : {}),
     tl,
     rk,
@@ -284,17 +296,67 @@ export function unpackSnapshot(
     };
   });
 
-  const pellets: BigPellet[] = raw.pl.map((pp) => ({
-    id: pp[0],
-    x: pp[1],
-    y: pp[2],
-    value: pp[3],
-    growth: pp[4],
-    color: pp[5],
-    spawnTick: raw.t,
-    ttlTicks: pp[6],
-    fromSnakeName: '',
-  }));
+  const pellets: BigPellet[] = [];
+  if (typeof raw.ps === 'string' && raw.ps.length > 0) {
+    const tokens = raw.ps.split('|');
+    for (let i = 0; i < tokens.length; i++) {
+      const segs = tokens[i].split('.');
+      if (segs.length === 3) {
+        const cell = parseInt(segs[0], 36) || 0;
+        const x = cell >> 6;
+        const y = cell & 63;
+        const colRaw = segs[1];
+        const colIdx = colRaw.charCodeAt(0) === 35 ? -1 : parseInt(colRaw, 10);
+        const color =
+          colIdx >= 0 && SNAKE_PALETTES[colIdx] ? SNAKE_PALETTES[colIdx].head : colRaw;
+        pellets.push({
+          id: `p_${cell}`,
+          x,
+          y,
+          value: 100,
+          growth: 1,
+          color,
+          spawnTick: raw.t,
+          ttlTicks: parseInt(segs[2], 36) || 1,
+          fromSnakeName: '',
+        });
+      } else if (segs.length >= 5) {
+        const cell = parseInt(segs[0], 36) || 0;
+        const x = cell >> 6;
+        const y = cell & 63;
+        const colRaw = segs[3];
+        const colIdx = colRaw.charCodeAt(0) === 35 ? -1 : parseInt(colRaw, 10);
+        const color =
+          colIdx >= 0 && SNAKE_PALETTES[colIdx] ? SNAKE_PALETTES[colIdx].head : colRaw;
+        pellets.push({
+          id: `p_${cell}`,
+          x,
+          y,
+          value: parseInt(segs[1], 36) || 100,
+          growth: parseInt(segs[2], 36) || 1,
+          color,
+          spawnTick: raw.t,
+          ttlTicks: parseInt(segs[4], 36) || 1,
+          fromSnakeName: '',
+        });
+      }
+    }
+  } else if (Array.isArray(raw.pl)) {
+    for (let i = 0; i < raw.pl.length; i++) {
+      const pp = raw.pl[i];
+      pellets.push({
+        id: pp[0],
+        x: pp[1],
+        y: pp[2],
+        value: pp[3],
+        growth: pp[4],
+        color: pp[5],
+        spawnTick: raw.t,
+        ttlTicks: pp[6],
+        fromSnakeName: '',
+      });
+    }
+  }
 
   const telegraphs: SpawnTelegraph[] = raw.tl.map((pt) => ({
     id: pt[0],

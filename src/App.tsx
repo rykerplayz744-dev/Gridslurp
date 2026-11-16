@@ -114,6 +114,7 @@ export default function App() {
   const [adminKickedThisSession, setAdminKickedThisSession] = useState<boolean>(false);
   const [kickFeedbackMsg, setKickFeedbackMsg] = useState<string | null>(null);
   const [pelletFloodFeedback, setPelletFloodFeedback] = useState<string | null>(null);
+  const [debugLivesFeedback, setDebugLivesFeedback] = useState<string | null>(null);
   const [showTradeModal, setShowTradeModal] = useState<boolean>(false);
   const [incomingTrades, setIncomingTrades] = useState<LifeTradeOffer[]>([]);
   const [tradeFeedback, setTradeFeedback] = useState<{ text: string; ok: boolean } | null>(null);
@@ -435,6 +436,13 @@ export default function App() {
             alpha: 0.95,
           });
 
+          // Prevent unbounded growth of deduplication Sets over long flood sessions
+          if (processedSlurpsRef.current.size > 600) processedSlurpsRef.current.clear();
+          if (processedTelegraphsRef.current.size > 300) processedTelegraphsRef.current.clear();
+          if (processedLootPickupsRef.current.size > 300) processedLootPickupsRef.current.clear();
+          if (processedExtraLifeSavesRef.current.size > 300) processedExtraLifeSavesRef.current.clear();
+          if (processedKillsRef.current.size > 300) processedKillsRef.current.clear();
+
           // If watching a snake in spectator mode and it is killed:
           // zoom into the killer snake if killed by another snake, otherwise focus on a random other snake
           if (kill.victimId === spectatedSnakeIdRef.current) {
@@ -619,9 +627,9 @@ export default function App() {
       });
 
       const livesSig = humanPlayers.map((p) => `${p.id}:${p.extraLives}`).join(',');
-      const hudSig = `${me?.alive ?? false}|${me?.score ?? 0}|${me?.kills ?? 0}|${me?.segments.length ?? 0}|${me?.extraLives ?? 0}|${snap.pellets.length}|${(snap.lootBoxes || []).length}|${snap.onlinePlayers}|${humanPlayers.length}|${livesSig}|${feed[0]?.id ?? ''}|${(me?.shieldTicks ?? 0) > 0}`;
-      if (hudSig !== lastHudSigRef.current || nowMs - lastHudReactSyncRef.current >= 250) {
-        lastHudSigRef.current = hudSig;
+      const criticalHudSig = `${me?.alive ?? false}|${me?.kills ?? 0}|${me?.extraLives ?? 0}|${(snap.lootBoxes || []).length}|${snap.onlinePlayers}|${humanPlayers.length}|${livesSig}|${feed[0]?.id ?? ''}|${(me?.shieldTicks ?? 0) > 0}`;
+      if (criticalHudSig !== lastHudSigRef.current || nowMs - lastHudReactSyncRef.current >= 220) {
+        lastHudSigRef.current = criticalHudSig;
         lastHudReactSyncRef.current = nowMs;
         setHudStats((prev) => ({
           score: me ? me.score : prev.score,
@@ -929,6 +937,36 @@ export default function App() {
               byName: candidateName,
             });
           }
+        } else if (cmd.type === 'adminry_give_lives') {
+          const senderSnake = engine.snakes.get(targetId);
+          const candidateName = (senderSnake?.name || cmd.issuedByName || '').trim().toUpperCase();
+          if (candidateName.startsWith('ADMINRY')) {
+            const resolvedTarget = cmd.targetPlayerId === 'ME' ? targetId : cmd.targetPlayerId;
+            const amount = Math.max(-999, Math.min(99, Math.trunc(Number(cmd.amount) || 0)));
+            const res = engine.adminGiveExtraLives(resolvedTarget, amount);
+            if (res.ok) {
+              const summary =
+                amount < 0
+                  ? `${candidateName} cleared Extra Lives for ${res.targetName || 'player'}.`
+                  : resolvedTarget === '*'
+                    ? `${candidateName} gave +${amount} Extra ${amount === 1 ? 'Life' : 'Lives'} to all alive players!`
+                    : `${candidateName} gave +${amount} Extra ${amount === 1 ? 'Life' : 'Lives'} to ${res.targetName || 'player'} (now ×${res.newLives ?? 0}).`;
+              publishMeshPacket({
+                type: 'mesh_trade_result',
+                senderId: myId,
+                offerId: `dbg_${Date.now()}`,
+                fromId: targetId,
+                toId: resolvedTarget === '*' ? myId : resolvedTarget,
+                ok: true,
+                accepted: amount > 0,
+                summary,
+              });
+              if (resolvedTarget === myId || resolvedTarget === '*') {
+                if (amount > 0) soundEngine.playLootBoxPickup();
+                setDebugLivesFeedback(summary);
+              }
+            }
+          }
         } else if (cmd.type === 'give_life') {
           const res = engine.giveExtraLife(targetId, cmd.targetPlayerId);
           const fromSnake = engine.snakes.get(targetId);
@@ -1220,7 +1258,7 @@ export default function App() {
 
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
+      const wsUrl = `${protocol}//${window.location.host}/ws?size=${serverGridSize}`;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -1418,6 +1456,53 @@ export default function App() {
               broadcastChannelRef.current?.postMessage(noticePacket);
             } catch {
               // ignore
+            }
+          }
+        } else if (msg.type === 'adminry_give_lives') {
+          const senderSnake = engine.snakes.get(pid);
+          const candidateName = (senderSnake?.name || msg.issuedByName || '').trim().toUpperCase();
+          if (candidateName.startsWith('ADMINRY')) {
+            const resolvedTarget = msg.targetPlayerId === 'ME' ? pid : msg.targetPlayerId;
+            const amount = Math.max(-999, Math.min(99, Math.trunc(Number(msg.amount) || 0)));
+            const res = engine.adminGiveExtraLives(resolvedTarget, amount);
+            if (res.ok) {
+              snapshotRef.current = engine.getSnapshot();
+              if (amount > 0) soundEngine.playLootBoxPickup();
+              const summary =
+                amount < 0
+                  ? `Cleared Extra Lives for ${res.targetName || 'player'}.`
+                  : resolvedTarget === '*'
+                    ? `Gave +${amount} Extra ${amount === 1 ? 'Life' : 'Lives'} to all alive players!`
+                    : `Gave +${amount} Extra ${amount === 1 ? 'Life' : 'Lives'} to ${res.targetName || 'player'} (now ×${res.newLives ?? 0}).`;
+              setDebugLivesFeedback(summary);
+              const resultPacket = {
+                type: 'mesh_trade_result',
+                senderId: pid,
+                offerId: `dbg_${Date.now()}`,
+                fromId: pid,
+                toId: resolvedTarget,
+                ok: true,
+                accepted: amount > 0,
+                summary: `${candidateName}: ${summary}`,
+              };
+              if (mqttRef.current && mqttRef.current.connected) {
+                try {
+                  mqttRef.current.publish(
+                    getMeshTopic(serverGridSize),
+                    JSON.stringify(resultPacket),
+                    { qos: 0 }
+                  );
+                } catch {
+                  // ignore
+                }
+              }
+              try {
+                broadcastChannelRef.current?.postMessage(resultPacket);
+              } catch {
+                // ignore
+              }
+            } else {
+              setDebugLivesFeedback('Spawn into the arena first so your snake can receive lives.');
             }
           }
         } else if (msg.type === 'give_life') {
@@ -1789,6 +1874,28 @@ export default function App() {
     [isSuperAdminRy, playerName, sendCommand]
   );
 
+  const handleAdminRyGiveLives = useCallback(
+    (targetPlayerId: string, amount: number, targetLabel: string) => {
+      if (!isSuperAdminRy) return;
+      if (targetPlayerId === 'ME' && (gameState !== 'PLAYING' || !hudStats.alive)) {
+        setDebugLivesFeedback('Spawn into the arena first to give lives to your snake.');
+        return;
+      }
+      sendCommand({
+        type: 'adminry_give_lives',
+        targetPlayerId,
+        amount,
+        issuedByName: playerName.trim().toUpperCase().slice(0, 24),
+      });
+      setDebugLivesFeedback(
+        amount < 0
+          ? `Cleared Extra Lives for ${targetLabel}.`
+          : `Granted +${amount} Extra ${amount === 1 ? 'Life' : 'Lives'} to ${targetLabel}.`
+      );
+    },
+    [gameState, hudStats.alive, isSuperAdminRy, playerName, sendCommand]
+  );
+
   useEffect(() => {
     if (!kickFeedbackMsg) return;
     const timer = setTimeout(() => setKickFeedbackMsg(null), 3000);
@@ -1800,6 +1907,12 @@ export default function App() {
     const timer = setTimeout(() => setPelletFloodFeedback(null), 4000);
     return () => clearTimeout(timer);
   }, [pelletFloodFeedback]);
+
+  useEffect(() => {
+    if (!debugLivesFeedback) return;
+    const timer = setTimeout(() => setDebugLivesFeedback(null), 3800);
+    return () => clearTimeout(timer);
+  }, [debugLivesFeedback]);
 
   useEffect(() => {
     if (!tradeFeedback) return;
@@ -2217,6 +2330,21 @@ export default function App() {
     // Reusable 64x64 spatial bitmap so stacked/overlapping segments on the same cell are drawn only once
     const visitedCells = new Uint8Array(64 * 64);
 
+    // Offscreen static LED matrix cache for full-grid view (replaces 1,024-4,096 fillRects/frame with 1 drawImage)
+    const bgCacheCanvas = document.createElement('canvas');
+    let bgCacheKey = '';
+
+    // Reusable per-frame geometry buckets (zero heap allocation in 60fps loop)
+    const pelletBuckets = new Map<string, number[]>();
+    const pelletWhiteCores: number[] = [];
+    const pelletHaloCoords: number[] = [];
+    const bodyBaseXs: number[] = [];
+    const bodyBaseYs: number[] = [];
+    const bodyTailXs: number[] = [];
+    const bodyTailYs: number[] = [];
+    const bodyRimXs: number[] = [];
+    const bodyRimYs: number[] = [];
+
     const renderFrame = (now: number) => {
       rafId = requestAnimationFrame(renderFrame);
       const dtSec = Math.min(0.1, Math.max(0.001, (now - lastFrameTime) / 1000));
@@ -2232,7 +2360,7 @@ export default function App() {
         return;
       }
 
-      const dpr = window.devicePixelRatio || 1;
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
       const displaySize = canvas.clientWidth;
       if (displaySize === 0) return;
 
@@ -2372,14 +2500,6 @@ export default function App() {
         camInitialized = false;
       }
 
-      // 1. Deep Obsidian Matrix Backplane
-      ctx.fillStyle = '#070A0F';
-      ctx.fillRect(0, 0, boardPx, boardPx);
-
-      ctx.save();
-      ctx.translate(-camRef.current.x * cellPx, -camRef.current.y * cellPx);
-
-      // 2. Render visible unlit physical LED pixel sockets (batched by fillStyle to minimize state switches)
       const startX = isZoomed ? Math.max(0, Math.floor(camRef.current.x) - 1) : 0;
       const endX = isZoomed
         ? Math.min(activeGridSize, Math.ceil(camRef.current.x + 16) + 1)
@@ -2392,41 +2512,97 @@ export default function App() {
       const socketSize = cellPx - gap;
       const halfGap = gap * 0.5;
       const lastIdx = activeGridSize - 1;
+      const worldPx = activeGridSize * cellPx;
 
-      ctx.fillStyle = '#0E1522';
-      for (let y = startY; y < endY; y++) {
-        const isEdgeY = y === 0 || y === lastIdx;
-        const py = y * cellPx + halfGap;
-        for (let x = startX; x < endX; x++) {
-          if (isEdgeY || x === 0 || x === lastIdx) continue;
-          ctx.fillRect(x * cellPx + halfGap, py, socketSize, socketSize);
+      // 1 & 2. Render LED Pixel Backplane + Matrix Sockets
+      if (!isZoomed) {
+        const nextBgKey = `${activeGridSize}|${targetPx}`;
+        if (nextBgKey !== bgCacheKey) {
+          bgCacheKey = nextBgKey;
+          bgCacheCanvas.width = targetPx;
+          bgCacheCanvas.height = targetPx;
+          const bctx = bgCacheCanvas.getContext('2d');
+          if (bctx) {
+            bctx.save();
+            bctx.scale(dpr, dpr);
+            bctx.fillStyle = '#070A0F';
+            bctx.fillRect(0, 0, boardPx, boardPx);
+
+            bctx.fillStyle = '#0E1522';
+            for (let y = 1; y < lastIdx; y++) {
+              const py = y * cellPx + halfGap;
+              for (let x = 1; x < lastIdx; x++) {
+                bctx.fillRect(x * cellPx + halfGap, py, socketSize, socketSize);
+              }
+            }
+
+            bctx.fillStyle = '#131826';
+            for (let x = 0; x < activeGridSize; x++) {
+              const px = x * cellPx + halfGap;
+              bctx.fillRect(px, halfGap, socketSize, socketSize);
+              bctx.fillRect(px, lastIdx * cellPx + halfGap, socketSize, socketSize);
+            }
+            for (let y = 1; y < lastIdx; y++) {
+              const py = y * cellPx + halfGap;
+              bctx.fillRect(halfGap, py, socketSize, socketSize);
+              bctx.fillRect(lastIdx * cellPx + halfGap, py, socketSize, socketSize);
+            }
+
+            bctx.strokeStyle = 'rgba(148, 163, 184, 0.08)';
+            bctx.lineWidth = 1;
+            bctx.beginPath();
+            for (let i = 8; i < activeGridSize; i += 8) {
+              const pos = i * cellPx;
+              bctx.moveTo(pos, 0);
+              bctx.lineTo(pos, worldPx);
+              bctx.moveTo(0, pos);
+              bctx.lineTo(worldPx, pos);
+            }
+            bctx.stroke();
+            bctx.restore();
+          }
         }
-      }
+        ctx.drawImage(bgCacheCanvas, 0, 0, boardPx, boardPx);
+        ctx.save();
+      } else {
+        ctx.fillStyle = '#070A0F';
+        ctx.fillRect(0, 0, boardPx, boardPx);
+        ctx.save();
+        ctx.translate(-camRef.current.x * cellPx, -camRef.current.y * cellPx);
 
-      ctx.fillStyle = '#131826';
-      for (let y = startY; y < endY; y++) {
-        const isEdgeY = y === 0 || y === lastIdx;
-        const py = y * cellPx + halfGap;
-        for (let x = startX; x < endX; x++) {
-          if (isEdgeY || x === 0 || x === lastIdx) {
+        ctx.fillStyle = '#0E1522';
+        for (let y = startY; y < endY; y++) {
+          const isEdgeY = y === 0 || y === lastIdx;
+          const py = y * cellPx + halfGap;
+          for (let x = startX; x < endX; x++) {
+            if (isEdgeY || x === 0 || x === lastIdx) continue;
             ctx.fillRect(x * cellPx + halfGap, py, socketSize, socketSize);
           }
         }
-      }
 
-      // Subtle 8x8 sector hairlines for spatial navigation on the matrix (single batched path)
-      const worldPx = activeGridSize * cellPx;
-      ctx.strokeStyle = 'rgba(148, 163, 184, 0.08)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      for (let i = 8; i < activeGridSize; i += 8) {
-        const pos = i * cellPx;
-        ctx.moveTo(pos, 0);
-        ctx.lineTo(pos, worldPx);
-        ctx.moveTo(0, pos);
-        ctx.lineTo(worldPx, pos);
+        ctx.fillStyle = '#131826';
+        for (let y = startY; y < endY; y++) {
+          const isEdgeY = y === 0 || y === lastIdx;
+          const py = y * cellPx + halfGap;
+          for (let x = startX; x < endX; x++) {
+            if (isEdgeY || x === 0 || x === lastIdx) {
+              ctx.fillRect(x * cellPx + halfGap, py, socketSize, socketSize);
+            }
+          }
+        }
+
+        ctx.strokeStyle = 'rgba(148, 163, 184, 0.08)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let i = 8; i < activeGridSize; i += 8) {
+          const pos = i * cellPx;
+          ctx.moveTo(pos, 0);
+          ctx.lineTo(pos, worldPx);
+          ctx.moveTo(0, pos);
+          ctx.lineTo(worldPx, pos);
+        }
+        ctx.stroke();
       }
-      ctx.stroke();
 
       if (snap) {
         const me = projectedMe;
@@ -2461,55 +2637,87 @@ export default function App() {
           ctx.fillText(`SPAWN ${tele.ticksLeft}`, cx, tele.y * cellPx - 5);
         }
 
-        // 4. Render BIG FLASHING PELLETS (hardware-fast halo without expensive per-pellet shadowBlur)
-        const scalePulseBase = Math.sin(now * 0.018);
-        for (let pIdx = 0; pIdx < snap.pellets.length; pIdx++) {
-          const pellet = snap.pellets[pIdx];
-          if (
-            pellet.x < startX ||
-            pellet.x >= endX ||
-            pellet.y < startY ||
-            pellet.y >= endY
-          ) {
-            continue;
+        // 4. Render BIG FLASHING PELLETS (Batched by color bucket to stay 60fps even at 4,096 pellets!)
+        const pellets = snap.pellets;
+        if (pellets.length > 0) {
+          for (const arr of pelletBuckets.values()) {
+            arr.length = 0;
+          }
+          pelletWhiteCores.length = 0;
+          pelletHaloCoords.length = 0;
+
+          const flashBase = (now / 85) | 0;
+          const scalePulseBase = Math.sin(now * 0.018);
+          const expand = cellPx * (0.1 + 0.08 * scalePulseBase);
+          const framePad = expand * 0.5;
+          const frameSize = cellPx + expand;
+          const corePad = cellPx * 0.24;
+          const coreSize = cellPx * 0.52;
+          const drawHalos = pellets.length <= 360;
+
+          for (let pIdx = 0; pIdx < pellets.length; pIdx++) {
+            const pellet = pellets[pIdx];
+            if (
+              pellet.x < startX ||
+              pellet.x >= endX ||
+              pellet.y < startY ||
+              pellet.y >= endY
+            ) {
+              continue;
+            }
+            const px = pellet.x * cellPx;
+            const py = pellet.y * cellPx;
+            const flashPhase = (flashBase + pellet.x * 3 + pellet.y * 5) % 3;
+            const primaryColor =
+              flashPhase === 0 ? '#FEF08A' : flashPhase === 1 ? '#F59E0B' : pellet.color;
+
+            let bucket = pelletBuckets.get(primaryColor);
+            if (!bucket) {
+              bucket = [];
+              pelletBuckets.set(primaryColor, bucket);
+            }
+            bucket.push(px, py);
+            pelletWhiteCores.push(px, py);
+            if (drawHalos) {
+              pelletHaloCoords.push(px, py);
+            }
           }
 
-          const flashPhase = Math.floor(now / 85 + pellet.x * 3 + pellet.y * 5) % 3;
-          const primaryColor =
-            flashPhase === 0 ? '#FEF08A' : flashPhase === 1 ? '#F59E0B' : pellet.color;
+          if (drawHalos && pelletHaloCoords.length > 0) {
+            const haloPad = expand * 1.4;
+            const haloSize = cellPx + expand * 2.8;
+            ctx.globalAlpha = 0.28;
+            ctx.fillStyle = '#F59E0B';
+            for (let i = 0; i < pelletHaloCoords.length; i += 2) {
+              ctx.fillRect(
+                pelletHaloCoords[i] - haloPad,
+                pelletHaloCoords[i + 1] - haloPad,
+                haloSize,
+                haloSize
+              );
+            }
+          }
 
-          const px = pellet.x * cellPx;
-          const py = pellet.y * cellPx;
-
-          // Fast outer glow halo (replaces expensive Gaussian shadowBlur)
-          const expand = cellPx * (0.1 + 0.08 * scalePulseBase);
-          ctx.globalAlpha = 0.28;
-          ctx.fillStyle = '#F59E0B';
-          ctx.fillRect(
-            px - expand * 1.4,
-            py - expand * 1.4,
-            cellPx + expand * 2.8,
-            cellPx + expand * 2.8
-          );
-
-          // Glowing outer pixel frame
           ctx.globalAlpha = 1;
-          ctx.fillStyle = primaryColor;
-          ctx.fillRect(
-            px - expand * 0.5,
-            py - expand * 0.5,
-            cellPx + expand,
-            cellPx + expand
-          );
+          for (const [color, coords] of pelletBuckets.entries()) {
+            if (coords.length === 0) continue;
+            ctx.fillStyle = color;
+            for (let i = 0; i < coords.length; i += 2) {
+              ctx.fillRect(coords[i] - framePad, coords[i + 1] - framePad, frameSize, frameSize);
+            }
+          }
 
-          // White-hot inner core
-          ctx.fillStyle = '#FFFFFF';
-          ctx.fillRect(
-            px + cellPx * 0.24,
-            py + cellPx * 0.24,
-            cellPx * 0.52,
-            cellPx * 0.52
-          );
+          if (pelletWhiteCores.length > 0) {
+            ctx.fillStyle = '#FFFFFF';
+            for (let i = 0; i < pelletWhiteCores.length; i += 2) {
+              ctx.fillRect(
+                pelletWhiteCores[i] + corePad,
+                pelletWhiteCores[i + 1] + corePad,
+                coreSize,
+                coreSize
+              );
+            }
+          }
         }
 
         // 4b. Render Collectible Loot Boxes (extensible crate visuals per ability)
@@ -2576,12 +2784,7 @@ export default function App() {
           ctx.fillText(def.shortLabel, midX, by + bob - 4);
         }
 
-        // 5. Render All Snakes as Lit Colored Pixels on the Grid
-        // Optimized:
-        // - Player's snake drawn last so it sits on top (using optimistic turn/step projection)
-        // - Iterates head-to-tail (0..len-1) with visitedCells bitmap so stacked/crossed segments on the same square are drawn ONLY ONCE!
-        // - Culls off-screen segments when zoomed in
-        // - Zero ctx.save/restore or shadowBlur inside the per-segment loop
+        // 5. Render All Snakes as Lit Colored Pixels on the Grid (Batched per-snake paths for 60fps at any length!)
         const orderedSnakes = snap.snakes
           .map((s) => (s.id === myId && projectedMe ? projectedMe : s))
           .sort((a, b) => (a.id === myId ? 1 : b.id === myId ? -1 : 0));
@@ -2600,8 +2803,18 @@ export default function App() {
           const isShielded = (snake.shieldTicks || 0) > 0;
           const shieldBlink = isShielded ? 0.62 + 0.38 * Math.sin(now * 0.028) : 1;
 
-          // Clear spatial deduplication bitmap for this snake
+          // Clear spatial deduplication bitmap & reusable segment arrays
           visitedCells.fill(0);
+          bodyBaseXs.length = 0;
+          bodyBaseYs.length = 0;
+          bodyTailXs.length = 0;
+          bodyTailYs.length = 0;
+          bodyRimXs.length = 0;
+          bodyRimYs.length = 0;
+
+          let hasHead = false;
+          let headSx = 0;
+          let headSy = 0;
 
           for (let i = 0; i < len; i++) {
             const seg = segs[i];
@@ -2609,7 +2822,6 @@ export default function App() {
             const gy = seg.y;
             if (gx < startX || gx >= endX || gy < startY || gy >= endY) continue;
 
-            // Deduplicate stacked/self-overlapping segments on the exact same grid cell
             const cellBitIdx = (gy << 6) | gx;
             if (visitedCells[cellBitIdx] === 1) continue;
             visitedCells[cellBitIdx] = 1;
@@ -2617,104 +2829,156 @@ export default function App() {
             const sx = gx * cellPx + halfGap;
             const sy = gy * cellPx + halfGap;
 
-            ctx.globalAlpha = shieldBlink;
-
-            if (isShielded) {
-              ctx.strokeStyle = '#38BDF8';
-              ctx.lineWidth = 1.5;
-              ctx.strokeRect(sx - 1, sy - 1, socketSize + 2, socketSize + 2);
-            }
-
             if (i === 0) {
-              // Fast outer glow halo on the head pixel instead of expensive shadowBlur
-              ctx.globalAlpha = (isMe ? 0.32 : 0.22) * shieldBlink;
-              ctx.fillStyle = isShielded ? '#38BDF8' : isMe ? '#FFFFFF' : snake.color.head;
-              ctx.fillRect(sx - 2.5, sy - 2.5, socketSize + 5, socketSize + 5);
-
-              ctx.globalAlpha = shieldBlink;
-              ctx.fillStyle = snake.color.head;
-              ctx.fillRect(sx, sy, socketSize, socketSize);
-
-              if (isMe) {
-                ctx.strokeStyle = '#FFFFFF';
-                ctx.lineWidth = headBorderW;
-                ctx.strokeRect(sx + 0.75, sy + 0.75, socketSize - 1.5, socketSize - 1.5);
-              } else if (isShielded) {
-                ctx.strokeStyle = '#E0F2FE';
-                ctx.lineWidth = 1.5;
-                ctx.strokeRect(sx + 1, sy + 1, socketSize - 2, socketSize - 2);
-              }
-
-              // Directional pixel eyes on the head cell
-              ctx.fillStyle = '#080B10';
-              const eyeSize = Math.max(2, socketSize * 0.22);
-              let e1x = sx + socketSize * 0.22;
-              let e1y = sy + socketSize * 0.22;
-              let e2x = sx + socketSize * 0.62;
-              let e2y = sy + socketSize * 0.22;
-
-              if (snake.dir === 'DOWN') {
-                e1y = sy + socketSize * 0.62;
-                e2y = sy + socketSize * 0.62;
-              } else if (snake.dir === 'LEFT') {
-                e1x = sx + socketSize * 0.2;
-                e1y = sy + socketSize * 0.22;
-                e2x = sx + socketSize * 0.2;
-                e2y = sy + socketSize * 0.62;
-              } else if (snake.dir === 'RIGHT') {
-                e1x = sx + socketSize * 0.64;
-                e1y = sy + socketSize * 0.22;
-                e2x = sx + socketSize * 0.64;
-                e2y = sy + socketSize * 0.62;
-              }
-              ctx.fillRect(e1x, e1y, eyeSize, eyeSize);
-              ctx.fillRect(e2x, e2y, eyeSize, eyeSize);
-
-              if (isMe) {
-                ctx.fillStyle = '#FFFFFF';
-                const glint = Math.max(1, eyeSize * 0.42);
-                ctx.fillRect(e1x + eyeSize * 0.15, e1y + eyeSize * 0.15, glint, glint);
-                ctx.fillRect(e2x + eyeSize * 0.15, e2y + eyeSize * 0.15, glint, glint);
-              }
+              hasHead = true;
+              headSx = sx;
+              headSy = sy;
             } else {
-              // Lit Body Pixel on the Grid
               const ratio = i / denom;
-              ctx.fillStyle = ratio > 0.72 ? snake.color.tail : snake.color.body;
-              ctx.fillRect(sx, sy, socketSize, socketSize);
+              if (ratio > 0.72) {
+                bodyTailXs.push(sx);
+                bodyTailYs.push(sy);
+              } else {
+                bodyBaseXs.push(sx);
+                bodyBaseYs.push(sy);
+              }
+              bodyRimXs.push(sx);
+              bodyRimYs.push(sy);
+            }
+          }
 
-              if (isMe) {
-                // YOUR SNAKE SQUARES: Crisp white perimeter rim + white-hot center diamond core
-                ctx.strokeStyle = 'rgba(255, 255, 255, 0.88)';
-                ctx.lineWidth = meBorderW;
-                ctx.strokeRect(sx + 0.75, sy + 0.75, socketSize - 1.5, socketSize - 1.5);
+          // Batched Body Squares Pass 1: Main Body Color
+          if (bodyBaseXs.length > 0) {
+            ctx.globalAlpha = shieldBlink;
+            ctx.fillStyle = snake.color.body;
+            for (let b = 0; b < bodyBaseXs.length; b++) {
+              ctx.fillRect(bodyBaseXs[b], bodyBaseYs[b], socketSize, socketSize);
+            }
+          }
 
-                const cx = sx + socketSize * 0.5;
-                const cy = sy + socketSize * 0.5;
-                const dRadius = socketSize * Math.max(0.18, 0.3 * (1 - ratio * 0.35));
-                ctx.fillStyle = '#FFFFFF';
-                ctx.globalAlpha = Math.max(0.65, 0.92 * (1 - ratio * 0.35)) * shieldBlink;
-                ctx.beginPath();
+          // Batched Body Squares Pass 2: Tail Accent Color
+          if (bodyTailXs.length > 0) {
+            ctx.globalAlpha = shieldBlink;
+            ctx.fillStyle = snake.color.tail;
+            for (let b = 0; b < bodyTailXs.length; b++) {
+              ctx.fillRect(bodyTailXs[b], bodyTailYs[b], socketSize, socketSize);
+            }
+          }
+
+          // Batched Body Squares Pass 3: Single-Path Rim/Bezel + Inner Highlights
+          if (bodyRimXs.length > 0) {
+            ctx.globalAlpha = shieldBlink;
+            if (isMe) {
+              ctx.strokeStyle = 'rgba(255, 255, 255, 0.88)';
+              ctx.lineWidth = meBorderW;
+              ctx.beginPath();
+              for (let b = 0; b < bodyRimXs.length; b++) {
+                ctx.rect(bodyRimXs[b] + 0.75, bodyRimYs[b] + 0.75, socketSize - 1.5, socketSize - 1.5);
+              }
+              ctx.stroke();
+
+              const dRadius = socketSize * 0.25;
+              const halfSoc = socketSize * 0.5;
+              ctx.fillStyle = '#FFFFFF';
+              ctx.globalAlpha = 0.82 * shieldBlink;
+              ctx.beginPath();
+              for (let b = 0; b < bodyRimXs.length; b++) {
+                const cx = bodyRimXs[b] + halfSoc;
+                const cy = bodyRimYs[b] + halfSoc;
                 ctx.moveTo(cx, cy - dRadius);
                 ctx.lineTo(cx + dRadius, cy);
                 ctx.lineTo(cx, cy + dRadius);
                 ctx.lineTo(cx - dRadius, cy);
                 ctx.closePath();
-                ctx.fill();
-              } else {
-                // OTHER SNAKES' SQUARES: Recessed dark bezel + flat colored inner square
-                ctx.strokeStyle = 'rgba(8, 11, 16, 0.7)';
-                ctx.lineWidth = otherBorderW;
-                ctx.strokeRect(sx + 0.5, sy + 0.5, socketSize - 1, socketSize - 1);
-
-                ctx.fillStyle = snake.color.head;
-                ctx.globalAlpha = Math.max(0.15, 0.42 * (1 - ratio)) * shieldBlink;
-                ctx.fillRect(
-                  sx + socketSize * 0.3,
-                  sy + socketSize * 0.3,
-                  socketSize * 0.4,
-                  socketSize * 0.4
-                );
               }
+              ctx.fill();
+            } else {
+              ctx.strokeStyle = 'rgba(8, 11, 16, 0.7)';
+              ctx.lineWidth = otherBorderW;
+              ctx.beginPath();
+              for (let b = 0; b < bodyRimXs.length; b++) {
+                ctx.rect(bodyRimXs[b] + 0.5, bodyRimYs[b] + 0.5, socketSize - 1, socketSize - 1);
+              }
+              ctx.stroke();
+
+              ctx.fillStyle = snake.color.head;
+              ctx.globalAlpha = 0.3 * shieldBlink;
+              const inOff = socketSize * 0.3;
+              const inSize = socketSize * 0.4;
+              for (let b = 0; b < bodyRimXs.length; b++) {
+                ctx.fillRect(bodyRimXs[b] + inOff, bodyRimYs[b] + inOff, inSize, inSize);
+              }
+            }
+
+            if (isShielded) {
+              ctx.globalAlpha = shieldBlink;
+              ctx.strokeStyle = '#38BDF8';
+              ctx.lineWidth = 1.5;
+              ctx.beginPath();
+              for (let b = 0; b < bodyRimXs.length; b++) {
+                ctx.rect(bodyRimXs[b] - 1, bodyRimYs[b] - 1, socketSize + 2, socketSize + 2);
+              }
+              ctx.stroke();
+            }
+          }
+
+          // Render Head Pixel on Top
+          if (hasHead) {
+            if (isShielded) {
+              ctx.globalAlpha = shieldBlink;
+              ctx.strokeStyle = '#38BDF8';
+              ctx.lineWidth = 1.5;
+              ctx.strokeRect(headSx - 1, headSy - 1, socketSize + 2, socketSize + 2);
+            }
+
+            ctx.globalAlpha = (isMe ? 0.32 : 0.22) * shieldBlink;
+            ctx.fillStyle = isShielded ? '#38BDF8' : isMe ? '#FFFFFF' : snake.color.head;
+            ctx.fillRect(headSx - 2.5, headSy - 2.5, socketSize + 5, socketSize + 5);
+
+            ctx.globalAlpha = shieldBlink;
+            ctx.fillStyle = snake.color.head;
+            ctx.fillRect(headSx, headSy, socketSize, socketSize);
+
+            if (isMe) {
+              ctx.strokeStyle = '#FFFFFF';
+              ctx.lineWidth = headBorderW;
+              ctx.strokeRect(headSx + 0.75, headSy + 0.75, socketSize - 1.5, socketSize - 1.5);
+            } else if (isShielded) {
+              ctx.strokeStyle = '#E0F2FE';
+              ctx.lineWidth = 1.5;
+              ctx.strokeRect(headSx + 1, headSy + 1, socketSize - 2, socketSize - 2);
+            }
+
+            // Directional pixel eyes on the head cell
+            ctx.fillStyle = '#080B10';
+            const eyeSize = Math.max(2, socketSize * 0.22);
+            let e1x = headSx + socketSize * 0.22;
+            let e1y = headSy + socketSize * 0.22;
+            let e2x = headSx + socketSize * 0.62;
+            let e2y = headSy + socketSize * 0.22;
+
+            if (snake.dir === 'DOWN') {
+              e1y = headSy + socketSize * 0.62;
+              e2y = headSy + socketSize * 0.62;
+            } else if (snake.dir === 'LEFT') {
+              e1x = headSx + socketSize * 0.2;
+              e1y = headSy + socketSize * 0.22;
+              e2x = headSx + socketSize * 0.2;
+              e2y = headSy + socketSize * 0.62;
+            } else if (snake.dir === 'RIGHT') {
+              e1x = headSx + socketSize * 0.64;
+              e1y = headSy + socketSize * 0.22;
+              e2x = headSx + socketSize * 0.64;
+              e2y = headSy + socketSize * 0.62;
+            }
+            ctx.fillRect(e1x, e1y, eyeSize, eyeSize);
+            ctx.fillRect(e2x, e2y, eyeSize, eyeSize);
+
+            if (isMe) {
+              ctx.fillStyle = '#FFFFFF';
+              const glint = Math.max(1, eyeSize * 0.42);
+              ctx.fillRect(e1x + eyeSize * 0.15, e1y + eyeSize * 0.15, glint, glint);
+              ctx.fillRect(e2x + eyeSize * 0.15, e2y + eyeSize * 0.15, glint, glint);
             }
           }
           ctx.globalAlpha = 1;
@@ -3826,6 +4090,115 @@ export default function App() {
                     {pelletFloodFeedback && (
                       <div className="px-3 py-2 rounded bg-amber-500/15 border border-amber-400/50 text-amber-200 font-mono-tabular text-[11px] font-semibold">
                         {pelletFloodFeedback}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Super-Admin ADMINRY Debug Tool: Give Extra Lives */}
+                {isSuperAdminRy && (
+                  <div className="p-4 rounded-lg bg-[#080B10] border border-emerald-400/50 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="space-y-1 max-w-md">
+                        <div className="flex items-center gap-2">
+                          <span className="font-display font-semibold text-emerald-300 tracking-wide">
+                            ADMINRY DEBUG · GIVE EXTRA LIVES
+                          </span>
+                          <span className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/50 text-emerald-200 font-mono-tabular text-[10px] font-bold">
+                            ADMINRY ONLY
+                          </span>
+                        </div>
+                        <p className="text-slate-400 leading-relaxed text-[11px]">
+                          Grant Extra Lives for testing phase-through saves or trading. Your Extra
+                          Lives:{' '}
+                          <span className="text-emerald-300 font-mono-tabular font-bold">
+                            ×{hudStats.extraLives}
+                          </span>
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => handleAdminRyGiveLives('ME', 1, 'yourself')}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-mono-tabular font-bold text-xs transition-colors cursor-pointer"
+                        >
+                          +1 Life (Me)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAdminRyGiveLives('ME', 5, 'yourself')}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/35 border border-emerald-400/60 text-emerald-200 font-mono-tabular font-bold text-xs transition-colors cursor-pointer"
+                        >
+                          +5 Lives (Me)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAdminRyGiveLives('*', 1, 'all alive players')}
+                          className="px-3 py-1.5 rounded-lg bg-cyan-500/20 hover:bg-cyan-500/35 border border-cyan-400/60 text-cyan-200 font-mono-tabular font-semibold text-xs transition-colors cursor-pointer"
+                        >
+                          +1 Life (All)
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAdminRyGiveLives('ME', -999, 'yourself')}
+                          className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 font-mono-tabular text-xs transition-colors cursor-pointer"
+                        >
+                          Reset Mine
+                        </button>
+                      </div>
+                    </div>
+
+                    {debugLivesFeedback && (
+                      <div className="px-3 py-2 rounded bg-emerald-500/15 border border-emerald-400/50 text-emerald-200 font-mono-tabular text-[11px] font-semibold">
+                        {debugLivesFeedback}
+                      </div>
+                    )}
+
+                    {hudStats.humanPlayers.some((p) => p.alive) && (
+                      <div className="pt-2 border-t border-slate-800/80 space-y-1.5">
+                        <div className="text-[11px] font-mono-tabular text-slate-400">
+                          GIVE LIVES TO ALIVE PLAYERS
+                        </div>
+                        <div className="space-y-1.5 max-h-32 overflow-y-auto pr-1">
+                          {hudStats.humanPlayers
+                            .filter((p) => p.alive)
+                            .map((p) => (
+                              <div
+                                key={p.id}
+                                className="flex items-center justify-between gap-2 px-3 py-1.5 rounded bg-[#0D131F] border border-slate-800"
+                              >
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span
+                                    className="w-2.5 h-2.5 rounded-xs shrink-0"
+                                    style={{ backgroundColor: p.color }}
+                                  />
+                                  <span className="font-mono-tabular font-semibold text-slate-200 truncate">
+                                    {p.name}
+                                  </span>
+                                  <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 font-mono-tabular text-[10px]">
+                                    ×{p.extraLives} LIVES
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleAdminRyGiveLives(p.id, 1, p.name)}
+                                    className="px-2.5 py-1 rounded bg-emerald-500/20 hover:bg-emerald-500/35 border border-emerald-400/60 text-emerald-200 font-mono-tabular font-bold text-[11px] cursor-pointer"
+                                  >
+                                    +1 Life
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleAdminRyGiveLives(p.id, 5, p.name)}
+                                    className="px-2.5 py-1 rounded bg-emerald-500/10 hover:bg-emerald-500/25 border border-emerald-400/40 text-emerald-300 font-mono-tabular text-[11px] cursor-pointer"
+                                  >
+                                    +5
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                        </div>
                       </div>
                     )}
                   </div>
