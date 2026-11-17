@@ -152,6 +152,7 @@ export interface SnakeEntity {
   name: string;
   color: SnakeColor;
   faceId?: string;
+  deathEffectId?: string;
   segments: Point[]; // segments[0] is head
   prevSegments: Point[]; // for smooth sub-tick visual interpolation
   dir: Direction;
@@ -184,6 +185,7 @@ export interface KillEvent {
   y: number;
   pelletsDropped: number;
   victimColor: string;
+  deathEffectId?: string;
 }
 
 export interface SlurpEvent {
@@ -231,6 +233,7 @@ export interface PackedSnake {
   ts?: number; // last acknowledged turn sequence
   el?: number; // extraLives count when > 0
   fId?: string; // custom PNG face id from src/faces/
+  de?: string; // custom transparent GIF/PNG death effect id from src/death-effects/
 }
 
 export type PackedPellet = [
@@ -266,6 +269,7 @@ export type PackedKill = [
   y: number,
   pelletsDropped: number,
   victimColor: string,
+  deathEffectId?: string,
 ];
 
 export type PackedSlurp = [
@@ -344,6 +348,7 @@ export type ClientToServerMessage =
       name: string;
       colorId: string;
       faceId?: string;
+      deathEffectId?: string;
       clientId: string;
       gridSize?: ServerGridSize;
       autoPilot?: boolean;
@@ -355,11 +360,13 @@ export type ClientToServerMessage =
       name: string;
       colorId: string;
       faceId?: string;
+      deathEffectId?: string;
       gridSize?: ServerGridSize;
       autoPilot?: boolean;
       autoPilotTier?: 'STANDARD' | 'ADMINRY';
     }
   | { type: 'set_face'; faceId?: string }
+  | { type: 'set_death_effect'; deathEffectId?: string }
   | { type: 'select_server'; gridSize: ServerGridSize }
   | { type: 'autopilot'; enabled: boolean; tier?: 'STANDARD' | 'ADMINRY' }
   | { type: 'admin_track'; trackId: string }

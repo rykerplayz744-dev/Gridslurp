@@ -220,7 +220,8 @@ export class ArenaEngine {
     color: SnakeColor,
     spawn: { x: number; y: number; dir: Direction },
     isBot: boolean,
-    faceId?: string
+    faceId?: string,
+    deathEffectId?: string
   ): SnakeEntity {
     const oppDir: Direction =
       spawn.dir === 'UP'
@@ -251,11 +252,17 @@ export class ArenaEngine {
         ? faceId.trim().slice(0, 64)
         : undefined;
 
+    const cleanDeathEffectId =
+      typeof deathEffectId === 'string' && deathEffectId.trim() && deathEffectId !== 'none'
+        ? deathEffectId.trim().slice(0, 80)
+        : undefined;
+
     return {
       id,
       name,
       color,
       faceId: cleanFaceId,
+      deathEffectId: cleanDeathEffectId,
       segments,
       prevSegments: [{ ...segments[0] }],
       dir: spawn.dir,
@@ -278,12 +285,13 @@ export class ArenaEngine {
     colorId: string,
     autoPilot?: boolean,
     autoPilotTier?: 'STANDARD' | 'ADMINRY',
-    faceId?: string
+    faceId?: string,
+    deathEffectId?: string
   ): SnakeEntity {
     const cleanName = (name || 'PLAYER_1').trim().slice(0, 24).toUpperCase() || 'PLAYER_1';
     const color = this.getColorById(colorId);
     const spawn = this.findNearbySafeSpawn();
-    const snake = this.createSnakeEntity(id, cleanName, color, spawn, false, faceId);
+    const snake = this.createSnakeEntity(id, cleanName, color, spawn, false, faceId, deathEffectId);
     if (autoPilot) {
       snake.autoPilot = true;
       snake.autoPilotTier =
@@ -299,6 +307,15 @@ export class ArenaEngine {
     snake.faceId =
       typeof faceId === 'string' && faceId.trim() && faceId !== 'default'
         ? faceId.trim().slice(0, 64)
+        : undefined;
+  }
+
+  public setPlayerDeathEffect(id: string, deathEffectId?: string) {
+    const snake = this.snakes.get(id);
+    if (!snake) return;
+    snake.deathEffectId =
+      typeof deathEffectId === 'string' && deathEffectId.trim() && deathEffectId !== 'none'
+        ? deathEffectId.trim().slice(0, 80)
         : undefined;
   }
 
@@ -1506,6 +1523,7 @@ export class ArenaEngine {
         y: crashPt.y,
         pelletsDropped: victim.segments.length,
         victimColor: victim.color.head,
+        deathEffectId: victim.deathEffectId,
       });
 
       // Remove dead bots from map after death; replacement up to targetBotCount is queued automatically

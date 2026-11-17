@@ -198,7 +198,8 @@ async function startServer() {
             msg.colorId,
             Boolean(msg.autoPilot),
             msg.autoPilotTier,
-            msg.faceId
+            msg.faceId,
+            msg.deathEffectId
           );
           sendMsg({
             type: 'welcome',
@@ -213,6 +214,8 @@ async function startServer() {
             ?.setAutopilot(assignedPlayerId, Boolean(msg.enabled), msg.tier);
         } else if (msg.type === 'set_face') {
           arenas.get(activeGridSize)?.setPlayerFace(assignedPlayerId, msg.faceId);
+        } else if (msg.type === 'set_death_effect') {
+          arenas.get(activeGridSize)?.setPlayerDeathEffect(assignedPlayerId, msg.deathEffectId);
         } else if (msg.type === 'respawn') {
           if (msg.gridSize === 64 || msg.gridSize === 32) {
             if (msg.gridSize !== activeGridSize) {
@@ -232,7 +235,8 @@ async function startServer() {
             msg.colorId,
             Boolean(msg.autoPilot),
             msg.autoPilotTier,
-            msg.faceId
+            msg.faceId,
+            msg.deathEffectId
           );
           sendMsg({
             type: 'state',

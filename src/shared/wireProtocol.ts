@@ -173,6 +173,9 @@ export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
     if (s.faceId) {
       packed.fId = s.faceId;
     }
+    if (s.deathEffectId) {
+      packed.de = s.deathEffectId;
+    }
     sn[i] = packed;
   }
 
@@ -212,19 +215,34 @@ export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
   const rk: PackedKill[] = new Array(snap.recentKills.length);
   for (let i = 0; i < snap.recentKills.length; i++) {
     const k = snap.recentKills[i];
-    rk[i] = [
-      k.id,
-      k.tick,
-      k.victimId,
-      k.victimName,
-      k.killerId || '',
-      k.killerName || '',
-      Math.max(0, DEATH_REASONS.indexOf(k.reason)),
-      k.x,
-      k.y,
-      k.pelletsDropped,
-      k.victimColor,
-    ];
+    rk[i] = k.deathEffectId
+      ? [
+          k.id,
+          k.tick,
+          k.victimId,
+          k.victimName,
+          k.killerId || '',
+          k.killerName || '',
+          Math.max(0, DEATH_REASONS.indexOf(k.reason)),
+          k.x,
+          k.y,
+          k.pelletsDropped,
+          k.victimColor,
+          k.deathEffectId,
+        ]
+      : [
+          k.id,
+          k.tick,
+          k.victimId,
+          k.victimName,
+          k.killerId || '',
+          k.killerName || '',
+          Math.max(0, DEATH_REASONS.indexOf(k.reason)),
+          k.x,
+          k.y,
+          k.pelletsDropped,
+          k.victimColor,
+        ];
   }
 
   const rs: PackedSlurp[] = new Array(snap.recentSlurps.length);
@@ -305,6 +323,7 @@ export function unpackSnapshot(
       name: ps.n,
       color: resolveColorFromCode(ps.c),
       faceId: ps.fId || undefined,
+      deathEffectId: ps.de || undefined,
       segments: decodeSegments(ps.g),
       prevSegments: [{ x: ps.px, y: ps.py }],
       dir: DIRS[ps.d] || 'RIGHT',
@@ -432,6 +451,7 @@ export function unpackSnapshot(
       y: pk[8],
       pelletsDropped: pk[9],
       victimColor: pk[10],
+      deathEffectId: pk[11] || undefined,
     };
   }
 

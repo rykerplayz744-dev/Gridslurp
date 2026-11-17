@@ -16,6 +16,13 @@ import {
 } from './shared/gameTypes';
 import { packSnapshot, unpackSnapshot } from './shared/wireProtocol';
 import {
+  createDeathEffectPlaybackUrl,
+  DISCOVERED_DEATH_EFFECTS,
+  loadSelectedDeathEffectId,
+  preloadDeathEffectBlob,
+  saveSelectedDeathEffectId,
+} from './utils/deathEffectManager';
+import {
   DISCOVERED_SNAKE_FACES,
   getFaceById,
   getFaceImage,
@@ -69,6 +76,16 @@ interface Shockwave {
   alpha: number;
 }
 
+interface ActiveDeathEffectOverlay {
+  id: string;
+  x: number;
+  y: number;
+  url: string;
+  objectUrlToRevoke: string | null;
+  startedAt: number;
+  durationMs: number;
+}
+
 export default function App() {
   const [gameState, setGameState] = useState<GameState>('TITLE_MENU');
   const [isSpectating, setIsSpectating] = useState<boolean>(false);
@@ -92,6 +109,10 @@ export default function App() {
   const [playerName, setPlayerName] = useState<string>('VIPER_01');
   const [selectedColorId, setSelectedColorId] = useState<string>('emerald');
   const [selectedFaceId, setSelectedFaceId] = useState<string>(() => loadSelectedFaceId());
+  const [selectedDeathEffectId, setSelectedDeathEffectId] = useState<string>(() =>
+    loadSelectedDeathEffectId()
+  );
+  const [activeDeathOverlays, setActiveDeathOverlays] = useState<ActiveDeathEffectOverlay[]>([]);
   const [muted, setMuted] = useState<boolean>(soundEngine.muted);
   const [, setConnectionMode] = useState<'ws' | 'local-sync'>('ws');
   const [showAdminModal, setShowAdminModal] = useState<boolean>(false);
@@ -149,6 +170,7 @@ export default function App() {
   const playerNameRef = useRef<string>(playerName);
   const selectedColorIdRef = useRef<string>(selectedColorId);
   const selectedFaceIdRef = useRef<string>(selectedFaceId);
+  const selectedDeathEffectIdRef = useRef<string>(selectedDeathEffectId);
   const lastAutoRespawnAtRef = useRef<number>(0);
   const triggerAutoPilotRespawnRef = useRef<() => void>(() => {});
 
@@ -249,10 +271,17 @@ export default function App() {
     readyToLeadAt: 0,
   });
   const lastAutoJoinSentAtRef = useRef<number>(0);
-  const myJoinInfoRef = useRef<{ name: string; colorId: string; faceId?: string; playing: boolean }>({
+  const myJoinInfoRef = useRef<{
+    name: string;
+    colorId: string;
+    faceId?: string;
+    deathEffectId?: string;
+    playing: boolean;
+  }>({
     name: 'VIPER_01',
     colorId: 'emerald',
     faceId: undefined,
+    deathEffectId: undefined,
     playing: false,
   });
 
@@ -279,6 +308,90 @@ export default function App() {
   const turnSeqRef = useRef<number>(0);
   const lastHudReactSyncRef = useRef<number>(0);
   const lastHudSigRef = useRef<string>('');
+  const deathOverlaysRef = useRef<ActiveDeathEffectOverlay[]>([]);
+  const deathOverlayElemMapRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const deathOverlayTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  const clearAllDeathOverlays = useCallback(() => {
+    for (const timer of deathOverlayTimersRef.current.values()) {
+      clearTimeout(timer);
+    }
+    deathOverlayTimersRef.current.clear();
+    for (const ov of deathOverlaysRef.current) {
+      if (ov.objectUrlToRevoke) {
+        try {
+          URL.revokeObjectURL(ov.objectUrlToRevoke);
+        } catch {
+          // ignore revoke error
+        }
+      }
+    }
+    deathOverlaysRef.current = [];
+    setActiveDeathOverlays([]);
+  }, []);
+
+  const triggerDeathEffectOverlay = useCallback(
+    (killId: string, gridX: number, gridY: number, effectId?: string | null) => {
+      if (!effectId || effectId === 'none') return;
+      const playback = createDeathEffectPlaybackUrl(effectId);
+      if (!playback) return;
+
+      const durationMs = 1750;
+      const entry: ActiveDeathEffectOverlay = {
+        id: killId,
+        x: gridX,
+        y: gridY,
+        url: playback.url,
+        objectUrlToRevoke: playback.objectUrlToRevoke,
+        startedAt: performance.now(),
+        durationMs,
+      };
+
+      const nextList = [...deathOverlaysRef.current, entry];
+      while (nextList.length > 24) {
+        const evicted = nextList.shift();
+        if (evicted) {
+          const oldTimer = deathOverlayTimersRef.current.get(evicted.id);
+          if (oldTimer) {
+            clearTimeout(oldTimer);
+            deathOverlayTimersRef.current.delete(evicted.id);
+          }
+          if (evicted.objectUrlToRevoke) {
+            try {
+              URL.revokeObjectURL(evicted.objectUrlToRevoke);
+            } catch {
+              // ignore
+            }
+          }
+        }
+      }
+      deathOverlaysRef.current = nextList;
+      setActiveDeathOverlays(nextList);
+
+      const timer = setTimeout(() => {
+        deathOverlayTimersRef.current.delete(killId);
+        const filtered = deathOverlaysRef.current.filter((ov) => ov.id !== killId);
+        deathOverlaysRef.current = filtered;
+        setActiveDeathOverlays(filtered);
+        if (playback.objectUrlToRevoke) {
+          try {
+            URL.revokeObjectURL(playback.objectUrlToRevoke);
+          } catch {
+            // ignore
+          }
+        }
+      }, durationMs + 60);
+
+      deathOverlayTimersRef.current.set(killId, timer);
+    },
+    []
+  );
+
+  useEffect(() => {
+    return () => {
+      clearAllDeathOverlays();
+    };
+  }, [clearAllDeathOverlays]);
 
   useEffect(() => {
     gameStateRef.current = gameState;
@@ -449,6 +562,17 @@ export default function App() {
             color: '#F59E0B',
             alpha: 0.95,
           });
+
+          const victimSnake = snap.snakes.find((s) => s.id === kill.victimId);
+          const resolvedDeathEffectId =
+            kill.deathEffectId ||
+            victimSnake?.deathEffectId ||
+            (kill.victimId === myId && selectedDeathEffectIdRef.current !== 'none'
+              ? selectedDeathEffectIdRef.current
+              : undefined);
+          if (resolvedDeathEffectId) {
+            triggerDeathEffectOverlay(kill.id, kill.x, kill.y, resolvedDeathEffectId);
+          }
 
           // Prevent unbounded growth of deduplication Sets over long flood sessions
           if (processedSlurpsRef.current.size > 600) processedSlurpsRef.current.clear();
@@ -702,7 +826,7 @@ export default function App() {
         }));
       }
     },
-    [pickRandomSpectatedSnake, spawnBurst]
+    [pickRandomSpectatedSnake, spawnBurst, triggerDeathEffectOverlay]
   );
 
   // Setup Live Multiplayer: Direct /ws Server + Global Cross-Device WSS Mesh (for Vercel) + BroadcastChannel
@@ -716,6 +840,7 @@ export default function App() {
     const meshTopic = getMeshTopic(serverGridSize);
     activePeersRef.current.clear();
     localEngineRef.current = null;
+    clearAllDeathOverlays();
 
     // Reset coordinator state cleanly for this room
     meshCoordRef.current = {
@@ -826,6 +951,7 @@ export default function App() {
             name: myJoinInfoRef.current.name,
             colorId: myJoinInfoRef.current.colorId,
             faceId: myJoinInfoRef.current.faceId,
+            deathEffectId: myJoinInfoRef.current.deathEffectId,
             gridSize: serverGridSize,
           },
         });
@@ -968,7 +1094,8 @@ export default function App() {
               cmd.colorId,
               Boolean(cmd.autoPilot),
               cmd.autoPilotTier,
-              cmd.faceId
+              cmd.faceId,
+              cmd.deathEffectId
             );
           }
         } else if (cmd.type === 'respawn') {
@@ -978,10 +1105,13 @@ export default function App() {
             cmd.colorId,
             Boolean(cmd.autoPilot),
             cmd.autoPilotTier,
-            cmd.faceId
+            cmd.faceId,
+            cmd.deathEffectId
           );
         } else if (cmd.type === 'set_face') {
           engine.setPlayerFace(targetId, cmd.faceId);
+        } else if (cmd.type === 'set_death_effect') {
+          engine.setPlayerDeathEffect(targetId, cmd.deathEffectId);
         } else if (cmd.type === 'turn') {
           engine.queueTurn(targetId, cmd.dir, cmd.seq);
         } else if (cmd.type === 'autopilot') {
@@ -1306,7 +1436,8 @@ export default function App() {
                 myJoinInfoRef.current.colorId,
                 false,
                 undefined,
-                myJoinInfoRef.current.faceId
+                myJoinInfoRef.current.faceId,
+                myJoinInfoRef.current.deathEffectId
               );
             }
           }
@@ -1557,10 +1688,13 @@ export default function App() {
           name: msg.name,
           colorId: msg.colorId,
           faceId: msg.faceId,
+          deathEffectId: msg.deathEffectId,
           playing: true,
         };
       } else if (msg.type === 'set_face') {
         myJoinInfoRef.current.faceId = msg.faceId;
+      } else if (msg.type === 'set_death_effect') {
+        myJoinInfoRef.current.deathEffectId = msg.deathEffectId;
       } else if (msg.type === 'leave') {
         myJoinInfoRef.current.playing = false;
       }
@@ -1582,11 +1716,15 @@ export default function App() {
             msg.colorId,
             Boolean(msg.autoPilot),
             msg.autoPilotTier,
-            msg.faceId
+            msg.faceId,
+            msg.deathEffectId
           );
           snapshotRef.current = engine.getSnapshot();
         } else if (msg.type === 'set_face') {
           engine.setPlayerFace(pid, msg.faceId);
+          snapshotRef.current = engine.getSnapshot();
+        } else if (msg.type === 'set_death_effect') {
+          engine.setPlayerDeathEffect(pid, msg.deathEffectId);
           snapshotRef.current = engine.getSnapshot();
         } else if (msg.type === 'turn') {
           engine.queueTurn(pid, msg.dir, msg.seq);
@@ -2207,9 +2345,30 @@ export default function App() {
     [sendCommand]
   );
 
+  const handleSelectDeathEffect = useCallback(
+    (effectId: string) => {
+      const normalized = effectId && effectId !== 'none' ? effectId : 'none';
+      setSelectedDeathEffectId(normalized);
+      selectedDeathEffectIdRef.current = normalized;
+      saveSelectedDeathEffectId(normalized);
+      if (normalized !== 'none') {
+        preloadDeathEffectBlob(normalized);
+      }
+      if (gameStateRef.current === 'PLAYING') {
+        sendCommand({
+          type: 'set_death_effect',
+          deathEffectId: normalized !== 'none' ? normalized : undefined,
+        });
+      }
+    },
+    [sendCommand]
+  );
+
   const handleStartOrRespawn = useCallback(() => {
     const cleanName = playerName.trim().toUpperCase().slice(0, 24) || 'VIPER_01';
     const cleanFaceId = selectedFaceId !== 'default' ? selectedFaceId : undefined;
+    const cleanDeathEffectId =
+      selectedDeathEffectId !== 'none' ? selectedDeathEffectId : undefined;
     lastAutoJoinSentAtRef.current = performance.now();
     lastSentAutoPilotRef.current = false;
     autoPilotActiveRef.current = false;
@@ -2220,12 +2379,13 @@ export default function App() {
       name: cleanName,
       colorId: selectedColorId,
       faceId: cleanFaceId,
+      deathEffectId: cleanDeathEffectId,
       clientId: playerIdRef.current,
       gridSize: serverGridSize,
     });
     setIsSpectating(false);
     setGameState('PLAYING');
-  }, [playerName, selectedColorId, selectedFaceId, serverGridSize, sendCommand]);
+  }, [playerName, selectedColorId, selectedFaceId, selectedDeathEffectId, serverGridSize, sendCommand]);
 
   const handleToggleMute = useCallback(() => {
     const nextMuted = soundEngine.toggleMute();
@@ -2354,7 +2514,8 @@ export default function App() {
     playerNameRef.current = playerName;
     selectedColorIdRef.current = selectedColorId;
     selectedFaceIdRef.current = selectedFaceId;
-  }, [isAdminName, isSuperAdminRy, playerName, selectedColorId, selectedFaceId]);
+    selectedDeathEffectIdRef.current = selectedDeathEffectId;
+  }, [isAdminName, isSuperAdminRy, playerName, selectedColorId, selectedFaceId, selectedDeathEffectId]);
 
   useEffect(() => {
     triggerAutoPilotRespawnRef.current = () => {
@@ -2369,6 +2530,10 @@ export default function App() {
         selectedFaceIdRef.current && selectedFaceIdRef.current !== 'default'
           ? selectedFaceIdRef.current
           : undefined;
+      const cleanDeathEffectId =
+        selectedDeathEffectIdRef.current && selectedDeathEffectIdRef.current !== 'none'
+          ? selectedDeathEffectIdRef.current
+          : undefined;
 
       predictedTurnsRef.current = [];
       gameStateRef.current = 'PLAYING';
@@ -2382,6 +2547,7 @@ export default function App() {
         name: cleanName,
         colorId: selectedColorIdRef.current,
         faceId: cleanFaceId,
+        deathEffectId: cleanDeathEffectId,
         gridSize: serverGridSize,
         autoPilot: true,
         autoPilotTier: tier,
@@ -2648,10 +2814,12 @@ export default function App() {
         ctx.scale(effectiveScale, effectiveScale);
 
       // Apply decaying screen shake
+      let shakeDx = 0;
+      let shakeDy = 0;
       if (shakeRef.current > 0.2) {
-        const dx = (Math.random() - 0.5) * shakeRef.current;
-        const dy = (Math.random() - 0.5) * shakeRef.current;
-        ctx.translate(dx, dy);
+        shakeDx = (Math.random() - 0.5) * shakeRef.current;
+        shakeDy = (Math.random() - 0.5) * shakeRef.current;
+        ctx.translate(shakeDx, shakeDy);
         shakeRef.current *= 0.84;
       } else {
         shakeRef.current = 0;
@@ -3395,6 +3563,30 @@ export default function App() {
       popupsRef.current = nextPopups;
 
         ctx.restore();
+
+        // 10. Sync transparent GIF / PNG Death Effect overlays so they cover the 3x3 area around head:
+        // from (headX - 1, headY + 1) [down 1, left 1] to (headX + 1, headY - 1) [up 1, right 1]
+        const activeOverlays = deathOverlaysRef.current;
+        if (activeOverlays.length > 0) {
+          const camX = isZoomed ? camRef.current.x : 0;
+          const camY = isZoomed ? camRef.current.y : 0;
+          const boxSizePx = cellPx * 3;
+          for (let i = 0; i < activeOverlays.length; i++) {
+            const ov = activeOverlays[i];
+            const el = deathOverlayElemMapRef.current.get(ov.id);
+            if (!el) continue;
+            const leftPx = (ov.x - 1 - camX) * cellPx + shakeDx;
+            const topPx = (ov.y - 1 - camY) * cellPx + shakeDy;
+            const ageMs = now - ov.startedAt;
+            const fadeRemain = ov.durationMs - ageMs;
+            const opacity =
+              fadeRemain <= 0 ? 0 : fadeRemain < 320 ? Math.max(0, fadeRemain / 320) : 1;
+            el.style.width = `${boxSizePx}px`;
+            el.style.height = `${boxSizePx}px`;
+            el.style.transform = `translate3d(${leftPx}px, ${topPx}px, 0)`;
+            el.style.opacity = String(opacity);
+          }
+        }
       } catch {
         // Prevent single-frame driver/canvas errors from stalling animation or leaking transform state
         try {
@@ -3627,10 +3819,38 @@ export default function App() {
                 {serverGridSize - 1},{serverGridSize - 1}
               </span>
 
-              <canvas
-                ref={canvasRef}
-                className="w-full h-full block rounded-sm bg-[#070A0F]"
-              />
+              <div className="relative w-full h-full overflow-hidden rounded-sm bg-[#070A0F]">
+                <canvas
+                  ref={canvasRef}
+                  className="w-full h-full block"
+                />
+                {activeDeathOverlays.map((ov) => (
+                  <img
+                    key={ov.id}
+                    ref={(node) => {
+                      if (node) {
+                        deathOverlayElemMapRef.current.set(ov.id, node);
+                      } else {
+                        deathOverlayElemMapRef.current.delete(ov.id);
+                      }
+                    }}
+                    src={ov.url}
+                    alt=""
+                    aria-hidden="true"
+                    className="pointer-events-none select-none [image-rendering:pixelated]"
+                    style={{
+                      position: 'absolute',
+                      left: 0,
+                      top: 0,
+                      width: 0,
+                      height: 0,
+                      opacity: 0,
+                      objectFit: 'fill',
+                      zIndex: 10,
+                    }}
+                  />
+                ))}
+              </div>
 
               {gameState === 'PLAYING' && autoPilotActive && !showAdminModal && (
                 <div
@@ -4139,6 +4359,77 @@ export default function App() {
                       </div>
                     );
                   })()}
+                </div>
+                {/* Scrollable Death Effect Picker (auto-discovers *.gif & *.png from src/death-effects/) */}
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className="block text-xs font-medium text-slate-300">
+                      DEATH EFFECT ·{' '}
+                      <span className="font-mono-tabular text-amber-400">
+                        src/death-effects/*.gif / .png
+                      </span>
+                    </span>
+                    <span className="text-[11px] font-mono-tabular text-slate-400">
+                      {DISCOVERED_DEATH_EFFECTS.length} FILE
+                      {DISCOVERED_DEATH_EFFECTS.length === 1 ? '' : 'S'} · 3×3 HEAD
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-4 sm:grid-cols-5 gap-2 h-24 overflow-y-scroll pr-1.5 p-2 rounded-lg bg-[#080B10] border border-slate-800 face-tray-scroll">
+                    <button
+                      type="button"
+                      onClick={() => handleSelectDeathEffect('none')}
+                      className={`flex flex-col items-center justify-center gap-1 p-1.5 rounded-md border transition-all cursor-pointer ${
+                        selectedDeathEffectId === 'none'
+                          ? 'bg-slate-800/90 border-white text-white shadow-sm'
+                          : 'bg-[#0D131F] border-slate-800 text-slate-400 hover:border-slate-600'
+                      }`}
+                      title="No overlay image — default pixel shatter particles only"
+                    >
+                      <div className="w-7 h-7 rounded-xs flex items-center justify-center border border-slate-700/70 bg-[#070A0F]">
+                        <span className="text-[10px] font-mono-tabular text-slate-500">NONE</span>
+                      </div>
+                      <span className="text-[10px] truncate w-full text-center font-mono-tabular">
+                        Default
+                      </span>
+                    </button>
+
+                    {DISCOVERED_DEATH_EFFECTS.map((fx) => {
+                      const active = selectedDeathEffectId === fx.id;
+                      return (
+                        <button
+                          key={fx.id}
+                          type="button"
+                          onClick={() => handleSelectDeathEffect(fx.id)}
+                          className={`relative flex flex-col items-center justify-center gap-1 p-1.5 rounded-md border transition-all cursor-pointer ${
+                            active
+                              ? 'bg-slate-800/90 border-white text-white shadow-sm'
+                              : 'bg-[#0D131F] border-slate-800 text-slate-400 hover:border-slate-600'
+                          }`}
+                          title={`${fx.filename} (src/death-effects/${fx.id}) — covers 3×3 pixels centered on head on death`}
+                        >
+                          <span
+                            className={`absolute top-1 right-1 px-1 rounded text-[8px] font-mono-tabular font-bold leading-tight ${
+                              fx.kind === 'gif'
+                                ? 'bg-cyan-500/20 text-cyan-300'
+                                : 'bg-amber-500/20 text-amber-300'
+                            }`}
+                          >
+                            {fx.kind.toUpperCase()}
+                          </span>
+                          <div className="w-7 h-7 rounded-xs overflow-hidden flex items-center justify-center border border-slate-700/70 bg-[#070A0F]">
+                            <img
+                              src={fx.url}
+                              alt={fx.label}
+                              className="w-full h-full object-contain [image-rendering:pixelated]"
+                            />
+                          </div>
+                          <span className="text-[10px] truncate w-full text-center font-mono-tabular">
+                            {fx.label}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <div>
