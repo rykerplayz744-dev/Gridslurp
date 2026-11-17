@@ -510,44 +510,61 @@ async function startServer() {
     const now = performance.now();
     let count32 = 0;
     let count64 = 0;
+    let total32 = 0;
+    let total64 = 0;
 
     for (const [client, info] of clientPlayers.entries()) {
-      if (client.readyState !== WebSocket.OPEN) continue;
-      if (info.gridSize === 64) count64++;
-      else count32++;
+      const state = client.readyState;
+      if (state !== WebSocket.OPEN && state !== WebSocket.CONNECTING) continue;
+      if (info.gridSize === 64) {
+        total64++;
+        if (state === WebSocket.OPEN) count64++;
+      } else {
+        total32++;
+        if (state === WebSocket.OPEN) count32++;
+      }
     }
 
-    pruneEmptyArenas();
+    if (total32 === 0 && arenas.has(32)) arenas.delete(32);
+    if (total64 === 0 && arenas.has(64)) arenas.delete(64);
 
-    let payload32: string | null = null;
+    let buf32: Buffer | null = null;
     const arena32 = arenas.get(32);
     if (count32 > 0 && arena32) {
       const snap32 = arena32.step();
       snap32.onlinePlayers = Math.max(snap32.onlinePlayers, count32);
-      payload32 = JSON.stringify({
-        type: 'state',
-        state: packSnapshot(snap32),
-      } satisfies ServerToClientMessage);
+      buf32 = Buffer.from(
+        JSON.stringify({
+          type: 'state',
+          state: packSnapshot(snap32),
+        } satisfies ServerToClientMessage),
+        'utf8'
+      );
     }
 
-    let payload64: string | null = null;
+    let buf64: Buffer | null = null;
     const arena64 = arenas.get(64);
     if (count64 > 0 && arena64) {
       const snap64 = arena64.step();
       snap64.onlinePlayers = Math.max(snap64.onlinePlayers, count64);
-      payload64 = JSON.stringify({
-        type: 'state',
-        state: packSnapshot(snap64),
-      } satisfies ServerToClientMessage);
+      buf64 = Buffer.from(
+        JSON.stringify({
+          type: 'state',
+          state: packSnapshot(snap64),
+        } satisfies ServerToClientMessage),
+        'utf8'
+      );
     }
 
-    for (const [client, info] of clientPlayers.entries()) {
-      if (client.readyState !== WebSocket.OPEN) continue;
-      // Backpressure guard: allow full-grid 64x64 pellet flood frames while protecting stalled sockets
-      if (client.bufferedAmount > 524288) continue;
-      const payload = info.gridSize === 64 ? payload64 : payload32;
-      if (payload) {
-        client.send(payload);
+    if (buf32 || buf64) {
+      for (const [client, info] of clientPlayers.entries()) {
+        if (client.readyState !== WebSocket.OPEN) continue;
+        // Backpressure guard: allow full-grid 64x64 pellet flood frames while protecting stalled sockets
+        if (client.bufferedAmount > 524288) continue;
+        const payload = info.gridSize === 64 ? buf64 : buf32;
+        if (payload) {
+          client.send(payload, { binary: false });
+        }
       }
     }
 

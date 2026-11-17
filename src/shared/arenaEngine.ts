@@ -81,6 +81,24 @@ export class ArenaEngine {
   private targetBotCount = 2;
   private readonly bfsVisited = new Uint8Array(64 * 64);
   private readonly bfsQueue = new Int16Array(64 * 64);
+  private readonly botHazardGrid = new Uint8Array(64 * 64);
+  private readonly aliveSnakesScratch: SnakeEntity[] = [];
+  private readonly humanAnchorsScratch: Point[] = [];
+  private readonly nextHeadsScratch: Map<string, Point> = new Map();
+  private readonly pendingGrowthScratch: Map<string, number> = new Map();
+  private readonly pelletAtCellScratch: Map<number, BigPellet> = new Map();
+  private readonly eatenPelletsScratch: Set<BigPellet> = new Set();
+  private readonly bodyOwnersScratch: Map<number, SnakeEntity | SnakeEntity[]> = new Map();
+  private readonly unshieldedScratch: SnakeEntity[] = [];
+  private readonly doomedScratch: Map<
+    string,
+    {
+      reason: 'WALL_CRASH' | 'SELF_CRASH' | 'KILLED_BY_SNAKE' | 'HEAD_COLLISION';
+      killer?: SnakeEntity;
+    }
+  > = new Map();
+  private readonly savedByExtraLifeScratch: Set<string> = new Set();
+  private readonly collectedBoxIdsScratch: Set<string> = new Set();
 
   constructor(targetBotCount = 2, gridSize = GRID_SIZE) {
     this.targetBotCount = targetBotCount;
@@ -541,9 +559,10 @@ export class ArenaEngine {
     }
   }
 
-  private dropBigFlashingPellets(victim: SnakeEntity) {
-    // O(1) spatial map of existing pellets so even a 2,000-segment snake drops pellets in < 1ms
-    const pelletByCell = new Map<number, BigPellet>();
+  private dropBigFlashingPellets(victim: SnakeEntity, fallbackHead?: Point) {
+    // O(1) spatial map of existing pellets so even a long snake drops pellets cleanly
+    const pelletByCell = this.pelletAtCellScratch;
+    pelletByCell.clear();
     for (let i = 0; i < this.pellets.length; i++) {
       const p = this.pellets[i];
       pelletByCell.set((p.x << 8) | p.y, p);
@@ -551,8 +570,9 @@ export class ArenaEngine {
 
     const count = victim.segments.length;
     for (let i = 0; i < count; i++) {
-      const seg = victim.segments[i];
-      if (!isInsideGrid(seg, this.gridSize)) continue;
+      const rawSeg = victim.segments[i];
+      const seg = isInsideGrid(rawSeg, this.gridSize) ? rawSeg : fallbackHead;
+      if (!seg || !isInsideGrid(seg, this.gridSize)) continue;
 
       const key = (seg.x << 8) | seg.y;
       const existing = pelletByCell.get(key);
@@ -579,36 +599,44 @@ export class ArenaEngine {
       this.pellets.push(created);
       pelletByCell.set(key, created);
     }
+    pelletByCell.clear();
   }
 
   private computeBotDirection(bot: SnakeEntity): Direction {
+    const gs = this.gridSize;
     const head = bot.segments[0];
     const allDirs: Direction[] = ['UP', 'DOWN', 'LEFT', 'RIGHT'];
-    const validDirs = allDirs.filter((d) => !isOppositeDirection(d, bot.dir));
 
     // Human-like reaction delay: if continuing straight stays inside the grid,
     // the bot often stays committed to its current heading instead of frame-perfectly dodging.
-    const straightPt = stepPoint(head, bot.dir);
-    const straightSafeFromWall =
-      isInsideGrid(straightPt, this.gridSize) &&
-      straightPt.x >= 1 &&
-      straightPt.x < this.gridSize - 1 &&
-      straightPt.y >= 1 &&
-      straightPt.y < this.gridSize - 1;
+    let straightX = head.x;
+    let straightY = head.y;
+    if (bot.dir === 'UP') straightY--;
+    else if (bot.dir === 'DOWN') straightY++;
+    else if (bot.dir === 'LEFT') straightX--;
+    else straightX++;
 
-    if (straightSafeFromWall && Math.random() < 0.62) {
+    if (
+      straightX >= 1 &&
+      straightX < gs - 1 &&
+      straightY >= 1 &&
+      straightY < gs - 1 &&
+      Math.random() < 0.62
+    ) {
       return bot.dir;
     }
 
-    // Build fast integer hazard set only for the 3 candidate neighbor cells around the bot's head
-    const otherTrailCells = new Set<number>();
+    // Reuse bitmap for the 3 candidate neighbor cells around the bot's head (zero Set/Point allocations)
+    const hazardGrid = this.botHazardGrid;
+    hazardGrid.fill(0, 0, gs * gs);
     for (const other of this.snakes.values()) {
       if (!other.alive || other.id === bot.id) continue;
       // Ignore segments 0, 1, 2 (the head and front body of a snake cutting in front of the AI)
-      for (let i = 3; i < other.segments.length - 1; i++) {
-        const seg = other.segments[i];
+      const segs = other.segments;
+      for (let i = 3, len = segs.length - 1; i < len; i++) {
+        const seg = segs[i];
         if (Math.abs(seg.x - head.x) <= 1 && Math.abs(seg.y - head.y) <= 1) {
-          otherTrailCells.add((seg.x << 8) | seg.y);
+          hazardGrid[seg.y * gs + seg.x] = 1;
         }
       }
     }
@@ -618,7 +646,8 @@ export class ArenaEngine {
     let bestScore = -999999;
 
     // Find closest human player or flashing pellet to gravitate toward
-    let targetPoint: Point | null = null;
+    let targetX = -1;
+    let targetY = -1;
     let minTargetDist = 999;
 
     // 1. Prioritize nearby flashing big pellets if any exist within 12 tiles
@@ -627,12 +656,13 @@ export class ArenaEngine {
       const d = Math.abs(p.x - head.x) + Math.abs(p.y - head.y);
       if (d < minTargetDist && d <= 12) {
         minTargetDist = d;
-        targetPoint = { x: p.x, y: p.y };
+        targetX = p.x;
+        targetY = p.y;
       }
     }
 
     // 2. Otherwise cruise near human players so players have plenty of opportunities to cut them off
-    if (!targetPoint) {
+    if (targetX < 0) {
       for (const s of this.snakes.values()) {
         if (!s.alive || s.id === bot.id) continue;
         const targetSeg = s.segments[0];
@@ -640,42 +670,48 @@ export class ArenaEngine {
         const weight = s.isBot ? dist * 1.35 : dist * 0.75;
         if (weight < minTargetDist) {
           minTargetDist = weight;
-          targetPoint = targetSeg;
+          targetX = targetSeg.x;
+          targetY = targetSeg.y;
         }
       }
     }
 
-    for (const dir of validDirs) {
-      const nextPt = stepPoint(head, dir);
+    const hasTarget = targetX >= 0;
+    const currDist = hasTarget ? Math.abs(targetX - head.x) + Math.abs(targetY - head.y) : 0;
+
+    for (let dIdx = 0; dIdx < 4; dIdx++) {
+      const dir = allDirs[dIdx];
+      if (isOppositeDirection(dir, bot.dir)) continue;
+
+      let nx = head.x;
+      let ny = head.y;
+      if (dir === 'UP') ny--;
+      else if (dir === 'DOWN') ny++;
+      else if (dir === 'LEFT') nx--;
+      else nx++;
 
       // Immediate outer wall check
-      if (!isInsideGrid(nextPt, this.gridSize)) {
+      if (nx < 0 || nx >= gs || ny < 0 || ny >= gs) {
         continue;
       }
 
       let score = 0;
 
       // Delayed reaction to another snake's older trail: 50% chance the AI notices it late
-      if (otherTrailCells.has((nextPt.x << 8) | nextPt.y)) {
+      if (hazardGrid[ny * gs + nx] === 1) {
         if (Math.random() < 0.5) {
           score -= 140;
         }
       }
 
       // Keep buffer from the unforgiving outer wall so bots don't die to walls on their own
-      const wallDist = Math.min(
-        nextPt.x,
-        this.gridSize - 1 - nextPt.x,
-        nextPt.y,
-        this.gridSize - 1 - nextPt.y
-      );
+      const wallDist = Math.min(nx, gs - 1 - nx, ny, gs - 1 - ny);
       if (wallDist === 0) score -= 65;
       else if (wallDist === 1) score -= 18;
 
       // Move toward target (pellet or player area)
-      if (targetPoint) {
-        const currDist = Math.abs(targetPoint.x - head.x) + Math.abs(targetPoint.y - head.y);
-        const nextDist = Math.abs(targetPoint.x - nextPt.x) + Math.abs(targetPoint.y - nextPt.y);
+      if (hasTarget) {
+        const nextDist = Math.abs(targetX - nx) + Math.abs(targetY - ny);
         if (nextDist < currDist) {
           score += 26;
         } else {
@@ -1083,12 +1119,13 @@ export class ArenaEngine {
   public step(): ArenaSnapshot {
     this.tick++;
 
-    // 1. Advance spawn telegraphs
-    const remainingTelegraphs: SpawnTelegraph[] = [];
-    for (const tele of this.telegraphs) {
+    // 1. Advance spawn telegraphs in-place
+    let writeTele = 0;
+    let queuedBotTelegraphs = 0;
+    for (let i = 0; i < this.telegraphs.length; i++) {
+      const tele = this.telegraphs[i];
       tele.ticksLeft--;
       if (tele.ticksLeft <= 0) {
-        // Spawn the rival snake on the grid
         const id = `bot_${++this.botCounter}_${this.tick}`;
         const bot = this.createSnakeEntity(
           id,
@@ -1099,21 +1136,32 @@ export class ArenaEngine {
         );
         this.snakes.set(id, bot);
       } else {
-        remainingTelegraphs.push(tele);
+        this.telegraphs[writeTele++] = tele;
+        if (tele.isBot) queuedBotTelegraphs++;
       }
     }
-    this.telegraphs = remainingTelegraphs;
+    this.telegraphs.length = writeTele;
 
-    // 2. Ensure exactly targetBotCount (2 on 32x32, 4 on 64x64) AI snakes are active or spawning on the server at all times
-    const aliveSnakes = Array.from(this.snakes.values()).filter((s) => s.alive);
-    const humanAnchors = aliveSnakes.filter((s) => !s.isBot).map((s) => s.segments[0]);
-    const aliveBotsCount = aliveSnakes.filter((s) => s.isBot).length;
+    // 2. Collect alive snakes, human anchors, and bot counts in a single pass
+    const aliveSnakes = this.aliveSnakesScratch;
+    const humanAnchors = this.humanAnchorsScratch;
+    aliveSnakes.length = 0;
+    humanAnchors.length = 0;
+    let aliveBotsCount = 0;
 
-    while (
-      aliveBotsCount + this.telegraphs.filter((t) => t.isBot).length <
-      this.targetBotCount
-    ) {
+    for (const s of this.snakes.values()) {
+      if (!s.alive) continue;
+      aliveSnakes.push(s);
+      if (s.isBot) {
+        aliveBotsCount++;
+      } else if (s.segments[0]) {
+        humanAnchors.push(s.segments[0]);
+      }
+    }
+
+    while (aliveBotsCount + queuedBotTelegraphs < this.targetBotCount) {
       this.queueNearbyBotSpawn(humanAnchors, 5);
+      queuedBotTelegraphs++;
     }
 
     // 2b. Occasionally spawn a collectible Loot Box on a safe interior cell
@@ -1137,11 +1185,19 @@ export class ArenaEngine {
     }
 
     // 3. Determine next direction & next head position for each alive snake
-    const nextHeads = new Map<string, Point>();
+    const nextHeads = this.nextHeadsScratch;
+    nextHeads.clear();
 
-    for (const snake of aliveSnakes) {
-      // Only store previous head position for smooth sub-tick camera interpolation & head-swap checks
-      snake.prevSegments = [{ ...snake.segments[0] }];
+    for (let sIdx = 0; sIdx < aliveSnakes.length; sIdx++) {
+      const snake = aliveSnakes[sIdx];
+      const currHead = snake.segments[0];
+      if (snake.prevSegments.length > 0 && snake.prevSegments[0]) {
+        snake.prevSegments[0].x = currHead.x;
+        snake.prevSegments[0].y = currHead.y;
+        snake.prevSegments.length = 1;
+      } else {
+        snake.prevSegments = [{ x: currHead.x, y: currHead.y }];
+      }
 
       if (snake.isBot) {
         const chosen = this.computeBotDirection(snake);
@@ -1162,36 +1218,34 @@ export class ArenaEngine {
         snake.dir = snake.nextDirs.shift()!;
       }
 
-      const nextHead = stepPoint(snake.segments[0], snake.dir);
-      nextHeads.set(snake.id, nextHead);
+      nextHeads.set(snake.id, stepPoint(currHead, snake.dir));
     }
 
     // 4. Advance snake segments provisionally & check pellet slurping in O(1) per snake via spatial cell map
-    const pendingGrowth = new Map<string, number>();
+    const pendingGrowth = this.pendingGrowthScratch;
+    pendingGrowth.clear();
 
     if (this.pellets.length > 0) {
-      const pelletAtCell = new Map<number, BigPellet>();
+      const pelletAtCell = this.pelletAtCellScratch;
+      pelletAtCell.clear();
       for (let i = 0; i < this.pellets.length; i++) {
         const p = this.pellets[i];
         pelletAtCell.set((p.x << 8) | p.y, p);
       }
 
-      const eatenPellets = new Set<BigPellet>();
-      const slurpOffsets = [
-        [0, 0],
-        [1, 0],
-        [-1, 0],
-        [0, 1],
-        [0, -1],
-      ];
+      const eatenPellets = this.eatenPelletsScratch;
+      eatenPellets.clear();
 
-      for (const snake of aliveSnakes) {
+      for (let sIdx = 0; sIdx < aliveSnakes.length; sIdx++) {
+        const snake = aliveSnakes[sIdx];
         const nextHead = nextHeads.get(snake.id)!;
         let growAmount = 0;
 
         for (let o = 0; o < 5; o++) {
-          const px = nextHead.x + slurpOffsets[o][0];
-          const py = nextHead.y + slurpOffsets[o][1];
+          const px =
+            o === 1 ? nextHead.x + 1 : o === 2 ? nextHead.x - 1 : nextHead.x;
+          const py =
+            o === 3 ? nextHead.y + 1 : o === 4 ? nextHead.y - 1 : nextHead.y;
           if (px < 0 || px >= this.gridSize || py < 0 || py >= this.gridSize) continue;
           const pellet = pelletAtCell.get((px << 8) | py);
           if (pellet && !eatenPellets.has(pellet)) {
@@ -1220,18 +1274,29 @@ export class ArenaEngine {
       }
 
       if (eatenPellets.size > 0) {
-        this.pellets = this.pellets.filter((p) => !eatenPellets.has(p));
+        let writePellet = 0;
+        for (let i = 0; i < this.pellets.length; i++) {
+          const p = this.pellets[i];
+          if (!eatenPellets.has(p)) {
+            this.pellets[writePellet++] = p;
+          }
+        }
+        this.pellets.length = writePellet;
+        eatenPellets.clear();
       }
+      pelletAtCell.clear();
     } else {
-      for (const snake of aliveSnakes) {
-        pendingGrowth.set(snake.id, 0);
+      for (let sIdx = 0; sIdx < aliveSnakes.length; sIdx++) {
+        pendingGrowth.set(aliveSnakes[sIdx].id, 0);
       }
     }
 
     // 4b. Collect Loot Boxes when a snake's head lands on a crate cell
     if (this.lootBoxes.length > 0) {
-      const collectedBoxIds = new Set<string>();
-      for (const snake of aliveSnakes) {
+      const collectedBoxIds = this.collectedBoxIdsScratch;
+      collectedBoxIds.clear();
+      for (let sIdx = 0; sIdx < aliveSnakes.length; sIdx++) {
+        const snake = aliveSnakes[sIdx];
         const nextHead = nextHeads.get(snake.id)!;
         for (let b = 0; b < this.lootBoxes.length; b++) {
           const box = this.lootBoxes[b];
@@ -1253,19 +1318,27 @@ export class ArenaEngine {
         }
       }
       if (collectedBoxIds.size > 0) {
-        this.lootBoxes = this.lootBoxes.filter((b) => !collectedBoxIds.has(b.id));
+        let writeBox = 0;
+        for (let i = 0; i < this.lootBoxes.length; i++) {
+          const b = this.lootBoxes[i];
+          if (!collectedBoxIds.has(b.id)) {
+            this.lootBoxes[writeBox++] = b;
+          }
+        }
+        this.lootBoxes.length = writeBox;
+        collectedBoxIds.clear();
       }
     }
 
     // Move segments forward
-    for (const snake of aliveSnakes) {
+    for (let sIdx = 0; sIdx < aliveSnakes.length; sIdx++) {
+      const snake = aliveSnakes[sIdx];
       const nextHead = nextHeads.get(snake.id)!;
       const grow = pendingGrowth.get(snake.id) || 0;
       snake.segments.unshift(nextHead);
       if (grow === 0) {
         snake.segments.pop();
       } else {
-        // Keep the tail segment to grow by 1 (and if grow > 1, duplicate tail tip)
         const tailTip = snake.segments[snake.segments.length - 1];
         for (let g = 1; g < grow; g++) {
           snake.segments.push({ x: tailTip.x, y: tailTip.y });
@@ -1273,23 +1346,17 @@ export class ArenaEngine {
       }
     }
 
-    // 5. Evaluate unforgiving collisions in O(totalSegments) using spatial lookup maps:
-    // - Out of bounds (off the grid)
-    // - Running into another snake's body (Snake.io cut-off!)
-    // - Head-to-head collision
-    const doomed = new Map<
-      string,
-      {
-        reason: 'WALL_CRASH' | 'SELF_CRASH' | 'KILLED_BY_SNAKE' | 'HEAD_COLLISION';
-        killer?: SnakeEntity;
-      }
-    >();
+    // 5. Evaluate unforgiving collisions in O(totalSegments) using reusable spatial lookup maps
+    const doomed = this.doomedScratch;
+    doomed.clear();
 
-    // Build spatial occupancy maps once for all unshielded snakes
-    const bodyOwners = new Map<number, SnakeEntity | SnakeEntity[]>();
-    const unshieldedSnakes: SnakeEntity[] = [];
+    const bodyOwners = this.bodyOwnersScratch;
+    bodyOwners.clear();
+    const unshieldedSnakes = this.unshieldedScratch;
+    unshieldedSnakes.length = 0;
 
-    for (const other of aliveSnakes) {
+    for (let sIdx = 0; sIdx < aliveSnakes.length; sIdx++) {
+      const other = aliveSnakes[sIdx];
       if (other.shieldTicks > 0) continue;
       unshieldedSnakes.push(other);
       const otherSegs = other.segments;
@@ -1307,9 +1374,11 @@ export class ArenaEngine {
       }
     }
 
-    const savedByExtraLife = new Set<string>();
+    const savedByExtraLife = this.savedByExtraLifeScratch;
+    savedByExtraLife.clear();
 
-    for (const snake of aliveSnakes) {
+    for (let sIdx = 0; sIdx < aliveSnakes.length; sIdx++) {
+      const snake = aliveSnakes[sIdx];
       const head = snake.segments[0];
 
       // A. Unforgiving Grid Boundary Check
@@ -1320,14 +1389,13 @@ export class ArenaEngine {
 
       // B. Self-overlap is allowed! Snakes can freely pass over their own tail/body.
 
-      // C. Other snakes check (Fail-safe spawn timer: shielded snakes cannot be killed by or kill other snakes on overlap)
+      // C. Other snakes check
       if (snake.shieldTicks > 0) {
         continue;
       }
 
       const myPrevHead = snake.prevSegments[0] || head;
 
-      // Check head-to-head collisions with other unshielded snakes (small set of heads)
       for (let u = 0; u < unshieldedSnakes.length; u++) {
         const other = unshieldedSnakes[u];
         if (other.id === snake.id) continue;
@@ -1355,7 +1423,6 @@ export class ArenaEngine {
 
       if (doomed.has(snake.id) || savedByExtraLife.has(snake.id)) continue;
 
-      // O(1) body trail collision check
       const hitOwner = bodyOwners.get((head.x << 8) | head.y);
       if (hitOwner) {
         if (Array.isArray(hitOwner)) {
@@ -1397,9 +1464,10 @@ export class ArenaEngine {
     }
 
     // Decrement fail-safe spawn protection timer for all surviving snakes
-    for (const snake of aliveSnakes) {
+    for (let sIdx = 0; sIdx < aliveSnakes.length; sIdx++) {
+      const snake = aliveSnakes[sIdx];
       if (snake.shieldTicks > 0) {
-        snake.shieldTicks = Math.max(0, snake.shieldTicks - 1);
+        snake.shieldTicks = snake.shieldTicks - 1;
       }
     }
 
@@ -1419,14 +1487,7 @@ export class ArenaEngine {
       }
 
       const fallbackHead = victim.prevSegments[0] || victim.segments[1] || victim.segments[0];
-      // Use fallbackHead if head went off-grid so pellets drop right along the grid edge
-      const dropSource: SnakeEntity = {
-        ...victim,
-        segments: victim.segments.map((seg) =>
-          isInsideGrid(seg, this.gridSize) ? seg : fallbackHead
-        ),
-      };
-      this.dropBigFlashingPellets(dropSource);
+      this.dropBigFlashingPellets(victim, fallbackHead);
 
       const crashPt = isInsideGrid(victim.segments[0], this.gridSize)
         ? victim.segments[0]
@@ -1450,29 +1511,74 @@ export class ArenaEngine {
       // Remove dead bots from map after death; replacement up to targetBotCount is queued automatically
       if (victim.isBot) {
         this.snakes.delete(victimId);
-        const currentBots = Array.from(this.snakes.values()).filter((s) => s.alive && s.isBot).length;
-        const queuedBots = this.telegraphs.filter((t) => t.isBot).length;
+        let currentBots = 0;
+        for (const s of this.snakes.values()) {
+          if (s.alive && s.isBot) currentBots++;
+        }
+        let queuedBots = 0;
+        for (let t = 0; t < this.telegraphs.length; t++) {
+          if (this.telegraphs[t].isBot) queuedBots++;
+        }
         if (currentBots + queuedBots < this.targetBotCount) {
           this.queueNearbyBotSpawn(humanAnchors, 5);
         }
       }
     }
 
-    // 7. Age pellets & loot boxes and prune old events (short window minimizes repeated payload bytes)
-    this.pellets = this.pellets.filter((p) => {
+    bodyOwners.clear();
+    doomed.clear();
+    savedByExtraLife.clear();
+    unshieldedSnakes.length = 0;
+    aliveSnakes.length = 0;
+
+    // 7. Age pellets & loot boxes and prune old events in-place (zero array allocations per tick)
+    let writePellets = 0;
+    for (let i = 0; i < this.pellets.length; i++) {
+      const p = this.pellets[i];
       p.ttlTicks--;
-      return p.ttlTicks > 0;
-    });
+      if (p.ttlTicks > 0) {
+        this.pellets[writePellets++] = p;
+      }
+    }
+    this.pellets.length = writePellets;
 
-    this.lootBoxes = this.lootBoxes.filter((box) => {
+    let writeBoxes = 0;
+    for (let i = 0; i < this.lootBoxes.length; i++) {
+      const box = this.lootBoxes[i];
       box.ttlTicks--;
-      return box.ttlTicks > 0;
-    });
+      if (box.ttlTicks > 0) {
+        this.lootBoxes[writeBoxes++] = box;
+      }
+    }
+    this.lootBoxes.length = writeBoxes;
 
-    this.recentKills = this.recentKills.filter((k) => this.tick - k.tick <= 18);
-    this.recentSlurps = this.recentSlurps.filter((s) => this.tick - s.tick <= 4);
-    this.recentLootPickups = this.recentLootPickups.filter((e) => this.tick - e.tick <= 4);
-    this.recentExtraLifeSaves = this.recentExtraLifeSaves.filter((e) => this.tick - e.tick <= 4);
+    let writeKills = 0;
+    for (let i = 0; i < this.recentKills.length; i++) {
+      const k = this.recentKills[i];
+      if (this.tick - k.tick <= 18) this.recentKills[writeKills++] = k;
+    }
+    this.recentKills.length = writeKills;
+
+    let writeSlurps = 0;
+    for (let i = 0; i < this.recentSlurps.length; i++) {
+      const s = this.recentSlurps[i];
+      if (this.tick - s.tick <= 4) this.recentSlurps[writeSlurps++] = s;
+    }
+    this.recentSlurps.length = writeSlurps;
+
+    let writePickups = 0;
+    for (let i = 0; i < this.recentLootPickups.length; i++) {
+      const e = this.recentLootPickups[i];
+      if (this.tick - e.tick <= 4) this.recentLootPickups[writePickups++] = e;
+    }
+    this.recentLootPickups.length = writePickups;
+
+    let writeSaves = 0;
+    for (let i = 0; i < this.recentExtraLifeSaves.length; i++) {
+      const e = this.recentExtraLifeSaves[i];
+      if (this.tick - e.tick <= 4) this.recentExtraLifeSaves[writeSaves++] = e;
+    }
+    this.recentExtraLifeSaves.length = writeSaves;
 
     return this.getSnapshot();
   }
@@ -1502,7 +1608,10 @@ export class ArenaEngine {
 
   public getSnapshot(): ArenaSnapshot {
     const snakesList = Array.from(this.snakes.values());
-    const humanCount = snakesList.filter((s) => !s.isBot).length;
+    let humanCount = 0;
+    for (let i = 0; i < snakesList.length; i++) {
+      if (!snakesList[i].isBot) humanCount++;
+    }
     return {
       tick: this.tick,
       gridSize: this.gridSize,

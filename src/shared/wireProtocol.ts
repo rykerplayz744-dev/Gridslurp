@@ -86,35 +86,35 @@ export function decodeSegments(encoded: string): Point[] {
   const segs: Point[] = [];
   let i = 0;
   const n = encoded.length;
+  let cx = 0;
+  let cy = 0;
 
-  const parsePair = (): { x: number; y: number } => {
+  const parsePair = () => {
     const commaIdx = encoded.indexOf(',', i);
     const colonIdx = encoded.indexOf(':', commaIdx + 1);
-    const x = parseInt(encoded.slice(i, commaIdx), 10) || 0;
-    const y = parseInt(encoded.slice(commaIdx + 1, colonIdx), 10) || 0;
+    cx = parseInt(encoded.slice(i, commaIdx), 10) || 0;
+    cy = parseInt(encoded.slice(commaIdx + 1, colonIdx), 10) || 0;
     i = colonIdx + 1;
-    return { x, y };
   };
 
-  let curr = parsePair();
-  segs.push({ x: curr.x, y: curr.y });
+  parsePair();
+  segs.push({ x: cx, y: cy });
 
   while (i < n) {
     const ch = encoded.charCodeAt(i);
     if (ch === 59) {
       // ';' non-adjacent jump
       i++;
-      curr = parsePair();
-      segs.push({ x: curr.x, y: curr.y });
+      parsePair();
     } else {
       i++;
-      if (ch === 48) curr = { x: curr.x, y: curr.y - 1 }; // '0'
-      else if (ch === 49) curr = { x: curr.x, y: curr.y + 1 }; // '1'
-      else if (ch === 50) curr = { x: curr.x - 1, y: curr.y }; // '2'
-      else if (ch === 51) curr = { x: curr.x + 1, y: curr.y }; // '3'
-      else curr = { x: curr.x, y: curr.y }; // '4'
-      segs.push(curr);
+      if (ch === 48) cy -= 1; // '0'
+      else if (ch === 49) cy += 1; // '1'
+      else if (ch === 50) cx -= 1; // '2'
+      else if (ch === 51) cx += 1; // '3'
+      // '4' keeps same cell
     }
+    segs.push({ x: cx, y: cy });
   }
 
   return segs;
@@ -127,7 +127,10 @@ export function isPackedSnapshot(
 }
 
 export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
-  const sn: PackedSnake[] = snap.snakes.map((s) => {
+  const snakesSrc = snap.snakes;
+  const sn: PackedSnake[] = new Array(snakesSrc.length);
+  for (let i = 0; i < snakesSrc.length; i++) {
+    const s = snakesSrc[i];
     const prevHead =
       s.prevSegments && s.prevSegments[0]
         ? s.prevSegments[0]
@@ -155,7 +158,11 @@ export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
       packed.kb = s.killedByName;
     }
     if (s.nextDirs && s.nextDirs.length > 0) {
-      packed.nd = s.nextDirs.map((d) => Math.max(0, DIRS.indexOf(d)));
+      const nd: number[] = new Array(s.nextDirs.length);
+      for (let d = 0; d < s.nextDirs.length; d++) {
+        nd[d] = Math.max(0, DIRS.indexOf(s.nextDirs[d]));
+      }
+      packed.nd = nd;
     }
     if (typeof s.lastTurnSeq === 'number') {
       packed.ts = s.lastTurnSeq;
@@ -166,8 +173,8 @@ export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
     if (s.faceId) {
       packed.fId = s.faceId;
     }
-    return packed;
-  });
+    sn[i] = packed;
+  }
 
   let ps = '';
   if (snap.pellets.length > 0) {
@@ -187,69 +194,79 @@ export function packSnapshot(snap: ArenaSnapshot): PackedArenaSnapshot {
     ps = parts.join('|');
   }
 
-  const tl: PackedTelegraph[] = snap.telegraphs.map((t) => [
-    t.id,
-    t.x,
-    t.y,
-    Math.max(0, DIRS.indexOf(t.dir)),
-    PALETTE_INDEX_BY_ID.get(t.color.id) ?? t.color.id,
-    t.name,
-    t.ticksLeft,
-    t.isBot ? 1 : 0,
-  ]);
+  const tl: PackedTelegraph[] = new Array(snap.telegraphs.length);
+  for (let i = 0; i < snap.telegraphs.length; i++) {
+    const t = snap.telegraphs[i];
+    tl[i] = [
+      t.id,
+      t.x,
+      t.y,
+      Math.max(0, DIRS.indexOf(t.dir)),
+      PALETTE_INDEX_BY_ID.get(t.color.id) ?? t.color.id,
+      t.name,
+      t.ticksLeft,
+      t.isBot ? 1 : 0,
+    ];
+  }
 
-  const rk: PackedKill[] = snap.recentKills.map((k) => [
-    k.id,
-    k.tick,
-    k.victimId,
-    k.victimName,
-    k.killerId || '',
-    k.killerName || '',
-    Math.max(0, DEATH_REASONS.indexOf(k.reason)),
-    k.x,
-    k.y,
-    k.pelletsDropped,
-    k.victimColor,
-  ]);
+  const rk: PackedKill[] = new Array(snap.recentKills.length);
+  for (let i = 0; i < snap.recentKills.length; i++) {
+    const k = snap.recentKills[i];
+    rk[i] = [
+      k.id,
+      k.tick,
+      k.victimId,
+      k.victimName,
+      k.killerId || '',
+      k.killerName || '',
+      Math.max(0, DEATH_REASONS.indexOf(k.reason)),
+      k.x,
+      k.y,
+      k.pelletsDropped,
+      k.victimColor,
+    ];
+  }
 
-  const rs: PackedSlurp[] = snap.recentSlurps.map((s) => [
-    s.id,
-    s.tick,
-    s.snakeId,
-    s.fromX,
-    s.fromY,
-    s.toX,
-    s.toY,
-    s.color,
-    s.value,
-  ]);
+  const rs: PackedSlurp[] = new Array(snap.recentSlurps.length);
+  for (let i = 0; i < snap.recentSlurps.length; i++) {
+    const s = snap.recentSlurps[i];
+    rs[i] = [s.id, s.tick, s.snakeId, s.fromX, s.fromY, s.toX, s.toY, s.color, s.value];
+  }
 
-  const lb: PackedLootBox[] = (snap.lootBoxes || []).map((box) => [
-    box.id,
-    box.x,
-    box.y,
-    Math.max(0, LOOT_BOX_ABILITY_POOL.indexOf(box.ability)),
-    box.ttlTicks,
-  ]);
+  const boxesSrc = snap.lootBoxes || [];
+  const lb: PackedLootBox[] = new Array(boxesSrc.length);
+  for (let i = 0; i < boxesSrc.length; i++) {
+    const box = boxesSrc[i];
+    lb[i] = [
+      box.id,
+      box.x,
+      box.y,
+      Math.max(0, LOOT_BOX_ABILITY_POOL.indexOf(box.ability)),
+      box.ttlTicks,
+    ];
+  }
 
-  const rlp: PackedLootPickup[] = (snap.recentLootPickups || []).map((e) => [
-    e.id,
-    e.tick,
-    e.snakeId,
-    e.snakeName,
-    e.x,
-    e.y,
-    Math.max(0, LOOT_BOX_ABILITY_POOL.indexOf(e.ability)),
-  ]);
+  const pickupsSrc = snap.recentLootPickups || [];
+  const rlp: PackedLootPickup[] = new Array(pickupsSrc.length);
+  for (let i = 0; i < pickupsSrc.length; i++) {
+    const e = pickupsSrc[i];
+    rlp[i] = [
+      e.id,
+      e.tick,
+      e.snakeId,
+      e.snakeName,
+      e.x,
+      e.y,
+      Math.max(0, LOOT_BOX_ABILITY_POOL.indexOf(e.ability)),
+    ];
+  }
 
-  const rels: PackedExtraLifeSave[] = (snap.recentExtraLifeSaves || []).map((e) => [
-    e.id,
-    e.tick,
-    e.snakeId,
-    e.snakeName,
-    e.x,
-    e.y,
-  ]);
+  const savesSrc = snap.recentExtraLifeSaves || [];
+  const rels: PackedExtraLifeSave[] = new Array(savesSrc.length);
+  for (let i = 0; i < savesSrc.length; i++) {
+    const e = savesSrc[i];
+    rels[i] = [e.id, e.tick, e.snakeId, e.snakeName, e.x, e.y];
+  }
 
   return {
     v: 2,
@@ -274,17 +291,24 @@ export function unpackSnapshot(
     return raw;
   }
 
-  const snakes: SnakeEntity[] = raw.sn.map((ps) => {
-    const segments = decodeSegments(ps.g);
-    return {
+  const snakes: SnakeEntity[] = new Array(raw.sn.length);
+  for (let i = 0; i < raw.sn.length; i++) {
+    const ps = raw.sn[i];
+    const nextDirs: Direction[] = Array.isArray(ps.nd) ? new Array(ps.nd.length) : [];
+    if (Array.isArray(ps.nd)) {
+      for (let d = 0; d < ps.nd.length; d++) {
+        nextDirs[d] = DIRS[ps.nd[d]] || 'RIGHT';
+      }
+    }
+    snakes[i] = {
       id: ps.i,
       name: ps.n,
       color: resolveColorFromCode(ps.c),
       faceId: ps.fId || undefined,
-      segments,
+      segments: decodeSegments(ps.g),
       prevSegments: [{ x: ps.px, y: ps.py }],
       dir: DIRS[ps.d] || 'RIGHT',
-      nextDirs: Array.isArray(ps.nd) ? ps.nd.map((idx) => DIRS[idx] || 'RIGHT') : [],
+      nextDirs,
       lastTurnSeq: ps.ts,
       score: ps.s,
       kills: ps.k,
@@ -298,52 +322,68 @@ export function unpackSnapshot(
       deathReason: ps.dr !== undefined ? DEATH_REASONS[ps.dr] : undefined,
       killedByName: ps.kb,
     };
-  });
+  }
 
   const pellets: BigPellet[] = [];
   if (typeof raw.ps === 'string' && raw.ps.length > 0) {
-    const tokens = raw.ps.split('|');
-    for (let i = 0; i < tokens.length; i++) {
-      const segs = tokens[i].split('.');
-      if (segs.length === 3) {
-        const cell = parseInt(segs[0], 36) || 0;
-        const x = cell >> 6;
-        const y = cell & 63;
-        const colRaw = segs[1];
-        const colIdx = colRaw.charCodeAt(0) === 35 ? -1 : parseInt(colRaw, 10);
-        const color =
-          colIdx >= 0 && SNAKE_PALETTES[colIdx] ? SNAKE_PALETTES[colIdx].head : colRaw;
-        pellets.push({
-          id: `p_${cell}`,
-          x,
-          y,
-          value: 100,
-          growth: 1,
-          color,
-          spawnTick: raw.t,
-          ttlTicks: parseInt(segs[2], 36) || 1,
-          fromSnakeName: '',
-        });
-      } else if (segs.length >= 5) {
-        const cell = parseInt(segs[0], 36) || 0;
-        const x = cell >> 6;
-        const y = cell & 63;
-        const colRaw = segs[3];
-        const colIdx = colRaw.charCodeAt(0) === 35 ? -1 : parseInt(colRaw, 10);
-        const color =
-          colIdx >= 0 && SNAKE_PALETTES[colIdx] ? SNAKE_PALETTES[colIdx].head : colRaw;
-        pellets.push({
-          id: `p_${cell}`,
-          x,
-          y,
-          value: parseInt(segs[1], 36) || 100,
-          growth: parseInt(segs[2], 36) || 1,
-          color,
-          spawnTick: raw.t,
-          ttlTicks: parseInt(segs[4], 36) || 1,
-          fromSnakeName: '',
-        });
+    const psStr = raw.ps;
+    const psLen = psStr.length;
+    let tokStart = 0;
+    while (tokStart < psLen) {
+      let tokEnd = psStr.indexOf('|', tokStart);
+      if (tokEnd < 0) tokEnd = psLen;
+
+      const dot1 = psStr.indexOf('.', tokStart);
+      if (dot1 > tokStart && dot1 < tokEnd) {
+        const dot2 = psStr.indexOf('.', dot1 + 1);
+        if (dot2 > dot1 && dot2 < tokEnd) {
+          const dot3 = psStr.indexOf('.', dot2 + 1);
+          const cell = parseInt(psStr.slice(tokStart, dot1), 36) || 0;
+          const x = cell >> 6;
+          const y = cell & 63;
+
+          if (dot3 < 0 || dot3 >= tokEnd) {
+            // 3-field compact pellet: cell.col.ttl
+            const colRaw = psStr.slice(dot1 + 1, dot2);
+            const colIdx = colRaw.charCodeAt(0) === 35 ? -1 : parseInt(colRaw, 10);
+            const color =
+              colIdx >= 0 && SNAKE_PALETTES[colIdx] ? SNAKE_PALETTES[colIdx].head : colRaw;
+            pellets.push({
+              id: `p_${cell}`,
+              x,
+              y,
+              value: 100,
+              growth: 1,
+              color,
+              spawnTick: raw.t,
+              ttlTicks: parseInt(psStr.slice(dot2 + 1, tokEnd), 36) || 1,
+              fromSnakeName: '',
+            });
+          } else {
+            // 5-field pellet: cell.value.growth.col.ttl
+            const dot4 = psStr.indexOf('.', dot3 + 1);
+            if (dot4 > dot3 && dot4 < tokEnd) {
+              const colRaw = psStr.slice(dot3 + 1, dot4);
+              const colIdx = colRaw.charCodeAt(0) === 35 ? -1 : parseInt(colRaw, 10);
+              const color =
+                colIdx >= 0 && SNAKE_PALETTES[colIdx] ? SNAKE_PALETTES[colIdx].head : colRaw;
+              pellets.push({
+                id: `p_${cell}`,
+                x,
+                y,
+                value: parseInt(psStr.slice(dot1 + 1, dot2), 36) || 100,
+                growth: parseInt(psStr.slice(dot2 + 1, dot3), 36) || 1,
+                color,
+                spawnTick: raw.t,
+                ttlTicks: parseInt(psStr.slice(dot4 + 1, tokEnd), 36) || 1,
+                fromSnakeName: '',
+              });
+            }
+          }
+        }
       }
+
+      tokStart = tokEnd + 1;
     }
   } else if (Array.isArray(raw.pl)) {
     for (let i = 0; i < raw.pl.length; i++) {
@@ -362,56 +402,77 @@ export function unpackSnapshot(
     }
   }
 
-  const telegraphs: SpawnTelegraph[] = raw.tl.map((pt) => ({
-    id: pt[0],
-    x: pt[1],
-    y: pt[2],
-    dir: DIRS[pt[3]] || 'RIGHT',
-    color: resolveColorFromCode(pt[4]),
-    name: pt[5],
-    ticksLeft: pt[6],
-    isBot: pt[7] === 1,
-  }));
+  const telegraphs: SpawnTelegraph[] = new Array(raw.tl.length);
+  for (let i = 0; i < raw.tl.length; i++) {
+    const pt = raw.tl[i];
+    telegraphs[i] = {
+      id: pt[0],
+      x: pt[1],
+      y: pt[2],
+      dir: DIRS[pt[3]] || 'RIGHT',
+      color: resolveColorFromCode(pt[4]),
+      name: pt[5],
+      ticksLeft: pt[6],
+      isBot: pt[7] === 1,
+    };
+  }
 
-  const recentKills: KillEvent[] = raw.rk.map((pk) => ({
-    id: pk[0],
-    tick: pk[1],
-    victimId: pk[2],
-    victimName: pk[3],
-    killerId: pk[4] || undefined,
-    killerName: pk[5] || undefined,
-    reason: DEATH_REASONS[pk[6]] || 'WALL_CRASH',
-    x: pk[7],
-    y: pk[8],
-    pelletsDropped: pk[9],
-    victimColor: pk[10],
-  }));
+  const recentKills: KillEvent[] = new Array(raw.rk.length);
+  for (let i = 0; i < raw.rk.length; i++) {
+    const pk = raw.rk[i];
+    recentKills[i] = {
+      id: pk[0],
+      tick: pk[1],
+      victimId: pk[2],
+      victimName: pk[3],
+      killerId: pk[4] || undefined,
+      killerName: pk[5] || undefined,
+      reason: DEATH_REASONS[pk[6]] || 'WALL_CRASH',
+      x: pk[7],
+      y: pk[8],
+      pelletsDropped: pk[9],
+      victimColor: pk[10],
+    };
+  }
 
-  const recentSlurps: SlurpEvent[] = raw.rs.map((ps) => ({
-    id: ps[0],
-    tick: ps[1],
-    snakeId: ps[2],
-    fromX: ps[3],
-    fromY: ps[4],
-    toX: ps[5],
-    toY: ps[6],
-    color: ps[7],
-    value: ps[8],
-  }));
+  const recentSlurps: SlurpEvent[] = new Array(raw.rs.length);
+  for (let i = 0; i < raw.rs.length; i++) {
+    const ps = raw.rs[i];
+    recentSlurps[i] = {
+      id: ps[0],
+      tick: ps[1],
+      snakeId: ps[2],
+      fromX: ps[3],
+      fromY: ps[4],
+      toX: ps[5],
+      toY: ps[6],
+      color: ps[7],
+      value: ps[8],
+    };
+  }
 
-  const lootBoxes: LootBoxItem[] = Array.isArray(raw.lb)
-    ? raw.lb.map((pb) => ({
+  const lootBoxes: LootBoxItem[] = Array.isArray(raw.lb) ? new Array(raw.lb.length) : [];
+  if (Array.isArray(raw.lb)) {
+    for (let i = 0; i < raw.lb.length; i++) {
+      const pb = raw.lb[i];
+      lootBoxes[i] = {
         id: pb[0],
         x: pb[1],
         y: pb[2],
         ability: LOOT_BOX_ABILITY_POOL[pb[3]] || 'EXTRA_LIFE',
         spawnTick: raw.t,
         ttlTicks: pb[4],
-      }))
-    : [];
+      };
+    }
+  }
 
   const recentLootPickups: LootBoxPickupEvent[] = Array.isArray(raw.rlp)
-    ? raw.rlp.map((pe) => ({
+    ? new Array(raw.rlp.length)
+    : [];
+  if (Array.isArray(raw.rlp)) {
+    for (let i = 0; i < raw.rlp.length; i++) {
+      const pe = raw.rlp[i];
+      recentLootPickups[i] = {
         id: pe[0],
         tick: pe[1],
         snakeId: pe[2],
@@ -419,19 +480,26 @@ export function unpackSnapshot(
         x: pe[4],
         y: pe[5],
         ability: LOOT_BOX_ABILITY_POOL[pe[6]] || 'EXTRA_LIFE',
-      }))
-    : [];
+      };
+    }
+  }
 
   const recentExtraLifeSaves: ExtraLifeSaveEvent[] = Array.isArray(raw.rels)
-    ? raw.rels.map((ps) => ({
+    ? new Array(raw.rels.length)
+    : [];
+  if (Array.isArray(raw.rels)) {
+    for (let i = 0; i < raw.rels.length; i++) {
+      const ps = raw.rels[i];
+      recentExtraLifeSaves[i] = {
         id: ps[0],
         tick: ps[1],
         snakeId: ps[2],
         snakeName: ps[3],
         x: ps[4],
         y: ps[5],
-      }))
-    : [];
+      };
+    }
+  }
 
   return {
     tick: raw.t,

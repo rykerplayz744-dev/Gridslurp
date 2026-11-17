@@ -543,29 +543,7 @@ export default function App() {
         }
       }
 
-      // Update HUD state
-      const aliveSnakes = snap.snakes.filter((s) => s.alive);
-      const sorted = [...aliveSnakes].sort((a, b) => b.score - a.score);
-
-      const feed = snap.recentKills
-        .slice(-4)
-        .reverse()
-        .map((k) => {
-          let desc = `${k.victimName} hit the outer wall (${k.pelletsDropped} big pellets!)`;
-          if (k.reason === 'SELF_CRASH') {
-            desc = `${k.victimName} ran over itself (${k.pelletsDropped} big pellets!)`;
-          } else if (k.reason === 'KILLED_BY_SNAKE' && k.killerName) {
-            desc = `${k.killerName} cut off ${k.victimName} (${k.pelletsDropped} big pellets!)`;
-          } else if (k.reason === 'HEAD_COLLISION' && k.killerName) {
-            desc = `${k.killerName} shattered ${k.victimName} head-on!`;
-          }
-          return {
-            id: k.id,
-            text: desc,
-            color: k.victimColor,
-          };
-        });
-
+      // Update HUD state (only build full HUD lists when critical values change or 220ms elapsed)
       const activeSize = snap.gridSize || GRID_SIZE;
       const nowMs = performance.now();
 
@@ -597,54 +575,113 @@ export default function App() {
         }
       }
 
-      const humanMap = new Map<
-        string,
-        {
-          id: string;
-          name: string;
-          color: string;
-          alive: boolean;
-          autoPilot: boolean;
-          extraLives: number;
-          score: number;
-        }
-      >();
-      for (const s of snap.snakes) {
-        if (s.isBot || s.id === myId) continue;
-        humanMap.set(s.id, {
-          id: s.id,
-          name: s.name,
-          color: s.color.head,
-          alive: s.alive,
-          autoPilot: Boolean(s.autoPilot),
-          extraLives: s.extraLives || 0,
-          score: s.score,
-        });
+      let activePeersCount = 0;
+      for (const p of activePeersRef.current.values()) {
+        if (nowMs - p.lastSeen < 6500) activePeersCount++;
       }
-      for (const [pid, info] of activePeersRef.current.entries()) {
-        if (pid === myId || nowMs - info.lastSeen > 6500 || humanMap.has(pid)) continue;
-        humanMap.set(pid, {
-          id: pid,
-          name: info.name,
-          color: '#94A3B8',
-          alive: false,
-          autoPilot: false,
-          extraLives: 0,
-          score: 0,
-        });
-      }
-      const humanPlayers = Array.from(humanMap.values()).sort((a, b) => {
-        const aAdmin = a.name.trim().toUpperCase().startsWith('ADMIN') ? 0 : 1;
-        const bAdmin = b.name.trim().toUpperCase().startsWith('ADMIN') ? 0 : 1;
-        if (aAdmin !== bAdmin) return aAdmin - bAdmin;
-        return a.name.localeCompare(b.name);
-      });
 
-      const livesSig = humanPlayers.map((p) => `${p.id}:${p.extraLives}`).join(',');
-      const criticalHudSig = `${me?.alive ?? false}|${me?.kills ?? 0}|${me?.extraLives ?? 0}|${(snap.lootBoxes || []).length}|${snap.onlinePlayers}|${humanPlayers.length}|${livesSig}|${feed[0]?.id ?? ''}|${(me?.shieldTicks ?? 0) > 0}`;
+      let humanCountOnSnap = 0;
+      let livesSig = '';
+      for (let i = 0; i < snap.snakes.length; i++) {
+        const s = snap.snakes[i];
+        if (!s.isBot && s.id !== myId) {
+          humanCountOnSnap++;
+          livesSig += `${s.id}:${s.extraLives || 0},`;
+        }
+      }
+      const latestKillId =
+        snap.recentKills.length > 0 ? snap.recentKills[snap.recentKills.length - 1].id : '';
+      const criticalHudSig = `${me?.alive ?? false}|${me?.kills ?? 0}|${me?.extraLives ?? 0}|${(snap.lootBoxes || []).length}|${snap.onlinePlayers}|${humanCountOnSnap}|${activePeersCount}|${livesSig}|${latestKillId}|${(me?.shieldTicks ?? 0) > 0}`;
+
       if (criticalHudSig !== lastHudSigRef.current || nowMs - lastHudReactSyncRef.current >= 220) {
         lastHudSigRef.current = criticalHudSig;
         lastHudReactSyncRef.current = nowMs;
+
+        const aliveSnakes: ArenaSnapshot['snakes'] = [];
+        const humanMap = new Map<
+          string,
+          {
+            id: string;
+            name: string;
+            color: string;
+            alive: boolean;
+            autoPilot: boolean;
+            extraLives: number;
+            score: number;
+          }
+        >();
+
+        for (let i = 0; i < snap.snakes.length; i++) {
+          const s = snap.snakes[i];
+          if (s.alive) aliveSnakes.push(s);
+          if (!s.isBot && s.id !== myId) {
+            humanMap.set(s.id, {
+              id: s.id,
+              name: s.name,
+              color: s.color.head,
+              alive: s.alive,
+              autoPilot: Boolean(s.autoPilot),
+              extraLives: s.extraLives || 0,
+              score: s.score,
+            });
+          }
+        }
+        aliveSnakes.sort((a, b) => b.score - a.score);
+
+        for (const [pid, info] of activePeersRef.current.entries()) {
+          if (pid === myId || nowMs - info.lastSeen > 6500 || humanMap.has(pid)) continue;
+          humanMap.set(pid, {
+            id: pid,
+            name: info.name,
+            color: '#94A3B8',
+            alive: false,
+            autoPilot: false,
+            extraLives: 0,
+            score: 0,
+          });
+        }
+        const humanPlayers = Array.from(humanMap.values()).sort((a, b) => {
+          const aAdmin = a.name.trim().toUpperCase().startsWith('ADMIN') ? 0 : 1;
+          const bAdmin = b.name.trim().toUpperCase().startsWith('ADMIN') ? 0 : 1;
+          if (aAdmin !== bAdmin) return aAdmin - bAdmin;
+          return a.name.localeCompare(b.name);
+        });
+
+        const feedCount = Math.min(4, snap.recentKills.length);
+        const feed: Array<{ id: string; text: string; color: string }> = new Array(feedCount);
+        for (let i = 0; i < feedCount; i++) {
+          const k = snap.recentKills[snap.recentKills.length - 1 - i];
+          let desc = `${k.victimName} hit the outer wall (${k.pelletsDropped} big pellets!)`;
+          if (k.reason === 'SELF_CRASH') {
+            desc = `${k.victimName} ran over itself (${k.pelletsDropped} big pellets!)`;
+          } else if (k.reason === 'KILLED_BY_SNAKE' && k.killerName) {
+            desc = `${k.killerName} cut off ${k.victimName} (${k.pelletsDropped} big pellets!)`;
+          } else if (k.reason === 'HEAD_COLLISION' && k.killerName) {
+            desc = `${k.killerName} shattered ${k.victimName} head-on!`;
+          }
+          feed[i] = {
+            id: k.id,
+            text: desc,
+            color: k.victimColor,
+          };
+        }
+
+        const lbCount = Math.min(6, aliveSnakes.length);
+        const leaderboard = new Array(lbCount);
+        for (let i = 0; i < lbCount; i++) {
+          const s = aliveSnakes[i];
+          leaderboard[i] = {
+            id: s.id,
+            name: s.name,
+            score: s.score,
+            length: s.segments.length,
+            kills: s.kills,
+            color: s.color.head,
+            isMe: s.id === myId,
+            isBot: s.isBot,
+          };
+        }
+
         setHudStats((prev) => ({
           score: me ? me.score : prev.score,
           length: me ? me.segments.length : prev.length,
@@ -658,24 +695,9 @@ export default function App() {
           deathReason: me?.deathReason || prev.deathReason,
           killedByName: me?.killedByName || prev.killedByName,
           bigPelletsOnGrid: snap.pellets.length,
-          onlineCount: Math.max(
-            snap.onlinePlayers,
-            1 +
-              Array.from(activePeersRef.current.values()).filter(
-                (p) => nowMs - p.lastSeen < 6500
-              ).length
-          ),
+          onlineCount: Math.max(snap.onlinePlayers, 1 + activePeersCount),
           humanPlayers,
-          leaderboard: sorted.slice(0, 6).map((s) => ({
-            id: s.id,
-            name: s.name,
-            score: s.score,
-            length: s.segments.length,
-            kills: s.kills,
-            color: s.color.head,
-            isMe: s.id === myId,
-            isBot: s.isBot,
-          })),
+          leaderboard,
           killFeed: feed,
         }));
       }
@@ -712,10 +734,9 @@ export default function App() {
       typeof document !== 'undefined' ? Boolean(document.hidden) : false;
 
     const publishMeshPacket = (packet: Record<string, unknown>) => {
-      const serialized = JSON.stringify(packet);
       if (mqttRef.current && mqttRef.current.connected) {
         try {
-          mqttRef.current.publish(meshTopic, serialized, { qos: 0 });
+          mqttRef.current.publish(meshTopic, JSON.stringify(packet), { qos: 0 });
         } catch {
           // ignore publish error
         }
@@ -1291,10 +1312,10 @@ export default function App() {
           }
 
           const snap = engine.step();
-          const activeHumans =
-            1 +
-            Array.from(activePeersRef.current.values()).filter((p) => now - p.lastSeen < 6500)
-              .length;
+          let activeHumans = 1;
+          for (const p of activePeersRef.current.values()) {
+            if (now - p.lastSeen < 6500) activeHumans++;
+          }
           snap.onlinePlayers = Math.max(snap.onlinePlayers, activeHumans);
 
           mc.lastAcceptedEpoch = mc.coordEpoch;
@@ -2537,6 +2558,7 @@ export default function App() {
     const bodyTailYs: number[] = [];
     const bodyRimXs: number[] = [];
     const bodyRimYs: number[] = [];
+    const orderedSnakesScratch: ArenaSnapshot['snakes'] = [];
 
     const drawStaticBoardBackground = (
       targetCtx: CanvasRenderingContext2D,
@@ -2586,6 +2608,10 @@ export default function App() {
 
     const renderFrame = (now: number) => {
       rafId = requestAnimationFrame(renderFrame);
+
+      if (typeof document !== 'undefined' && document.hidden) {
+        return;
+      }
 
       // On software/no-GPU setups, throttle canvas draws to ~30fps so CPU rasterization never stalls the compositor
       if (isSoftwareGpu && now - lastPaintedAt < 32) {
@@ -2973,6 +2999,10 @@ export default function App() {
 
         // 4b. Render Collectible Loot Boxes (extensible crate visuals per ability)
         const lootBoxes = snap.lootBoxes || [];
+        if (lootBoxes.length > 0) {
+          ctx.font = `700 ${Math.max(8, Math.floor(cellPx * 0.36))}px "IBM Plex Mono", monospace`;
+          ctx.textAlign = 'center';
+        }
         for (let bIdx = 0; bIdx < lootBoxes.length; bIdx++) {
           const box = lootBoxes[bIdx];
           if (box.x < startX || box.x >= endX || box.y < startY || box.y >= endY) {
@@ -3027,25 +3057,38 @@ export default function App() {
           ctx.fillRect(midX - barThick * 0.5, midY - barLen * 0.5, barThick, barLen);
 
           // Mini overhead crate label
-          ctx.font = `700 ${Math.max(8, Math.floor(cellPx * 0.36))}px "IBM Plex Mono", monospace`;
-          ctx.textAlign = 'center';
           ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
           ctx.fillText(def.shortLabel, midX + 1, by + bob - 3);
           ctx.fillStyle = def.accentColor;
           ctx.fillText(def.shortLabel, midX, by + bob - 4);
         }
 
-        // 5. Render All Snakes as Lit Colored Pixels on the Grid (Batched per-snake paths for 60fps at any length!)
-        const orderedSnakes = snap.snakes
-          .map((s) => (s.id === myId && projectedMe ? projectedMe : s))
-          .sort((a, b) => (a.id === myId ? 1 : b.id === myId ? -1 : 0));
+        // 5. Render All Snakes as Lit Colored Pixels on the Grid (zero-alloc ordering, local player on top)
+        orderedSnakesScratch.length = 0;
+        let myRenderedSnake: ArenaSnapshot['snakes'][number] | null = null;
+        for (let i = 0; i < snap.snakes.length; i++) {
+          const s = snap.snakes[i];
+          if (!s.alive) continue;
+          if (s.id === myId) {
+            myRenderedSnake = projectedMe || s;
+          } else {
+            orderedSnakesScratch.push(s);
+          }
+        }
+        if (myRenderedSnake) {
+          orderedSnakesScratch.push(myRenderedSnake);
+        }
 
         const meBorderW = Math.max(1.1, cellPx * 0.065);
         const otherBorderW = Math.max(1, cellPx * 0.05);
         const headBorderW = Math.max(1.5, cellPx * 0.09);
+        const nameFontPx = Math.max(9, Math.floor(cellPx * 0.42));
+        const meNameFont = `700 ${nameFontPx}px "IBM Plex Mono", monospace`;
+        const otherNameFont = `600 ${nameFontPx}px "IBM Plex Mono", monospace`;
+        ctx.textAlign = 'center';
 
-        for (let sIdx = 0; sIdx < orderedSnakes.length; sIdx++) {
-          const snake = orderedSnakes[sIdx];
+        for (let sIdx = 0; sIdx < orderedSnakesScratch.length; sIdx++) {
+          const snake = orderedSnakesScratch[sIdx];
           if (!snake.alive) continue;
           const isMe = snake.id === myId;
           const segs = snake.segments;
@@ -3254,8 +3297,7 @@ export default function App() {
           if (head && head.x >= startX && head.x < endX && head.y >= startY && head.y < endY) {
             const hx = (head.x + 0.5) * cellPx;
             const hy = head.y * cellPx - 4;
-            ctx.font = `${isMe ? '700' : '600'} ${Math.max(9, Math.floor(cellPx * 0.42))}px "IBM Plex Mono", monospace`;
-            ctx.textAlign = 'center';
+            ctx.font = isMe ? meNameFont : otherNameFont;
             const shieldSec = ((snake.shieldTicks * TICK_MS) / 1000).toFixed(1);
             const lifeTag = (snake.extraLives || 0) > 0 ? ` [+${snake.extraLives} LIFE]` : '';
             const label = isShielded
