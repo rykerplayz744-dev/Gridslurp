@@ -101,7 +101,12 @@ export default function App() {
   const [zoomIn16, setZoomIn16] = useState<boolean>(false);
   const [mobileControlsEnabled, setMobileControlsEnabled] = useState<boolean>(() => {
     try {
-      return localStorage.getItem('gridslurp_mobile_controls') === 'true';
+      const saved = localStorage.getItem('gridslurp_mobile_controls');
+      if (saved !== null) return saved === 'true';
+      return (
+        typeof window !== 'undefined' &&
+        Boolean(window.matchMedia?.('(pointer: coarse)').matches)
+      );
     } catch {
       return false;
     }
@@ -308,6 +313,24 @@ export default function App() {
   const turnSeqRef = useRef<number>(0);
   const lastHudReactSyncRef = useRef<number>(0);
   const lastHudSigRef = useRef<string>('');
+  const arenaStageRef = useRef<HTMLElement | null>(null);
+  const showAdminModalRef = useRef<boolean>(showAdminModal);
+  const showTradeModalRef = useRef<boolean>(showTradeModal);
+  const swipeGestureRef = useRef<{
+    active: boolean;
+    mode: 'none' | 'touch' | 'pointer';
+    id: number;
+    anchorX: number;
+    anchorY: number;
+    lastDir: Direction | null;
+  }>({
+    active: false,
+    mode: 'none',
+    id: -1,
+    anchorX: 0,
+    anchorY: 0,
+    lastDir: null,
+  });
   const deathOverlaysRef = useRef<ActiveDeathEffectOverlay[]>([]);
   const deathOverlayElemMapRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const deathOverlayTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
@@ -2469,12 +2492,180 @@ export default function App() {
     [sendCommand, stopAutoPilot]
   );
 
-  const handleMobileTurn = useCallback(
-    (dir: Direction) => {
-      issueDirectionalTurn(dir);
-    },
-    [issueDirectionalTurn]
-  );
+  const issueDirectionalTurnRef = useRef<(dir: Direction) => void>(issueDirectionalTurn);
+  useEffect(() => {
+    issueDirectionalTurnRef.current = issueDirectionalTurn;
+  }, [issueDirectionalTurn]);
+
+  useEffect(() => {
+    showAdminModalRef.current = showAdminModal;
+  }, [showAdminModal]);
+
+  useEffect(() => {
+    showTradeModalRef.current = showTradeModal;
+  }, [showTradeModal]);
+
+  // Built-in RAM Google Snake-style screen swipe recognizer (zero server round-trip for swipe direction)
+  useEffect(() => {
+    if (!mobileControlsEnabled || gameState !== 'PLAYING') {
+      swipeGestureRef.current.active = false;
+      swipeGestureRef.current.mode = 'none';
+      swipeGestureRef.current.id = -1;
+      swipeGestureRef.current.lastDir = null;
+      return;
+    }
+
+    const stage = arenaStageRef.current;
+    if (!stage) return;
+
+    const SWIPE_THRESHOLD_PX = 16;
+    const hasTouchEvents = typeof window !== 'undefined' && 'ontouchstart' in window;
+
+    const isInteractiveTarget = (target: EventTarget | null): boolean =>
+      target instanceof Element &&
+      Boolean(target.closest('button, a, input, textarea, select, [role="dialog"]'));
+
+    const resolveSwipeDir = (dx: number, dy: number): Direction => {
+      const absDx = dx < 0 ? -dx : dx;
+      const absDy = dy < 0 ? -dy : dy;
+      if (absDx >= absDy) {
+        return dx > 0 ? 'RIGHT' : 'LEFT';
+      }
+      return dy > 0 ? 'DOWN' : 'UP';
+    };
+
+    const handleSwipeStep = (clientX: number, clientY: number) => {
+      const swipe = swipeGestureRef.current;
+      const dx = clientX - swipe.anchorX;
+      const dy = clientY - swipe.anchorY;
+      const absDx = dx < 0 ? -dx : dx;
+      const absDy = dy < 0 ? -dy : dy;
+      if (absDx < SWIPE_THRESHOLD_PX && absDy < SWIPE_THRESHOLD_PX) {
+        return;
+      }
+      const dir = resolveSwipeDir(dx, dy);
+      // Re-anchor to current finger coordinates so continuous L-turns and U-turns chain without lifting
+      swipe.anchorX = clientX;
+      swipe.anchorY = clientY;
+      if (dir !== swipe.lastDir) {
+        swipe.lastDir = dir;
+        issueDirectionalTurnRef.current(dir);
+      }
+    };
+
+    const resetSwipe = () => {
+      const swipe = swipeGestureRef.current;
+      swipe.active = false;
+      swipe.mode = 'none';
+      swipe.id = -1;
+      swipe.lastDir = null;
+    };
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (gameStateRef.current !== 'PLAYING') return;
+      if (showAdminModalRef.current || showTradeModalRef.current) return;
+      if (isInteractiveTarget(e.target)) return;
+      const touch = e.changedTouches[0];
+      if (!touch) return;
+      e.preventDefault();
+      const swipe = swipeGestureRef.current;
+      swipe.active = true;
+      swipe.mode = 'touch';
+      swipe.id = touch.identifier;
+      swipe.anchorX = touch.clientX;
+      swipe.anchorY = touch.clientY;
+      swipe.lastDir = null;
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (gameStateRef.current !== 'PLAYING') return;
+      if (showAdminModalRef.current || showTradeModalRef.current) return;
+      const swipe = swipeGestureRef.current;
+      if (!swipe.active || swipe.mode !== 'touch') return;
+      e.preventDefault();
+      let tracked: Touch | null = null;
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i].identifier === swipe.id) {
+          tracked = e.changedTouches[i];
+          break;
+        }
+      }
+      if (!tracked) {
+        for (let i = 0; i < e.touches.length; i++) {
+          if (e.touches[i].identifier === swipe.id) {
+            tracked = e.touches[i];
+            break;
+          }
+        }
+      }
+      if (tracked) {
+        handleSwipeStep(tracked.clientX, tracked.clientY);
+      }
+    };
+
+    const onTouchEnd = (e: TouchEvent) => {
+      const swipe = swipeGestureRef.current;
+      if (!swipe.active || swipe.mode !== 'touch') return;
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i].identifier === swipe.id) {
+          resetSwipe();
+          break;
+        }
+      }
+    };
+
+    const onPointerDown = (e: PointerEvent) => {
+      if (hasTouchEvents && e.pointerType === 'touch') return;
+      if (gameStateRef.current !== 'PLAYING') return;
+      if (showAdminModalRef.current || showTradeModalRef.current) return;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (isInteractiveTarget(e.target)) return;
+      const swipe = swipeGestureRef.current;
+      if (swipe.active) return;
+      swipe.active = true;
+      swipe.mode = 'pointer';
+      swipe.id = e.pointerId;
+      swipe.anchorX = e.clientX;
+      swipe.anchorY = e.clientY;
+      swipe.lastDir = null;
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      const swipe = swipeGestureRef.current;
+      if (!swipe.active || swipe.mode !== 'pointer' || swipe.id !== e.pointerId) return;
+      if (gameStateRef.current !== 'PLAYING') return;
+      if (showAdminModalRef.current || showTradeModalRef.current) return;
+      handleSwipeStep(e.clientX, e.clientY);
+    };
+
+    const onPointerUp = (e: PointerEvent) => {
+      const swipe = swipeGestureRef.current;
+      if (swipe.active && swipe.mode === 'pointer' && swipe.id === e.pointerId) {
+        resetSwipe();
+      }
+    };
+
+    stage.addEventListener('touchstart', onTouchStart, { passive: false });
+    stage.addEventListener('touchmove', onTouchMove, { passive: false });
+    stage.addEventListener('touchend', onTouchEnd, { passive: true });
+    stage.addEventListener('touchcancel', onTouchEnd, { passive: true });
+    stage.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
+
+    return () => {
+      stage.removeEventListener('touchstart', onTouchStart);
+      stage.removeEventListener('touchmove', onTouchMove);
+      stage.removeEventListener('touchend', onTouchEnd);
+      stage.removeEventListener('touchcancel', onTouchEnd);
+      stage.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerUp);
+      resetSwipe();
+    };
+  }, [mobileControlsEnabled, gameState]);
 
   const handleToggleAdminAutoPilot = useCallback(() => {
     setAdminAutoPilot((prev) => {
@@ -3763,9 +3954,9 @@ export default function App() {
                 ? 'bg-emerald-500/20 border-emerald-400/60 text-emerald-300'
                 : 'bg-slate-800/80 hover:bg-slate-700/80 text-slate-300 border-slate-700'
             }`}
-            title="Enable or disable on-screen mobile directional controls"
+            title="Toggle Google Snake-style screen swipe controls"
           >
-            {mobileControlsEnabled ? 'Mobile: On' : 'Mobile: Off'}
+            {mobileControlsEnabled ? 'Swipe: On' : 'Swipe: Off'}
           </button>
           <button
             type="button"
@@ -3799,7 +3990,12 @@ export default function App() {
       </header>
 
       {/* Main Arena Stage */}
-      <main className="relative flex-1 w-full flex items-center justify-center px-4 py-2 overflow-hidden">
+      <main
+        ref={arenaStageRef}
+        className={`relative flex-1 w-full flex items-center justify-center px-4 py-2 overflow-hidden ${
+          mobileControlsEnabled && gameState === 'PLAYING' ? 'touch-none' : ''
+        }`}
+      >
         <div className="w-full max-w-[1360px] h-full flex items-center justify-center gap-6">
           {/* Center 1:1 32x32 Pixel Matrix Board */}
           <div className="relative flex items-center justify-center h-full aspect-square max-h-[calc(100vh-6.2rem)] max-w-[calc(100vw-2rem)]">
@@ -3970,91 +4166,11 @@ export default function App() {
                 border is instant death.
               </p>
               <p className="pt-1 text-[11px] font-mono-tabular text-slate-300">
-                Controls: WASD, Arrow Keys, or Mobile Controls
+                Controls: WASD, Arrow Keys, or Swipe on Screen
               </p>
             </div>
           </aside>
         </div>
-
-        {/* ON-SCREEN MOBILE CONTROLS D-PAD OVERLAY */}
-        {mobileControlsEnabled && gameState === 'PLAYING' && (
-          <div
-            className="fixed bottom-5 right-5 z-20 select-none touch-none"
-            aria-label="Mobile Directional Controls"
-          >
-            <div className="p-2.5 rounded-2xl bg-[#0B111D]/95 border border-slate-700/80 shadow-lg">
-              <div className="grid grid-cols-3 gap-2 w-40 h-40 sm:w-44 sm:h-44">
-                <div />
-                <button
-                  type="button"
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    handleMobileTurn('UP');
-                  }}
-                  aria-label="Turn Up"
-                  className="flex items-center justify-center rounded-xl bg-slate-800/90 active:bg-emerald-500/40 hover:bg-slate-700/90 border border-slate-600/80 active:border-emerald-400 text-white shadow-inner transition-colors cursor-pointer touch-none select-none"
-                >
-                  <svg className="w-7 h-7" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M12 5l7 9H5l7-9z" />
-                  </svg>
-                </button>
-                <div />
-
-                <button
-                  type="button"
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    handleMobileTurn('LEFT');
-                  }}
-                  aria-label="Turn Left"
-                  className="flex items-center justify-center rounded-xl bg-slate-800/90 active:bg-emerald-500/40 hover:bg-slate-700/90 border border-slate-600/80 active:border-emerald-400 text-white shadow-inner transition-colors cursor-pointer touch-none select-none"
-                >
-                  <svg className="w-7 h-7" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M5 12l9-7v14l-9-7z" />
-                  </svg>
-                </button>
-
-                <div className="flex items-center justify-center rounded-xl bg-[#070A0F]/80 border border-slate-800/90">
-                  <div className="w-2.5 h-2.5 rounded-xs bg-emerald-400/70" />
-                </div>
-
-                <button
-                  type="button"
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    handleMobileTurn('RIGHT');
-                  }}
-                  aria-label="Turn Right"
-                  className="flex items-center justify-center rounded-xl bg-slate-800/90 active:bg-emerald-500/40 hover:bg-slate-700/90 border border-slate-600/80 active:border-emerald-400 text-white shadow-inner transition-colors cursor-pointer touch-none select-none"
-                >
-                  <svg className="w-7 h-7" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M19 12l-9 7V5l9 7z" />
-                  </svg>
-                </button>
-
-                <div />
-                <button
-                  type="button"
-                  onPointerDown={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    handleMobileTurn('DOWN');
-                  }}
-                  aria-label="Turn Down"
-                  className="flex items-center justify-center rounded-xl bg-slate-800/90 active:bg-emerald-500/40 hover:bg-slate-700/90 border border-slate-600/80 active:border-emerald-400 text-white shadow-inner transition-colors cursor-pointer touch-none select-none"
-                >
-                  <svg className="w-7 h-7" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M12 19l-7-9h14l-7 9z" />
-                  </svg>
-                </button>
-                <div />
-              </div>
-            </div>
-          </div>
-        )}
 
         {/* SPECTATOR MODE FLOATING HUD BAR (WHEN MAIN MENU IS HIDDEN) */}
         {gameState === 'TITLE_MENU' && isSpectating && (
@@ -4494,7 +4610,7 @@ export default function App() {
 
                   <div>
                     <span className="block text-xs font-medium text-slate-300 mb-2">
-                      MOBILE CONTROLS
+                      MOBILE SWIPE
                     </span>
                     <div className="grid grid-cols-2 gap-1.5">
                       <button
@@ -4521,7 +4637,7 @@ export default function App() {
                             : 'bg-[#080B10] border-slate-800 text-slate-400 hover:border-slate-600'
                         }`}
                       >
-                        ON
+                        SWIPE
                       </button>
                     </div>
                   </div>
@@ -4547,7 +4663,7 @@ export default function App() {
                   </button>
                 </div>
                 <p className="text-center text-xs text-slate-400 font-mono-tabular">
-                  WASD / Arrow Keys Move · Z Toggle 16×16 Zoom · M Mute · Esc Pause
+                  WASD / Arrow Keys / Screen Swipe · Z Zoom · M Mute · Esc Pause
                 </p>
               </div>
             </div>
@@ -4560,8 +4676,9 @@ export default function App() {
             <div className="w-full max-w-md rounded-xl bg-[#0D131F] border border-slate-700 p-6 text-center space-y-5">
               <h2 className="font-display text-2xl font-bold text-white">ARENA PAUSED</h2>
               <p className="text-xs text-slate-400">
-                Use only <strong className="text-slate-200">WASD</strong> or{' '}
-                <strong className="text-slate-200">Arrow Keys</strong> to steer your pixel snake
+                Use <strong className="text-slate-200">WASD</strong>,{' '}
+                <strong className="text-slate-200">Arrow Keys</strong>, or{' '}
+                <strong className="text-slate-200">Screen Swipe</strong> to steer your pixel snake
                 across the arena grid.
               </p>
               <div className="flex items-center justify-center gap-3">
