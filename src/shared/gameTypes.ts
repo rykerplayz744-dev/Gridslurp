@@ -355,6 +355,7 @@ export type ClientToServerMessage =
       autoPilotTier?: 'STANDARD' | 'ADMINRY';
     }
   | { type: 'turn'; dir: Direction; seq?: number }
+  | { type: 'turn_batch'; turns: Array<{ dir: Direction; seq: number }> }
   | {
       type: 'respawn';
       name: string;

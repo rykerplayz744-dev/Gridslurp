@@ -39,11 +39,18 @@ import {
 } from './utils/playlistManager';
 import { soundEngine } from './utils/soundEngine';
 
-const getMeshTopic = (size: ServerGridSize) => `gridslurp/v3/arena/global_main_${size}x${size}`;
+const getMeshTopic = (size: ServerGridSize) => `gridslurp/v4/arena/global_main_${size}x${size}`;
 const MQTT_BROKERS = [
   'wss://broker.emqx.io:8084/mqtt',
   'wss://broker.hivemq.com:8884/mqtt',
 ];
+const RTC_ICE_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+  ],
+};
 
 type GameState = 'TITLE_MENU' | 'PLAYING' | 'PAUSED' | 'GAME_OVER';
 
@@ -313,6 +320,21 @@ export default function App() {
   const turnSeqRef = useRef<number>(0);
   const lastHudReactSyncRef = useRef<number>(0);
   const lastHudSigRef = useRef<string>('');
+  const joinGraceUntilRef = useRef<number>(0);
+  const lastTurnRetryAtRef = useRef<number>(0);
+  const rtcPeersRef = useRef<
+    Map<
+      string,
+      {
+        pc: RTCPeerConnection;
+        dc: RTCDataChannel | null;
+        isOfferer: boolean;
+        connected: boolean;
+        createdAt: number;
+        pendingIce: RTCIceCandidateInit[];
+      }
+    >
+  >(new Map());
   const arenaStageRef = useRef<HTMLElement | null>(null);
   const showAdminModalRef = useRef<boolean>(showAdminModal);
   const showTradeModalRef = useRef<boolean>(showTradeModal);
@@ -694,13 +716,18 @@ export default function App() {
       const activeSize = snap.gridSize || GRID_SIZE;
       const nowMs = performance.now();
 
+      if (me && me.alive) {
+        joinGraceUntilRef.current = 0;
+      }
+
       // Ensure AI autopilot auto-respawns seamlessly even if the kill event scrolled past
       if (
         me &&
         !me.alive &&
         gameStateRef.current === 'PLAYING' &&
         autoPilotActiveRef.current &&
-        isAdminNameRef.current
+        isAdminNameRef.current &&
+        nowMs > joinGraceUntilRef.current
       ) {
         triggerAutoPilotRespawnRef.current();
       }
@@ -713,7 +740,7 @@ export default function App() {
           const front = predictedTurnsRef.current[0];
           const ackedBySeq =
             typeof me.lastTurnSeq === 'number' && front.seq <= me.lastTurnSeq;
-          const staleTurn = nowMs - front.sentAt > 1500;
+          const staleTurn = nowMs - front.sentAt > 650;
           if (ackedBySeq || staleTurn) {
             predictedTurnsRef.current.shift();
           } else {
@@ -852,18 +879,46 @@ export default function App() {
     [pickRandomSpectatedSnake, spawnBurst, triggerDeathEffectOverlay]
   );
 
-  // Setup Live Multiplayer: Direct /ws Server + Global Cross-Device WSS Mesh (for Vercel) + BroadcastChannel
+  // Setup Live Multiplayer: Direct /ws Server + Direct WebRTC P2P + MQTT Fast Signaling + BroadcastChannel
   useEffect(() => {
     let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+    let wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let tickTimeout: ReturnType<typeof setTimeout> | null = null;
     let tickWorker: Worker | null = null;
     let tickWorkerUrl: string | null = null;
     let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
     let isUnmounted = false;
+    let meshStarted = false;
+    let wasWsOpen = false;
+    let wsRetryCount = 0;
     const meshTopic = getMeshTopic(serverGridSize);
+    const COORD_HEALTHY_MS = 2800;
+
     activePeersRef.current.clear();
     localEngineRef.current = null;
     clearAllDeathOverlays();
+
+    const closeRtcPeer = (peerId: string) => {
+      const entry = rtcPeersRef.current.get(peerId);
+      if (!entry) return;
+      rtcPeersRef.current.delete(peerId);
+      try {
+        entry.dc?.close();
+      } catch {
+        // ignore
+      }
+      try {
+        entry.pc.close();
+      } catch {
+        // ignore
+      }
+    };
+
+    const closeAllRtcPeers = () => {
+      for (const peerId of Array.from(rtcPeersRef.current.keys())) {
+        closeRtcPeer(peerId);
+      }
+    };
 
     // Reset coordinator state cleanly for this room
     meshCoordRef.current = {
@@ -875,13 +930,13 @@ export default function App() {
       lastAcceptedTick: -1,
       lastCoordMsgAt: 0,
       needsHydrateBeforeStep: false,
-      readyToLeadAt: performance.now() + 900,
+      readyToLeadAt: performance.now() + 1200,
     };
 
     const isSelfHidden = (): boolean =>
       typeof document !== 'undefined' ? Boolean(document.hidden) : false;
 
-    const publishMeshPacket = (packet: Record<string, unknown>) => {
+    const sendPacketViaMqtt = (packet: Record<string, unknown>) => {
       if (mqttRef.current && mqttRef.current.connected) {
         try {
           mqttRef.current.publish(meshTopic, JSON.stringify(packet), { qos: 0 });
@@ -889,10 +944,201 @@ export default function App() {
           // ignore publish error
         }
       }
+    };
+
+    const publishMeshPacket = (packet: Record<string, unknown>, targetPeerId?: string | null) => {
       try {
         broadcastChannelRef.current?.postMessage(packet);
       } catch {
         // ignore broadcast channel error
+      }
+
+      const packetType = packet.type;
+
+      // Signaling and explicit target routing
+      if (packetType === 'rtc_signal') {
+        sendPacketViaMqtt(packet);
+        return;
+      }
+
+      if (targetPeerId) {
+        const peerRtc = rtcPeersRef.current.get(targetPeerId);
+        if (peerRtc && peerRtc.dc && peerRtc.dc.readyState === 'open') {
+          try {
+            peerRtc.dc.send(JSON.stringify(packet));
+            return;
+          } catch {
+            // fall through to MQTT fallback
+          }
+        }
+        sendPacketViaMqtt(packet);
+        return;
+      }
+
+      if (packetType === 'mesh_state') {
+        let serialized: string | null = null;
+        let hasAnyFallbackPeer = false;
+        const now = performance.now();
+
+        for (const [pid, info] of activePeersRef.current.entries()) {
+          if (now - info.lastSeen > 6500) continue;
+          const peerRtc = rtcPeersRef.current.get(pid);
+          if (peerRtc && peerRtc.dc && peerRtc.dc.readyState === 'open') {
+            try {
+              if (serialized === null) serialized = JSON.stringify(packet);
+              peerRtc.dc.send(serialized);
+              continue;
+            } catch {
+              // fallback to MQTT below
+            }
+          }
+          hasAnyFallbackPeer = true;
+        }
+
+        // Only send full tick snapshots over MQTT while at least 1 peer is still establishing WebRTC
+        if (hasAnyFallbackPeer && mqttRef.current && mqttRef.current.connected) {
+          try {
+            if (serialized === null) serialized = JSON.stringify(packet);
+            mqttRef.current.publish(meshTopic, serialized, { qos: 0 });
+          } catch {
+            // ignore publish error
+          }
+        }
+        return;
+      }
+
+      // Broadcast general packets over all open WebRTC channels AND MQTT
+      let serialized: string | null = null;
+      for (const peerRtc of rtcPeersRef.current.values()) {
+        if (peerRtc.dc && peerRtc.dc.readyState === 'open') {
+          try {
+            if (serialized === null) serialized = JSON.stringify(packet);
+            peerRtc.dc.send(serialized);
+          } catch {
+            // ignore
+          }
+        }
+      }
+      if (mqttRef.current && mqttRef.current.connected) {
+        try {
+          if (serialized === null) serialized = JSON.stringify(packet);
+          mqttRef.current.publish(meshTopic, serialized, { qos: 0 });
+        } catch {
+          // ignore publish error
+        }
+      }
+    };
+
+    const bindRtcDataChannel = (peerId: string, dc: RTCDataChannel) => {
+      const entry = rtcPeersRef.current.get(peerId);
+      if (!entry) return;
+      entry.dc = dc;
+      dc.onopen = () => {
+        const cur = rtcPeersRef.current.get(peerId);
+        if (cur) cur.connected = true;
+      };
+      dc.onclose = () => {
+        const cur = rtcPeersRef.current.get(peerId);
+        if (cur) cur.connected = false;
+      };
+      dc.onerror = () => {
+        const cur = rtcPeersRef.current.get(peerId);
+        if (cur) cur.connected = false;
+      };
+      dc.onmessage = (ev) => {
+        try {
+          if (typeof ev.data === 'string') {
+            handleMeshPacket(JSON.parse(ev.data));
+          }
+        } catch {
+          // ignore malformed DC packet
+        }
+      };
+    };
+
+    const createRtcPeer = (peerId: string, isOfferer: boolean) => {
+      if (typeof RTCPeerConnection === 'undefined') return null;
+      const existing = rtcPeersRef.current.get(peerId);
+      if (existing) {
+        const state = existing.pc.connectionState;
+        if (state !== 'failed' && state !== 'closed') {
+          return existing;
+        }
+        closeRtcPeer(peerId);
+      }
+
+      try {
+        const pc = new RTCPeerConnection(RTC_ICE_CONFIG);
+        const entry = {
+          pc,
+          dc: null as RTCDataChannel | null,
+          isOfferer,
+          connected: false,
+          createdAt: performance.now(),
+          pendingIce: [] as RTCIceCandidateInit[],
+        };
+        rtcPeersRef.current.set(peerId, entry);
+
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate && !isUnmounted) {
+            publishMeshPacket({
+              type: 'rtc_signal',
+              senderId: playerIdRef.current,
+              targetId: peerId,
+              candidate: ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate,
+            });
+          }
+        };
+
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+            closeRtcPeer(peerId);
+          }
+        };
+
+        pc.ondatachannel = (ev) => {
+          bindRtcDataChannel(peerId, ev.channel);
+        };
+
+        if (isOfferer) {
+          const dc = pc.createDataChannel('gridslurp', {
+            ordered: false,
+            maxPacketLifeTime: 180,
+          });
+          bindRtcDataChannel(peerId, dc);
+          pc.createOffer()
+            .then((offer) => pc.setLocalDescription(offer))
+            .then(() => {
+              if (!isUnmounted && pc.localDescription) {
+                publishMeshPacket({
+                  type: 'rtc_signal',
+                  senderId: playerIdRef.current,
+                  targetId: peerId,
+                  sdp: {
+                    type: pc.localDescription.type,
+                    sdp: pc.localDescription.sdp,
+                  },
+                });
+              }
+            })
+            .catch(() => {
+              closeRtcPeer(peerId);
+            });
+        }
+
+        return entry;
+      } catch {
+        return null;
+      }
+    };
+
+    const maybeInitiateRtcWithPeer = (peerId: string) => {
+      if (!meshStarted || isUnmounted) return;
+      const myId = playerIdRef.current;
+      if (!peerId || peerId === myId) return;
+      // Deterministic initiator rule prevents offer glare: smaller peer ID initiates
+      if (myId < peerId && !rtcPeersRef.current.has(peerId)) {
+        createRtcPeer(peerId, true);
       }
     };
 
@@ -905,10 +1151,10 @@ export default function App() {
 
       const amHidden = isSelfHidden();
       const coordSilentMs = now - mc.lastCoordMsgAt;
-      // Treat any coordinator that is backgrounded while we are foregrounded (or silent > 420ms, i.e. 1Hz-throttled) as degraded
+      // Give healthy coordinators a full 2.8s jitter buffer so brief WiFi hiccups never cause split-brain teleports
       const coordHealthy =
         Boolean(mc.activeCoordId) &&
-        coordSilentMs <= Math.max(420, TICK_MS * 3) &&
+        coordSilentMs <= COORD_HEALTHY_MS &&
         (!mc.activeCoordHidden || amHidden);
 
       if (coordHealthy) {
@@ -921,7 +1167,7 @@ export default function App() {
       let anyVisiblePeer = false;
       for (const [pid, info] of activePeersRef.current.entries()) {
         if (pid === myId) continue;
-        if (now - info.lastSeen > 5000) continue;
+        if (now - info.lastSeen > 6500) continue;
         if (!info.hidden) {
           anyVisiblePeer = true;
           if (amHidden) return false;
@@ -930,8 +1176,8 @@ export default function App() {
           return false;
         }
       }
-      // If we are hidden and still see a non-expired coordinator within 4.5s, don't fight it
-      if (amHidden && mc.activeCoordId && coordSilentMs < 4500) {
+      // If we are hidden and still see a non-expired coordinator within 5s, don't fight it
+      if (amHidden && mc.activeCoordId && coordSilentMs < 5000) {
         return false;
       }
       return true;
@@ -945,8 +1191,17 @@ export default function App() {
       const myId = playerIdRef.current;
       const mySnake = remoteSnap.snakes.find((s) => s.id === myId);
 
-      // Sync GAME_OVER synchronously if coordinator reports our snake dead (unless AI autopilot auto-respawns)
-      if (mySnake && !mySnake.alive && gameStateRef.current === 'PLAYING') {
+      if (mySnake && mySnake.alive) {
+        joinGraceUntilRef.current = 0;
+      }
+
+      // Sync GAME_OVER only when outside post-join grace window so stale in-flight dead ticks never cancel Play Again
+      if (
+        mySnake &&
+        !mySnake.alive &&
+        gameStateRef.current === 'PLAYING' &&
+        now > joinGraceUntilRef.current
+      ) {
         if (autoPilotActiveRef.current && isAdminNameRef.current) {
           triggerAutoPilotRespawnRef.current();
         } else {
@@ -957,27 +1212,31 @@ export default function App() {
         return;
       }
 
-      // If we just joined and aren't on the coordinator's board yet, resend join cleanly once per 850ms
+      // If we just joined/respawned and aren't alive on the coordinator's board yet, resend join every 420ms
+      const needsSpawnOnBoard = !mySnake || (!mySnake.alive && now <= joinGraceUntilRef.current);
       if (
         myJoinInfoRef.current.playing &&
         gameStateRef.current === 'PLAYING' &&
-        !mySnake &&
-        now - lastAutoJoinSentAtRef.current > 850
+        needsSpawnOnBoard &&
+        now - lastAutoJoinSentAtRef.current > 420
       ) {
         lastAutoJoinSentAtRef.current = now;
-        publishMeshPacket({
-          type: 'mesh_cmd',
-          senderId: myId,
-          cmd: {
-            type: 'join',
-            clientId: myId,
-            name: myJoinInfoRef.current.name,
-            colorId: myJoinInfoRef.current.colorId,
-            faceId: myJoinInfoRef.current.faceId,
-            deathEffectId: myJoinInfoRef.current.deathEffectId,
-            gridSize: serverGridSize,
+        publishMeshPacket(
+          {
+            type: 'mesh_cmd',
+            senderId: myId,
+            cmd: {
+              type: 'join',
+              clientId: myId,
+              name: myJoinInfoRef.current.name,
+              colorId: myJoinInfoRef.current.colorId,
+              faceId: myJoinInfoRef.current.faceId,
+              deathEffectId: myJoinInfoRef.current.deathEffectId,
+              gridSize: serverGridSize,
+            },
           },
-        });
+          meshCoordRef.current.activeCoordId
+        );
       }
     };
 
@@ -999,23 +1258,77 @@ export default function App() {
         hidden: remoteHidden,
       });
 
+      maybeInitiateRtcWithPeer(senderId);
+
+      // Handle WebRTC SDP & ICE signaling
+      if (data.type === 'rtc_signal') {
+        if (data.targetId !== myId) return;
+        const sdp = data.sdp as RTCSessionDescriptionInit | undefined;
+        const candidate = data.candidate as RTCIceCandidateInit | undefined;
+        if (sdp) {
+          const entry =
+            rtcPeersRef.current.get(senderId) || createRtcPeer(senderId, false);
+          if (!entry) return;
+          const pc = entry.pc;
+          pc.setRemoteDescription(new RTCSessionDescription(sdp))
+            .then(async () => {
+              while (entry.pendingIce.length > 0) {
+                const c = entry.pendingIce.shift()!;
+                try {
+                  await pc.addIceCandidate(new RTCIceCandidate(c));
+                } catch {
+                  // ignore candidate error
+                }
+              }
+              if (sdp.type === 'offer') {
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                if (!isUnmounted && pc.localDescription) {
+                  publishMeshPacket({
+                    type: 'rtc_signal',
+                    senderId: myId,
+                    targetId: senderId,
+                    sdp: {
+                      type: pc.localDescription.type,
+                      sdp: pc.localDescription.sdp,
+                    },
+                  });
+                }
+              }
+            })
+            .catch(() => {
+              closeRtcPeer(senderId);
+            });
+        } else if (candidate) {
+          const entry = rtcPeersRef.current.get(senderId);
+          if (entry) {
+            if (entry.pc.remoteDescription) {
+              entry.pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
+            } else {
+              entry.pendingIce.push(candidate);
+            }
+          }
+        }
+        return;
+      }
+
       const mc = meshCoordRef.current;
 
       if (data.type === 'mesh_state' && data.state && localEngineRef.current) {
         const remoteEpoch = Number(data.epoch) || 1;
         const remoteSnap = unpackSnapshot(data.state as ArenaSnapshot | PackedArenaSnapshot);
 
-        // If we thought we were coordinator, yield cleanly to visible peers when hidden, higher epoch, higher tick, or lower ID
+        // If we thought we were coordinator, never let a late-joining lower ID hijack an established host ahead in ticks
         if (mc.isCoordinator) {
           const ourTick = localEngineRef.current.tick;
           const amHidden = isSelfHidden();
           const remoteWins =
-            (amHidden && !remoteHidden && remoteEpoch >= mc.coordEpoch) ||
             remoteEpoch > mc.coordEpoch ||
-            (remoteEpoch === mc.coordEpoch && remoteSnap.tick > ourTick + 1) ||
+            (remoteEpoch === mc.coordEpoch && amHidden && !remoteHidden) ||
             (remoteEpoch === mc.coordEpoch &&
-              Math.abs(remoteSnap.tick - ourTick) <= 1 &&
-              (amHidden === remoteHidden ? senderId < myId : !remoteHidden));
+              amHidden === remoteHidden &&
+              (remoteSnap.tick > ourTick + 3 ||
+                (Math.abs(remoteSnap.tick - ourTick) <= 3 && senderId < myId)));
           if (!remoteWins) {
             return;
           }
@@ -1035,7 +1348,7 @@ export default function App() {
           mc.activeCoordId &&
           senderId !== mc.activeCoordId &&
           remoteEpoch === mc.lastAcceptedEpoch &&
-          now - mc.lastCoordMsgAt < Math.max(420, TICK_MS * 3) &&
+          now - mc.lastCoordMsgAt < COORD_HEALTHY_MS &&
           !mc.activeCoordHidden
         ) {
           return;
@@ -1137,6 +1450,11 @@ export default function App() {
           engine.setPlayerDeathEffect(targetId, cmd.deathEffectId);
         } else if (cmd.type === 'turn') {
           engine.queueTurn(targetId, cmd.dir, cmd.seq);
+        } else if (cmd.type === 'turn_batch' && Array.isArray(cmd.turns)) {
+          for (let i = 0; i < cmd.turns.length; i++) {
+            const t = cmd.turns[i];
+            if (t && t.dir) engine.queueTurn(targetId, t.dir, t.seq);
+          }
         } else if (cmd.type === 'autopilot') {
           engine.setAutopilot(targetId, Boolean(cmd.enabled), cmd.tier);
         } else if (cmd.type === 'adminry_pellet_flood') {
@@ -1291,7 +1609,7 @@ export default function App() {
       let nextCoordIsVisible = false;
       for (const [pid, info] of activePeersRef.current.entries()) {
         if (pid === playerIdRef.current) continue;
-        if (now - info.lastSeen > 5000) continue;
+        if (now - info.lastSeen > 6500) continue;
         const peerVisible = !info.hidden;
         if (
           !nextCoordId ||
@@ -1317,7 +1635,8 @@ export default function App() {
     };
 
     const startGlobalMeshEngine = () => {
-      if (isUnmounted || localEngineRef.current) return;
+      if (isUnmounted || meshStarted || localEngineRef.current) return;
+      meshStarted = true;
       setConnectionMode('ws');
       const targetBots = serverGridSize === 64 ? 4 : 2;
       const engine = new ArenaEngine(targetBots, serverGridSize);
@@ -1325,7 +1644,7 @@ export default function App() {
 
       // 1. Local multi-tab BroadcastChannel
       try {
-        const bc = new BroadcastChannel(`gridslurp_${serverGridSize}x${serverGridSize}_arena_v3`);
+        const bc = new BroadcastChannel(`gridslurp_${serverGridSize}x${serverGridSize}_arena_v4`);
         broadcastChannelRef.current = bc;
         bc.onmessage = (ev) => {
           handleMeshPacket(ev.data);
@@ -1334,7 +1653,7 @@ export default function App() {
         // BroadcastChannel optional
       }
 
-      // 2. Global Cross-Device WSS Relay (MQTT over WebSockets - works on Vercel & worldwide browsers)
+      // 2. Global Cross-Device Signaling & Relay (MQTT over WebSockets - upgrades peers to direct WebRTC P2P)
       const connectMqttBroker = (brokerIndex: number) => {
         if (isUnmounted) return;
         const brokerUrl = MQTT_BROKERS[brokerIndex] || MQTT_BROKERS[0];
@@ -1346,7 +1665,7 @@ export default function App() {
             clientId: `gridslurp_${playerIdRef.current}_${Math.random().toString(16).slice(2, 6)}`,
             clean: true,
             keepalive: 20,
-            connectTimeout: 3500,
+            connectTimeout: 4000,
             reconnectPeriod: 1500,
           });
           mqttRef.current = client;
@@ -1361,7 +1680,7 @@ export default function App() {
                 }
                 connectMqttBroker(1);
               }
-            }, 3800);
+            }, 4500);
           }
 
           client.on('connect', () => {
@@ -1370,7 +1689,7 @@ export default function App() {
             if (isUnmounted) return;
             setConnectionMode('ws');
             client.subscribe(meshTopic, { qos: 0 });
-            publishMeshPacket({
+            sendPacketViaMqtt({
               type: 'mesh_heartbeat',
               senderId: playerIdRef.current,
               playing: myJoinInfoRef.current.playing,
@@ -1400,33 +1719,33 @@ export default function App() {
       lastSnapshotTimeRef.current = performance.now();
       processSnapshotEvents(initialSnap);
 
-      // Lightweight periodic peer heartbeat & stale player cleanup
+      // Periodic peer discovery heartbeat & stale peer cleanup
       heartbeatInterval = setInterval(() => {
         const now = performance.now();
-        // Coordinator already proves liveness every tick via mesh_state when active
-        if (!meshCoordRef.current.isCoordinator || activePeersRef.current.size === 0) {
-          publishMeshPacket({
-            type: 'mesh_heartbeat',
-            senderId: playerIdRef.current,
-            playing: myJoinInfoRef.current.playing,
-            name: myJoinInfoRef.current.name,
-            colorId: myJoinInfoRef.current.colorId,
-            hidden: isSelfHidden(),
-          });
-        }
+        // Lightweight heartbeat on MQTT so newcomers discover host even when active peers use direct WebRTC
+        sendPacketViaMqtt({
+          type: 'mesh_heartbeat',
+          senderId: playerIdRef.current,
+          playing: myJoinInfoRef.current.playing,
+          name: myJoinInfoRef.current.name,
+          colorId: myJoinInfoRef.current.colorId,
+          hidden: isSelfHidden(),
+        });
 
-        // Clean up disconnected remote human players after 6.5s of silence
         for (const [pid, info] of activePeersRef.current.entries()) {
           if (now - info.lastSeen > 6500) {
             activePeersRef.current.delete(pid);
+            closeRtcPeer(pid);
             if (meshCoordRef.current.isCoordinator) {
               localEngineRef.current?.removePlayer(pid);
             }
+          } else {
+            maybeInitiateRtcWithPeer(pid);
           }
         }
-      }, 900);
+      }, 950);
 
-      // Drift-compensated Authoritative Room Coordinator step loop
+      // Drift-compensated Authoritative Room Coordinator step loop + Guest unacked input redundancy
       let lastTickExecutedAt = 0;
       const executeMeshTick = () => {
         if (isUnmounted) return;
@@ -1436,6 +1755,38 @@ export default function App() {
         }
         lastTickExecutedAt = now;
         const mc = meshCoordRef.current;
+
+        // Guest input redundancy: resend unacknowledged turns every ~100ms until coordinator acks lastTurnSeq
+        if (
+          !mc.isCoordinator &&
+          mc.activeCoordId &&
+          gameStateRef.current === 'PLAYING' &&
+          predictedTurnsRef.current.length > 0 &&
+          now - lastTurnRetryAtRef.current >= 100
+        ) {
+          lastTurnRetryAtRef.current = now;
+          const retryTurns: Array<{ dir: Direction; seq: number }> = [];
+          for (let i = 0; i < predictedTurnsRef.current.length; i++) {
+            const pt = predictedTurnsRef.current[i];
+            if (now - pt.sentAt <= 650) {
+              retryTurns.push({ dir: pt.dir, seq: pt.seq });
+            }
+          }
+          if (retryTurns.length > 0) {
+            publishMeshPacket(
+              {
+                type: 'mesh_cmd',
+                senderId: playerIdRef.current,
+                cmd: {
+                  type: 'turn_batch',
+                  turns: retryTurns,
+                  clientId: playerIdRef.current,
+                },
+              },
+              mc.activeCoordId
+            );
+          }
+        }
 
         if (canBecomeCoordinator(now)) {
           if (!mc.isCoordinator) {
@@ -1447,7 +1798,6 @@ export default function App() {
               engine.hydrateFromSnapshot(snapshotRef.current);
               mc.needsHydrateBeforeStep = false;
             }
-            // If local user joined during discovery window before promotion, ensure they spawn now
             if (
               myJoinInfoRef.current.playing &&
               gameStateRef.current === 'PLAYING' &&
@@ -1569,98 +1919,129 @@ export default function App() {
 
     let activeTickSeenOnWs = -1;
 
-    try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws?size=${serverGridSize}`;
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
+    const connectDirectWs = () => {
+      if (isUnmounted) return;
+      try {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws?size=${serverGridSize}`;
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
 
-      fallbackTimer = setTimeout(() => {
-        if (ws.readyState !== WebSocket.OPEN) {
-          try {
-            ws.close();
-          } catch {
-            // ignore
-          }
-          startGlobalMeshEngine();
-        }
-      }, 2000);
-
-      ws.onopen = () => {
         if (fallbackTimer) clearTimeout(fallbackTimer);
-        setConnectionMode('ws');
-        ws.send(JSON.stringify({ type: 'select_server', gridSize: serverGridSize }));
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data) as ServerToClientMessage;
-          if (msg.type === 'welcome') {
-            playerIdRef.current = msg.playerId;
-            const unpacked = unpackSnapshot(msg.state);
-            activeTickSeenOnWs = unpacked.tick;
-            snapshotRef.current = unpacked;
-            lastSnapshotTimeRef.current = performance.now();
-            processSnapshotEvents(unpacked);
-          } else if (msg.type === 'state') {
-            const unpacked = unpackSnapshot(msg.state);
-            if (unpacked.tick < activeTickSeenOnWs) return;
-            activeTickSeenOnWs = unpacked.tick;
-            snapshotRef.current = unpacked;
-            lastSnapshotTimeRef.current = performance.now();
-            processSnapshotEvents(unpacked);
-          } else if (msg.type === 'admin_track') {
-            isAdminMusicActiveRef.current = true;
-            setIsAdminMusicActive(true);
-            playNextAdminTrackRef.current(msg.trackId);
-          } else if (msg.type === 'kick_admin') {
-            handleIncomingAdminKickRef.current(msg.targetPlayerId, msg.issuedByClientId);
-          } else if (msg.type === 'trade_offer') {
-            if (msg.offer.toId === playerIdRef.current) {
-              setIncomingTrades((prev) =>
-                prev.some((o) => o.id === msg.offer.id) ? prev : [...prev.slice(-3), msg.offer]
-              );
+        fallbackTimer = setTimeout(() => {
+          if (ws.readyState !== WebSocket.OPEN && !wasWsOpen && !isUnmounted) {
+            try {
+              ws.close();
+            } catch {
+              // ignore
             }
-          } else if (msg.type === 'trade_result') {
-            if (msg.ok && msg.accepted) {
-              soundEngine.playLootBoxPickup();
-            }
-            setIncomingTrades((prev) => prev.filter((o) => o.id !== msg.offerId));
-            setTradeFeedback({ text: msg.summary, ok: msg.ok });
-          } else if (msg.type === 'pellet_flood_notice') {
-            if (msg.action === 'FLOOD_SCREEN') {
-              soundEngine.playLootBoxPickup();
-              setPelletFloodFeedback(
-                `${msg.byName} flooded the screen with ${msg.count.toLocaleString()} flashing pellets!`
-              );
-            } else {
-              setPelletFloodFeedback(
-                `${msg.byName} cleared ${msg.count.toLocaleString()} pellets from the grid.`
-              );
-            }
+            startGlobalMeshEngine();
           }
-        } catch {
-          // ignore parse error
-        }
-      };
+        }, 1500);
 
-      ws.onerror = () => {
-        startGlobalMeshEngine();
-      };
+        ws.onopen = () => {
+          wasWsOpen = true;
+          wsRetryCount = 0;
+          if (fallbackTimer) clearTimeout(fallbackTimer);
+          setConnectionMode('ws');
+          ws.send(JSON.stringify({ type: 'select_server', gridSize: serverGridSize }));
+          if (myJoinInfoRef.current.playing && gameStateRef.current === 'PLAYING') {
+            ws.send(
+              JSON.stringify({
+                type: 'join',
+                name: myJoinInfoRef.current.name,
+                colorId: myJoinInfoRef.current.colorId,
+                faceId: myJoinInfoRef.current.faceId,
+                deathEffectId: myJoinInfoRef.current.deathEffectId,
+                clientId: playerIdRef.current,
+                gridSize: serverGridSize,
+              })
+            );
+          }
+        };
 
-      ws.onclose = () => {
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data) as ServerToClientMessage;
+            if (msg.type === 'welcome') {
+              playerIdRef.current = msg.playerId;
+              const unpacked = unpackSnapshot(msg.state);
+              activeTickSeenOnWs = unpacked.tick;
+              snapshotRef.current = unpacked;
+              lastSnapshotTimeRef.current = performance.now();
+              processSnapshotEvents(unpacked);
+            } else if (msg.type === 'state') {
+              const unpacked = unpackSnapshot(msg.state);
+              if (unpacked.tick < activeTickSeenOnWs) return;
+              activeTickSeenOnWs = unpacked.tick;
+              snapshotRef.current = unpacked;
+              lastSnapshotTimeRef.current = performance.now();
+              processSnapshotEvents(unpacked);
+            } else if (msg.type === 'admin_track') {
+              isAdminMusicActiveRef.current = true;
+              setIsAdminMusicActive(true);
+              playNextAdminTrackRef.current(msg.trackId);
+            } else if (msg.type === 'kick_admin') {
+              handleIncomingAdminKickRef.current(msg.targetPlayerId, msg.issuedByClientId);
+            } else if (msg.type === 'trade_offer') {
+              if (msg.offer.toId === playerIdRef.current) {
+                setIncomingTrades((prev) =>
+                  prev.some((o) => o.id === msg.offer.id) ? prev : [...prev.slice(-3), msg.offer]
+                );
+              }
+            } else if (msg.type === 'trade_result') {
+              if (msg.ok && msg.accepted) {
+                soundEngine.playLootBoxPickup();
+              }
+              setIncomingTrades((prev) => prev.filter((o) => o.id !== msg.offerId));
+              setTradeFeedback({ text: msg.summary, ok: msg.ok });
+            } else if (msg.type === 'pellet_flood_notice') {
+              if (msg.action === 'FLOOD_SCREEN') {
+                soundEngine.playLootBoxPickup();
+                setPelletFloodFeedback(
+                  `${msg.byName} flooded the screen with ${msg.count.toLocaleString()} flashing pellets!`
+                );
+              } else {
+                setPelletFloodFeedback(
+                  `${msg.byName} cleared ${msg.count.toLocaleString()} pellets from the grid.`
+                );
+              }
+            }
+          } catch {
+            // ignore parse error
+          }
+        };
+
+        ws.onerror = () => {
+          if (!wasWsOpen) {
+            startGlobalMeshEngine();
+          }
+        };
+
+        ws.onclose = () => {
+          if (isUnmounted) return;
+          if (wasWsOpen && wsRetryCount < 4) {
+            wsRetryCount++;
+            wsReconnectTimer = setTimeout(connectDirectWs, 500);
+          } else {
+            startGlobalMeshEngine();
+          }
+        };
+      } catch {
         startGlobalMeshEngine();
-      };
-    } catch {
-      startGlobalMeshEngine();
-    }
+      }
+    };
+
+    connectDirectWs();
 
     return () => {
       isUnmounted = true;
       window.removeEventListener('pagehide', sendCoordinatorHandoff);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       sendCoordinatorHandoff();
+      closeAllRtcPeers();
       if (fallbackTimer) clearTimeout(fallbackTimer);
+      if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
       if (tickTimeout) clearTimeout(tickTimeout);
       if (tickWorker) {
         try {
@@ -1700,7 +2081,7 @@ export default function App() {
         }
       }
     };
-  }, [processSnapshotEvents, serverGridSize]);
+  }, [clearAllDeathOverlays, processSnapshotEvents, serverGridSize]);
 
   const sendCommand = useCallback(
     (msg: ClientToServerMessage) => {
@@ -1728,10 +2109,10 @@ export default function App() {
       }
 
       // Global Mesh / Vercel Multiplayer command dispatch:
-      // Only mutate localEngineRef directly when WE are the coordinator (or no coordinator is active yet)
+      // Only mutate localEngineRef directly when WE are confirmed authoritative coordinator
       const engine = localEngineRef.current;
       const mc = meshCoordRef.current;
-      if (engine && (mc.isCoordinator || !mc.activeCoordId)) {
+      if (engine && mc.isCoordinator) {
         if (msg.type === 'join' || msg.type === 'respawn') {
           engine.spawnPlayer(
             pid,
@@ -1751,6 +2132,11 @@ export default function App() {
           snapshotRef.current = engine.getSnapshot();
         } else if (msg.type === 'turn') {
           engine.queueTurn(pid, msg.dir, msg.seq);
+        } else if (msg.type === 'turn_batch' && Array.isArray(msg.turns)) {
+          for (let i = 0; i < msg.turns.length; i++) {
+            const t = msg.turns[i];
+            if (t && t.dir) engine.queueTurn(pid, t.dir, t.seq);
+          }
         } else if (msg.type === 'autopilot') {
           engine.setAutopilot(pid, Boolean(msg.enabled), msg.tier);
         } else if (msg.type === 'kick_admin') {
@@ -1786,9 +2172,19 @@ export default function App() {
               count,
               byName: candidateName,
             };
+            const noticeRaw = JSON.stringify(noticePacket);
+            for (const peerRtc of rtcPeersRef.current.values()) {
+              if (peerRtc.dc && peerRtc.dc.readyState === 'open') {
+                try {
+                  peerRtc.dc.send(noticeRaw);
+                } catch {
+                  // ignore
+                }
+              }
+            }
             if (mqttRef.current && mqttRef.current.connected) {
               try {
-                mqttRef.current.publish(getMeshTopic(serverGridSize), JSON.stringify(noticePacket), {
+                mqttRef.current.publish(meshTopicForSend(), noticeRaw, {
                   qos: 0,
                 });
               } catch {
@@ -1828,13 +2224,19 @@ export default function App() {
                 accepted: amount > 0,
                 summary: `${candidateName}: ${summary}`,
               };
+              const resRaw = JSON.stringify(resultPacket);
+              for (const peerRtc of rtcPeersRef.current.values()) {
+                if (peerRtc.dc && peerRtc.dc.readyState === 'open') {
+                  try {
+                    peerRtc.dc.send(resRaw);
+                  } catch {
+                    // ignore
+                  }
+                }
+              }
               if (mqttRef.current && mqttRef.current.connected) {
                 try {
-                  mqttRef.current.publish(
-                    getMeshTopic(serverGridSize),
-                    JSON.stringify(resultPacket),
-                    { qos: 0 }
-                  );
+                  mqttRef.current.publish(meshTopicForSend(), resRaw, { qos: 0 });
                 } catch {
                   // ignore
                 }
@@ -1867,11 +2269,19 @@ export default function App() {
             accepted: true,
             summary,
           };
+          const resRaw = JSON.stringify(resultPacket);
+          for (const peerRtc of rtcPeersRef.current.values()) {
+            if (peerRtc.dc && peerRtc.dc.readyState === 'open') {
+              try {
+                peerRtc.dc.send(resRaw);
+              } catch {
+                // ignore
+              }
+            }
+          }
           if (mqttRef.current && mqttRef.current.connected) {
             try {
-              mqttRef.current.publish(getMeshTopic(serverGridSize), JSON.stringify(resultPacket), {
-                qos: 0,
-              });
+              mqttRef.current.publish(meshTopicForSend(), resRaw, { qos: 0 });
             } catch {
               // ignore
             }
@@ -1908,11 +2318,19 @@ export default function App() {
             accepted: msg.accepted,
             summary,
           };
+          const resRaw = JSON.stringify(resultPacket);
+          for (const peerRtc of rtcPeersRef.current.values()) {
+            if (peerRtc.dc && peerRtc.dc.readyState === 'open') {
+              try {
+                peerRtc.dc.send(resRaw);
+              } catch {
+                // ignore
+              }
+            }
+          }
           if (mqttRef.current && mqttRef.current.connected) {
             try {
-              mqttRef.current.publish(getMeshTopic(serverGridSize), JSON.stringify(resultPacket), {
-                qos: 0,
-              });
+              mqttRef.current.publish(meshTopicForSend(), resRaw, { qos: 0 });
             } catch {
               // ignore
             }
@@ -1925,6 +2343,7 @@ export default function App() {
         } else if (msg.type === 'leave') {
           engine.removePlayer(pid);
         }
+        return;
       }
 
       const packet = {
@@ -1932,18 +2351,47 @@ export default function App() {
         senderId: pid,
         cmd: { ...msg, clientId: pid },
       };
+      const serializedPacket = JSON.stringify(packet);
 
-      if (mqttRef.current && mqttRef.current.connected) {
-        try {
-          mqttRef.current.publish(getMeshTopic(serverGridSize), JSON.stringify(packet), { qos: 0 });
-        } catch {
-          // ignore
-        }
-      }
       try {
         broadcastChannelRef.current?.postMessage(packet);
       } catch {
         // ignore
+      }
+
+      // Fast-path: send directly to authoritative coordinator via WebRTC DataChannel (zero broker lag!)
+      const coordId = mc.activeCoordId;
+      if (coordId && msg.type !== 'admin_track' && msg.type !== 'kick_admin') {
+        const coordRtc = rtcPeersRef.current.get(coordId);
+        if (coordRtc && coordRtc.dc && coordRtc.dc.readyState === 'open') {
+          try {
+            coordRtc.dc.send(serializedPacket);
+            return;
+          } catch {
+            // fall through to MQTT fallback
+          }
+        }
+      }
+
+      for (const peerRtc of rtcPeersRef.current.values()) {
+        if (peerRtc.dc && peerRtc.dc.readyState === 'open') {
+          try {
+            peerRtc.dc.send(serializedPacket);
+          } catch {
+            // ignore
+          }
+        }
+      }
+      if (mqttRef.current && mqttRef.current.connected) {
+        try {
+          mqttRef.current.publish(meshTopicForSend(), serializedPacket, { qos: 0 });
+        } catch {
+          // ignore
+        }
+      }
+
+      function meshTopicForSend() {
+        return getMeshTopic(serverGridSize);
       }
     },
     [serverGridSize]
@@ -2392,7 +2840,9 @@ export default function App() {
     const cleanFaceId = selectedFaceId !== 'default' ? selectedFaceId : undefined;
     const cleanDeathEffectId =
       selectedDeathEffectId !== 'none' ? selectedDeathEffectId : undefined;
-    lastAutoJoinSentAtRef.current = performance.now();
+    const now = performance.now();
+    lastAutoJoinSentAtRef.current = now;
+    joinGraceUntilRef.current = now + 2400;
     lastSentAutoPilotRef.current = false;
     autoPilotActiveRef.current = false;
     setAutoPilotActive(false);
@@ -2461,9 +2911,15 @@ export default function App() {
         stopAutoPilot();
       }
 
+      const now = performance.now();
+      const pending = predictedTurnsRef.current;
+      // Prune stale unacknowledged turns so brief packet loss never locks controls
+      while (pending.length > 0 && now - pending[0].sentAt > 650) {
+        pending.shift();
+      }
+
       const snap = snapshotRef.current;
       const me = snap?.snakes.find((s) => s.id === playerIdRef.current && s.alive);
-      const pending = predictedTurnsRef.current;
       const plannedQueue: Direction[] = [
         ...(me?.nextDirs ?? []),
         ...pending.map((p) => p.dir),
@@ -2483,11 +2939,21 @@ export default function App() {
       pending.push({
         dir: requestedDir,
         seq,
-        sentAt: performance.now(),
+        sentAt: now,
       });
 
       soundEngine.playTurnBlip();
-      sendCommand({ type: 'turn', dir: requestedDir, seq });
+      if (
+        (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) &&
+        pending.length > 1
+      ) {
+        sendCommand({
+          type: 'turn_batch',
+          turns: pending.map((p) => ({ dir: p.dir, seq: p.seq })),
+        });
+      } else {
+        sendCommand({ type: 'turn', dir: requestedDir, seq });
+      }
     },
     [sendCommand, stopAutoPilot]
   );
@@ -2727,6 +3193,7 @@ export default function App() {
           : undefined;
 
       predictedTurnsRef.current = [];
+      joinGraceUntilRef.current = now + 2400;
       gameStateRef.current = 'PLAYING';
       setGameState('PLAYING');
       setIsSpectating(false);

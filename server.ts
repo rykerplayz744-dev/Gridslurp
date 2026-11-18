@@ -208,6 +208,14 @@ async function startServer() {
           });
         } else if (msg.type === 'turn') {
           arenas.get(activeGridSize)?.queueTurn(assignedPlayerId, msg.dir, msg.seq);
+        } else if (msg.type === 'turn_batch' && Array.isArray(msg.turns)) {
+          const arena = arenas.get(activeGridSize);
+          if (arena) {
+            for (let i = 0; i < msg.turns.length; i++) {
+              const t = msg.turns[i];
+              if (t && t.dir) arena.queueTurn(assignedPlayerId, t.dir, t.seq);
+            }
+          }
         } else if (msg.type === 'autopilot') {
           arenas
             .get(activeGridSize)

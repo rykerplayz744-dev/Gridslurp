@@ -555,6 +555,9 @@ export class ArenaEngine {
     if (!snake || !snake.alive) return;
 
     if (typeof seq === 'number') {
+      if (typeof snake.lastTurnSeq === 'number' && seq <= snake.lastTurnSeq) {
+        return;
+      }
       snake.lastTurnSeq = seq;
     }
 
